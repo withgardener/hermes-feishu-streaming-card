@@ -26,7 +26,8 @@ TurnRunner 的 `stream_delta_cb` / `interim_assistant_cb` 使用 `ctx` 传递本
 message ID、Gateway loop 和 session；approval 保留空选择时的原生回退。
 completion 从调用方复制 `_turn_seconds`，不修改原始 `agent_result` 对象。
 
-## Exact Base 边界
+检测把 `reply_context`、`attachment_delivery` 当作 capability evidence：多个文件含有合法调用时，`capability_locations` 会完整列出排序后的文件，但不会产生 ambiguity。`anchor_candidates` 只记录真正待注入的 AST 定义候选；重复 handler、callback、completion、cron 或 exact Base seam 仍 fail-closed，并在 doctor 中显示文件/行/列。注释、docstring、字符串示例不构成 anchor evidence。
+
 
 必须同时验证 `_process_message_background`、`_extract_response_content`、
 `_send_final_text`、`_record_delivery_obligation` 与 `_finalize_delivery_obligation`

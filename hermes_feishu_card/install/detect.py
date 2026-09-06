@@ -322,11 +322,21 @@ def detect_hermes(root: str | Path) -> HermesDetection:
 
     try:
         if decomposed:
-            capabilities, capability_locations, capability_error = _detect_layout_capabilities(
-                gateway_sources, cron_contents, cron_py.relative_to(hermes_root).as_posix()
+            (
+                capabilities,
+                capability_locations,
+                capability_error,
+                detected_anchor_candidates,
+            ) = _detect_layout_capabilities(
+                gateway_sources,
+                cron_contents,
+                cron_py.relative_to(hermes_root).as_posix(),
             )
+            anchor_candidates.update(detected_anchor_candidates)
         else:
             capabilities, capability_error = _detect_capabilities(contents, cron_contents)
+            if capability_error != "supported":
+                anchor_candidates["capability_detection"] = (capability_error,)
             capability_locations = {
                 key: ((cron_py.relative_to(hermes_root).as_posix(),)
                       if key == "cron_delivery" and _find_deliver_result_in_contents(cron_contents)
@@ -334,7 +344,7 @@ def detect_hermes(root: str | Path) -> HermesDetection:
                 for key, found in capabilities.items() if found
             }
     except AnchorAmbiguityError as exc:
-        anchor_candidates[exc.label] = exc.locations
+        anchor_candidates.setdefault(exc.label, exc.locations)
         return result(
             False,
             str(exc),
@@ -1022,8 +1032,18 @@ _LAYOUT_MARKERS = {
 
 
 def _detect_layout_capabilities(sources, cron_contents, cron_target):
-    locations = {name: [] for name in (*_LAYOUT_MARKERS, "run_agent", "reply_context", "attachment_delivery", "cron_delivery")}
+    locations = {
+        name: []
+        for name in (
+            *_LAYOUT_MARKERS,
+            "run_agent",
+            "reply_context",
+            "attachment_delivery",
+            "cron_delivery",
+        )
+    }
     errors = []
+    injection_candidates = {}
     for target, content in sources.items():
         try:
             clean = patcher.remove_patch(content)
@@ -1032,37 +1052,72 @@ def _detect_layout_capabilities(sources, cron_contents, cron_target):
             for name, marker in _LAYOUT_MARKERS.items():
                 if marker in rendered:
                     locations[name].append(target)
-            if _find_run_agent(tree) is not None:
+            try:
+                run_agent = _find_run_agent(tree)
+            except AnchorAmbiguityError as exc:
+                injection_candidates[exc.label] = tuple(
+                    f"{target}:{location}" for location in exc.locations
+                )
+                raise
+            if run_agent is not None:
                 locations["run_agent"].append(target)
-            if any(isinstance(node, ast.Attribute) and node.attr in {
-                "reply_to_message_id", "_reply_anchor_for_event"
-            } for node in ast.walk(tree)):
+            if any(
+                isinstance(node, ast.Attribute)
+                and node.attr in {"reply_to_message_id", "_reply_anchor_for_event"}
+                for node in ast.walk(tree)
+            ):
                 locations["reply_context"].append(target)
-            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                   and node.func.attr in {"extract_media", "_deliver_media_from_response"}
-                   for node in ast.walk(tree)):
+            if any(
+                isinstance(node, ast.Call)
+                and (
+                    (isinstance(node.func, ast.Attribute)
+                     and node.func.attr in {"extract_media", "_deliver_media_from_response"})
+                    or (isinstance(node.func, ast.Name)
+                        and node.func.id in {"extract_media", "_deliver_media_from_response"})
+                )
+                for node in ast.walk(tree)
+            ):
                 locations["attachment_delivery"].append(target)
             handler = patcher._find_handler_node(tree)
             if handler is not None and patcher._find_decomposed_completion_node(tree) is None:
                 errors.append(f"{target}: decomposed completion/agent:end contract missing")
-        except (AnchorAmbiguityError, ValueError, SyntaxError) as exc:
-            if isinstance(exc, AnchorAmbiguityError):
-                locations.setdefault(exc.label, []).extend(exc.locations)
+        except AnchorAmbiguityError as exc:
+            injection_candidates.setdefault(
+                exc.label,
+                tuple(f"{target}:{location}" for location in exc.locations),
+            )
+            errors.append(f"{target}: unsafe injection anchor ({exc})")
+        except (ValueError, SyntaxError) as exc:
             errors.append(f"{target}: unsafe anchors or ownership ({exc})")
     try:
         if patcher.CRON_PATCH_BEGIN in patcher.apply_cron_patch(cron_contents):
             locations["cron_delivery"].append(cron_target)
         else:
             errors.append(f"{cron_target}: missing cron delivery anchor")
-    except (AnchorAmbiguityError, ValueError):
+    except AnchorAmbiguityError as exc:
+        injection_candidates["_deliver_result"] = tuple(
+            f"{cron_target}:{location}" for location in exc.locations
+        )
+        errors.append(f"{cron_target}: unsafe injection anchor ({exc})")
+    except ValueError:
         errors.append(f"{cron_target}: unsafe cron anchors")
-    for name in (*_LAYOUT_MARKERS, "run_agent", "reply_context", "attachment_delivery", "cron_delivery"):
+    for name in (*_LAYOUT_MARKERS, "run_agent", "cron_delivery"):
         if len(locations[name]) > 1:
-            errors.append(f"{name}: ambiguous anchors in {', '.join(str(item) for item in locations[name])}")
+            errors.append(
+                f"{name}: ambiguous injection anchors in "
+                + ", ".join(sorted(set(locations[name])))
+            )
+    for name in ("reply_context", "attachment_delivery"):
+        locations[name] = sorted(set(locations[name]))
     capabilities = {key: bool(value) for key, value in locations.items()}
-    # Status remains optional exactly as on the legacy layout. All other
-    # decomposed delivery/interaction seams are required to preserve features.
-    missing = [key for key in _LAYOUT_MARKERS if key != "status_callback" and not capabilities[key]]
+    missing = [
+        key for key in _LAYOUT_MARKERS if key != "status_callback" and not capabilities[key]
+    ]
     if missing:
         errors.append("missing decomposed anchors: " + ", ".join(missing))
-    return capabilities, {key: tuple(value) for key, value in locations.items()}, "; ".join(errors) or "supported"
+    return (
+        capabilities,
+        {key: tuple(value) for key, value in locations.items()},
+        "; ".join(errors) or "supported",
+        {key: tuple(value) for key, value in injection_candidates.items()},
+    )
