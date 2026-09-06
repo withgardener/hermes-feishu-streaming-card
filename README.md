@@ -57,9 +57,8 @@ Hermes 飞书流式卡片插件把 Hermes Agent Gateway 的飞书/Lark 回复变
 The installer supports the legacy single-file gateway and Hermes' modern split facade layout. It parses Python structure rather than trusting version numbers or text inside comments/docstrings. If a required anchor is missing, appears in an incomplete split tree, or has multiple candidates, detection is `unsupported_or_ambiguous` and installation fails closed. Run `doctor --explain` to see the layout and candidate locations.
 
 If a Hermes update or Git autostash leaves the original source files in place while HFC backups and the ownership manifest remain, doctor reports a possible overwritten/moved hook. Do not overwrite user changes automatically: inspect the evidence, restore the owned patch, or explicitly accept the Hermes upgrade. Git stash contents are not treated as safe install evidence. Automated fixture/mock tests cover patch mechanics and are not a real Feishu acceptance test.
+检测会把 `reply_context`、`attachment_delivery` 视为能力证据：`capability_locations` 可以列出多个合法使用文件，不会因此产生 ambiguity。`anchor_candidates` 只记录真正注入 anchor 的定义候选；重复 handler、callback、completion、cron 或 exact Base seam 仍 fail-closed。fixture/mock 测试只是离线检查，不等于真实飞书验收。
 
-
-macOS / Linux：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/baileyh8/hermes-feishu-streaming-card/main/install.sh | bash

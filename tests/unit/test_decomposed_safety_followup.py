@@ -1,9 +1,41 @@
 from pathlib import Path
 import ast
+import shutil
 
 import pytest
 
 from hermes_feishu_card.install import detect, decomposed
+
+FIXTURE = Path(__file__).parents[1] / "fixtures/hermes_decomposed"
+
+
+def test_modern_split_capabilities_allow_multiple_usage_locations(tmp_path):
+    root = tmp_path / "hermes"
+    shutil.copytree(FIXTURE, root)
+    detection = detect.detect_hermes(root)
+    assert detection.supported
+    assert detection.layout == detect.HermesLayout.MODERN_SPLIT_GATEWAY.value
+    assert detection.reason == "supported"
+    assert detection.anchor_candidates == {}
+    assert detection.capability_locations["reply_context"] == (
+        "gateway/run_notifications.py",
+        "gateway/run_turn.py",
+    )
+    assert detection.capability_locations["attachment_delivery"] == (
+        "gateway/run_notifications.py",
+        "gateway/run_turn.py",
+    )
+    assert "ambiguous" not in detection.reason
+
+
+def test_doctor_report_keeps_capability_evidence_separate(tmp_path):
+    root = tmp_path / "hermes"
+    shutil.copytree(FIXTURE, root)
+    detection = detect.detect_hermes(root)
+    assert detection.layout == "modern_split_gateway"
+    assert detection.anchor_candidates == {}
+    assert detection.capability_locations["reply_context"]
+    assert detection.capability_locations["attachment_delivery"]
 
 
 def test_duplicate_handler_is_ambiguous():

@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0
 ### Added
 - Hardened Hermes installer detection for legacy single-file and modern split facade layouts with explicit `unsupported_or_ambiguous` results, AST anchor uniqueness checks, candidate locations, and fail-closed incomplete-layout handling.
 - Extended decomposed ownership manifests with per-target patch groups and layout strategy, plus precise doctor warnings for possible Hermes update/autostash hook overwrite.
-- Added follow-up contracts for ambiguous anchors, pseudo-anchor text, ownership drift, and upgrade recovery. Fixture/mock tests remain offline patch tests and are not real Feishu acceptance.
+- Fixed modern split detector false ambiguity: multiple legal `reply_context` and `attachment_delivery` uses remain capability locations, while only duplicate injection-anchor definitions populate `anchor_candidates` and fail closed.
+- Updated the sanitized Hermes 0.21.0 split fixture and detector contracts.
 
 ### Changed
 - Hermes update recovery no longer collapses every decomposed evidence failure into a generic user-edit finding; unsupported manifests, implementation drift, unreadable evidence, and likely overwritten hooks are reported separately.

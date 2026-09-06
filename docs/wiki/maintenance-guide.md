@@ -12,7 +12,10 @@
 
 ## Hot files
 
-### `hermes_feishu_card/hook_runtime.py`
+### Decomposed detector evidence
+
+For `modern_split_gateway`, `capability_locations` may contain multiple sorted files: `reply_context` and `attachment_delivery` are evidence of legal call/reference use, not injection targets. They must never be reported as ambiguous solely because several modules use them. `anchor_candidates` is reserved for actual AST injection definitions (handler, completion, callbacks, cron delivery, and exact Base seams); duplicate definitions remain fail-closed and doctor must show their file/line/column candidates. A supported result must not have an ambiguity reason with an empty candidate map.
+
 
 职责：
 
