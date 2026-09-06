@@ -17,7 +17,24 @@ MANIFEST_NAME = ".hermes_feishu_card_manifest"
 BACKUP_SUFFIX = ".hermes_feishu_card.bak"
 SOURCE_TARGETS = ("gateway/run.py", *patcher.DECOMPOSED_GATEWAY_TARGETS,
                   "cron/scheduler.py", "cron/scheduler_delivery.py", "gateway/platforms/base.py")
+SOURCE_TARGET_SET = frozenset(SOURCE_TARGETS)
 VERSION_TARGETS = ("VERSION", "hermes_cli/__init__.py", ".git/HEAD", ".git/packed-refs")
+LAYOUT_STRATEGY = "modern_split_gateway"
+
+
+def _patch_groups_for_target(target: str, rendered: bytes) -> tuple[str, ...]:
+    from .detect import _LAYOUT_MARKERS
+    groups = [name for name, marker in _LAYOUT_MARKERS.items()
+              if marker.encode("utf-8") in rendered]
+    if patcher.CRON_PATCH_BEGIN.encode("utf-8") in rendered:
+        groups.append("cron_delivery")
+    if patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN.encode("utf-8") in rendered:
+        groups.append("exact_base_no_text")
+    if patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN.encode("utf-8") in rendered:
+        groups.append("exact_base_final_delivery")
+    if not groups:
+        groups.append("source_ownership")
+    return tuple(sorted(set(groups)))
 
 
 def is_managed(root: Path) -> bool:
@@ -36,13 +53,18 @@ def validate_manifest(manifest):
             or manifest.get("layout") != "gateway-decomposed-v1"
             or manifest.get("integration_mode") != "legacy-patch"
             or not isinstance(manifest.get("targets"), dict)
-            or not manifest["targets"]
-            or not set(manifest["targets"]).issubset(SOURCE_TARGETS)
-            or "gateway/run.py" not in manifest["targets"]):
+            or set(manifest["targets"]) != SOURCE_TARGET_SET):
         raise ManifestStructureError("invalid decomposed ownership manifest")
     for target, row in manifest["targets"].items():
-        if (not isinstance(row, dict) or set(row) != {"path", "backup", "original_sha256", "patched_sha256"}
-                or row["path"] != target or row["backup"] != target + BACKUP_SUFFIX
+        if (not isinstance(row, dict)
+                or set(row) != {"path", "backup", "original_sha256", "patched_sha256",
+                                "patch_groups", "layout_strategy"}
+                or row["path"] != target
+                or row["backup"] != target + BACKUP_SUFFIX
+                or row["layout_strategy"] != LAYOUT_STRATEGY
+                or not isinstance(row["patch_groups"], list)
+                or not row["patch_groups"]
+                or any(not isinstance(group, str) or not group for group in row["patch_groups"])
                 or any(not isinstance(row[k], str) or len(row[k]) != 64
                        or any(c not in "0123456789abcdef" for c in row[k])
                        for k in ("original_sha256", "patched_sha256"))):
@@ -136,6 +158,10 @@ def _inspect(root):
         row = manifest["targets"][target]
         if sha256(rendered[target]).hexdigest() != row["patched_sha256"]:
             raise ValueError(f"{target}: patch implementation differs from owned manifest")
+        if tuple(row["patch_groups"]) != _patch_groups_for_target(target, rendered[target]):
+            raise ValueError(f"{target}: patch group ownership differs from rendered patch")
+        if row["layout_strategy"] != LAYOUT_STRATEGY:
+            raise ValueError(f"{target}: layout strategy is unsupported")
         if raw == rendered[target]:
             continue
         if raw == originals[target]:
@@ -156,16 +182,62 @@ def plan(detection, *, accept_hermes_upgrade=False):
     try:
         snapshot, _, _, state = _inspect(detection.root)
         fingerprint = _fingerprint(snapshot)
-        executable = state == "owned_incomplete" or (state == "stale_unpatched" and accept_hermes_upgrade and detection.supported)
-        actions = ("restore_owned_hooks",) if state == "owned_incomplete" else ("accept_hermes_upgrade",) if state == "stale_unpatched" else ()
+        if state == "stale_unpatched":
+            return RecoveryPlan(
+                detection.root,
+                state,
+                bool(accept_hermes_upgrade and detection.supported),
+                fingerprint,
+                ("accept_hermes_upgrade",),
+                (RecoveryFinding(
+                    "hermes_upgrade_overwrote_hooks",
+                    "error",
+                    "Current Hermes sources are unpatched while HFC ownership evidence remains; "
+                    "Hermes update or git autostash may have moved/overwritten the hooks. "
+                    "Inspect and restore manually, or explicitly accept the upgrade.",
+                ),),
+            )
+        executable = state == "owned_incomplete"
+        actions = ("restore_owned_hooks",) if executable else ()
         return RecoveryPlan(detection.root, state, executable, fingerprint, actions, ())
-    except (OSError, ValueError, UnicodeError):
+    except ValueError as exc:
         try:
             fingerprint = _fingerprint(_snapshot(detection.root))
         except (OSError, ValueError):
             fingerprint = sha256(b"unsafe decomposed evidence").hexdigest()
-        return RecoveryPlan(detection.root, "refused", False, fingerprint, (),
-                            (RecoveryFinding("user_modified", "error", "Decomposed ownership cannot be verified."),))
+        message = str(exc)
+        code = "manifest_or_ownership_invalid"
+        if "patch implementation differs" in message:
+            code = "patch_implementation_drift"
+        elif "source drift" in message or "user edit" in message:
+            code = "user_modified"
+        elif "manifest" in message or "ownership" in message:
+            code = "manifest_unsupported"
+        return RecoveryPlan(
+            detection.root,
+            "refused",
+            False,
+            fingerprint,
+            (),
+            (RecoveryFinding(code, "error", message),),
+        )
+    except (OSError, UnicodeError) as exc:
+        try:
+            fingerprint = _fingerprint(_snapshot(detection.root))
+        except (OSError, ValueError):
+            fingerprint = sha256(b"unsafe decomposed evidence").hexdigest()
+        return RecoveryPlan(
+            detection.root,
+            "refused",
+            False,
+            fingerprint,
+            (),
+            (RecoveryFinding(
+                "ownership_evidence_unreadable",
+                "error",
+                f"Decomposed ownership evidence could not be read safely: {exc.__class__.__name__}.",
+            ),),
+        )
 
 
 def install(detection, *, no_repair=False, expected_fingerprint=None, accept_hermes_upgrade=False):
@@ -181,6 +253,10 @@ def install(detection, *, no_repair=False, expected_fingerprint=None, accept_her
             raise ValueError("unsupported decomposed Hermes: " + detection.reason)
         if state == "installed":
             return False
+        if state == "owned_incomplete" and all(
+            snapshot[name] == originals[name] for name in originals
+        ):
+            return False
         if state in {"owned_incomplete", "stale_unpatched"} and no_repair:
             raise ValueError("decomposed ownership needs repair; --no-repair set")
         if state == "stale_unpatched" and not (accept_hermes_upgrade and detection.supported):
@@ -194,7 +270,9 @@ def install(detection, *, no_repair=False, expected_fingerprint=None, accept_her
             "integration_mode": "legacy-patch",
             "targets": {name: {"path": name, "backup": name + BACKUP_SUFFIX,
                                 "original_sha256": sha256(raw).hexdigest(),
-                                "patched_sha256": sha256(rendered[name]).hexdigest()}
+                                "patched_sha256": sha256(rendered[name]).hexdigest(),
+                                "patch_groups": list(_patch_groups_for_target(name, rendered[name])),
+                                "layout_strategy": LAYOUT_STRATEGY}
                         for name, raw in originals.items()},
         }
         validate_manifest(manifest)

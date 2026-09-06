@@ -52,7 +52,12 @@ Hermes 飞书流式卡片插件把 Hermes Agent Gateway 的飞书/Lark 回复变
 | 授权、选择、模型切换要手工回编号 | 优先使用飞书按钮或下拉选择，失败时再退回文本 fallback |
 | Hermes 升级后不知道 hook 是否兼容 | `doctor --explain` 展示 `version_source`、`hook_strategy`、`compatibility`、anchors 和建议 |
 
-## 快速安装
+## Hermes gateway layout and safe detection
+
+The installer supports the legacy single-file gateway and Hermes' modern split facade layout. It parses Python structure rather than trusting version numbers or text inside comments/docstrings. If a required anchor is missing, appears in an incomplete split tree, or has multiple candidates, detection is `unsupported_or_ambiguous` and installation fails closed. Run `doctor --explain` to see the layout and candidate locations.
+
+If a Hermes update or Git autostash leaves the original source files in place while HFC backups and the ownership manifest remain, doctor reports a possible overwritten/moved hook. Do not overwrite user changes automatically: inspect the evidence, restore the owned patch, or explicitly accept the Hermes upgrade. Git stash contents are not treated as safe install evidence. Automated fixture/mock tests cover patch mechanics and are not a real Feishu acceptance test.
+
 
 macOS / Linux：
 

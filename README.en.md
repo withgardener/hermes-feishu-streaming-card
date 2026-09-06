@@ -52,7 +52,12 @@ During execution, the Header follows real Hermes tool actions while public inter
 | Approval, choices, and model switching require manual numbered replies | Uses Feishu buttons or dropdowns first, then falls back to text when cards are unavailable |
 | Hermes upgrades make hook compatibility unclear | `doctor --explain` reports `version_source`, `hook_strategy`, `compatibility`, anchors, and recommendations |
 
-## Quick Install
+## Hermes gateway layout and safe detection
+
+The installer supports both Hermes' legacy single-file gateway and the modern split facade layout. Detection parses Python structure instead of trusting version numbers or text inside comments/docstrings. Missing, incomplete, or ambiguous required anchors are reported as `unsupported_or_ambiguous` and installation fails closed. Run `doctor --explain` to see the selected layout and candidate locations.
+
+If a Hermes update or Git autostash leaves original source files while HFC backups and the ownership manifest remain, doctor reports a possible overwritten or moved hook. Inspect the evidence, restore the owned patch, or explicitly accept the upgrade; user changes are never overwritten automatically. Git stash contents are not treated as safe install evidence. Automated fixture/mock tests validate patch mechanics only and are not real Feishu acceptance tests.
+
 
 macOS / Linux:
 

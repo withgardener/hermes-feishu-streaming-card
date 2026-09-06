@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
-## V4.4.0 — 2026-08-31
+## Unreleased
+
+### Added
+- Hardened Hermes installer detection for legacy single-file and modern split facade layouts with explicit `unsupported_or_ambiguous` results, AST anchor uniqueness checks, candidate locations, and fail-closed incomplete-layout handling.
+- Extended decomposed ownership manifests with per-target patch groups and layout strategy, plus precise doctor warnings for possible Hermes update/autostash hook overwrite.
+- Added follow-up contracts for ambiguous anchors, pseudo-anchor text, ownership drift, and upgrade recovery. Fixture/mock tests remain offline patch tests and are not real Feishu acceptance.
+
+### Changed
+- Hermes update recovery no longer collapses every decomposed evidence failure into a generic user-edit finding; unsupported manifests, implementation drift, unreadable evidence, and likely overwritten hooks are reported separately.
+
 
 See also: [docs/release-notes-v4.4.0.md](docs/release-notes-v4.4.0.md)
 

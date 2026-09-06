@@ -1496,6 +1496,8 @@ def _doctor_hermes_report(detection: HermesDetection) -> dict[str, Any]:
         "compatibility": detection.compatibility,
         "anchors": dict(detection.capabilities),
         "anchor_locations": dict(detection.capability_locations),
+        "anchor_candidates": dict(detection.anchor_candidates),
+        "layout": detection.layout,
         "reason": detection.reason,
         "suggested_root": (
             str(detection.suggested_root)
@@ -2064,11 +2066,18 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
     from .install import decomposed
     if detection.decomposed or decomposed.is_managed(detection.root):
         plan = decomposed.plan(detection)
-        return {"checked": True, "status": plan.state,
-                "manifest_exists": (detection.root / MANIFEST_NAME).exists(),
-                "manual_action_required": plan.state == "refused",
-                "automatic_repair_available": plan.executable,
-                "message": "Decomposed ownership: " + plan.state}
+        return {
+            "checked": True,
+            "status": plan.state,
+            "manifest_exists": (detection.root / MANIFEST_NAME).exists(),
+            "layout": detection.layout,
+            "manual_action_required": plan.state == "refused" or bool(plan.findings),
+            "automatic_repair_available": plan.executable,
+            "message": "; ".join(
+                ["Decomposed ownership: " + plan.state]
+                + [finding.message for finding in plan.findings]
+            ),
+        }
     run_py = detection.run_py
     backup_path = _backup_path(run_py)
     manifest_path = _manifest_path(detection.root)

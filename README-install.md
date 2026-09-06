@@ -6,7 +6,8 @@ This package contains lightweight installers for `hermes-feishu-streaming-card`.
 They install the Python package, configure Feishu credentials, install the Hermes
 hook, start the sidecar, and print the health-check command.
 
-From V3.6.2, setup also checks the Python interpreter used by Hermes Gateway
+From V4.4.0 follow-up support, the installer recognizes both the legacy single-file Hermes gateway and the modern split facade layout. Detection is structural and AST-based: a missing or ambiguous anchor is classified as `unsupported_or_ambiguous` and installation stops rather than guessing. After a Hermes update, use `doctor --explain` first; if the current files are original while HFC backups and manifest remain, treat this as possible update/autostash overwrite and inspect or restore manually before accepting the upgrade. The installer does not inspect Git stash contents as trusted evidence. Fixture and mock tests validate patching only and are not a real Feishu acceptance test.
+
 itself. When `HERMES_DIR/venv/bin/python`, `HERMES_DIR/.venv/bin/python`, or the
 Windows equivalent exists, the same package release is installed into that
 runtime venv before `gateway/run.py` is patched. This prevents a hook from being

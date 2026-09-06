@@ -318,6 +318,8 @@ def build_diagnostic_report(
         "compatibility": detection.compatibility,
         "anchors": dict(detection.capabilities),
         "anchor_locations": dict(detection.capability_locations),
+        "anchor_candidates": dict(detection.anchor_candidates),
+        "layout": detection.layout,
         "reason": detection.reason,
         "suggested_root": str(detection.suggested_root or ""),
         "suggestion_reason": detection.suggestion_reason,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 import re
 import subprocess
@@ -37,6 +38,32 @@ _VERSION_RE = re.compile(r"(?<!\d)v?(\d+(?:\.\d+)+)(?!\d)")
 _HERMES_PROJECT_RE = re.compile(r"(?im)^\s*Project:\s*(.+?)\s*$")
 
 
+class HermesLayout(str, Enum):
+    LEGACY_SINGLE_FILE = "legacy_single_file"
+    MODERN_SPLIT_GATEWAY = "modern_split_gateway"
+    UNSUPPORTED_OR_AMBIGUOUS = "unsupported_or_ambiguous"
+
+
+@dataclass(frozen=True)
+class AnchorResolution:
+    state: str
+    candidates: tuple[ast.AST, ...] = ()
+    locations: tuple[str, ...] = ()
+
+    @property
+    def unique(self):
+        return self.candidates[0] if self.state == "unique" else None
+
+
+@dataclass(frozen=True)
+class AnchorAmbiguityError(ValueError):
+    label: str
+    locations: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return f"ambiguous {self.label} anchors: {', '.join(self.locations)}"
+
+
 @dataclass(frozen=True)
 class HermesDetection:
     root: Path
@@ -60,6 +87,8 @@ class HermesDetection:
     capability_locations: dict[str, tuple[str, ...]] = field(default_factory=dict)
     gateway_files: tuple[str, ...] = ()
     decomposed: bool = False
+    layout: str = HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value
+    anchor_candidates: dict[str, tuple[str, ...]] = field(default_factory=dict)
     suggested_root: Path | None = None
     suggestion_reason: str = ""
 
@@ -114,7 +143,20 @@ def detect_hermes(root: str | Path) -> HermesDetection:
     base_py = hermes_root / "gateway" / "platforms" / "base.py"
     gateway_sources = {}
     capability_locations = {}
-    decomposed = any((hermes_root / name).exists() for name in patcher.DECOMPOSED_GATEWAY_TARGETS)
+    gateway_candidates = [
+        name for name in ("gateway/run.py", *patcher.DECOMPOSED_GATEWAY_TARGETS)
+        if (hermes_root / name).exists()
+    ]
+    has_split_siblings = any(
+        (hermes_root / name).exists() for name in patcher.DECOMPOSED_GATEWAY_TARGETS
+    )
+    decomposed = has_split_siblings
+    layout = (
+        HermesLayout.MODERN_SPLIT_GATEWAY.value
+        if has_split_siblings
+        else HermesLayout.LEGACY_SINGLE_FILE.value
+    )
+    anchor_candidates = {}
     cron_sources = {}
     version, version_error, version_source = _read_version(hermes_root / "VERSION")
     if version == "unknown" and version_error is None:
@@ -141,7 +183,12 @@ def detect_hermes(root: str | Path) -> HermesDetection:
         suggestion_reason: str = "",
         base_required: bool = False,
         base_hook_strategy: str = "",
+        layout_override: str | None = None,
+        anchor_candidates_override: dict[str, tuple[str, ...]] | None = None,
     ) -> HermesDetection:
+        final_layout = layout_override or layout
+        if not supported and final_layout != HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value:
+            final_layout = HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value
         return HermesDetection(
             root=hermes_root,
             version=version,
@@ -164,6 +211,8 @@ def detect_hermes(root: str | Path) -> HermesDetection:
             capability_locations=capability_locations,
             gateway_files=tuple(gateway_sources),
             decomposed=decomposed,
+            layout=final_layout,
+            anchor_candidates=(anchor_candidates_override or anchor_candidates),
             suggested_root=suggested_root,
             suggestion_reason=suggestion_reason,
         )
@@ -181,6 +230,16 @@ def detect_hermes(root: str | Path) -> HermesDetection:
             suggested_root=suggested_root,
             suggestion_reason=suggestion_reason,
         )
+
+    if decomposed:
+        expected_split = {"gateway/run.py", *patcher.DECOMPOSED_GATEWAY_TARGETS}
+        missing_split = sorted(expected_split.difference(gateway_candidates))
+        if missing_split:
+            return result(
+                False,
+                "modern split layout is incomplete; missing: " + ", ".join(missing_split),
+                layout_override=HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value,
+            )
 
     if run_py.is_symlink():
         return result(False, "gateway/run.py must not be a symlink")
@@ -214,10 +273,19 @@ def detect_hermes(root: str | Path) -> HermesDetection:
             if cron_error is not None:
                 return result(False, cron_error)
             cron_sources[name] = source
-    cron_anchors = [name for name, source in cron_sources.items()
-                    if _find_deliver_result_in_contents(source)]
-    if len(cron_anchors) > 1:
-        return result(False, "ambiguous cron delivery anchors: " + ", ".join(cron_anchors))
+    cron_anchors = []
+    for name, source in cron_sources.items():
+        try:
+            if _find_deliver_result_in_contents(source):
+                cron_anchors.append(name)
+        except AnchorAmbiguityError as exc:
+            anchor_candidates["cron_delivery"] = exc.locations
+            return result(
+                False,
+                str(exc),
+                layout_override=HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value,
+                anchor_candidates_override=anchor_candidates,
+            )
     if cron_anchors:
         cron_py = hermes_root / cron_anchors[0]
     cron_contents = cron_sources.get(cron_py.relative_to(hermes_root).as_posix(), "")
@@ -252,11 +320,27 @@ def detect_hermes(root: str | Path) -> HermesDetection:
     elif base_required:
         exact_base_error = "gateway/platforms/base.py missing for exact delivery contract"
 
-    if decomposed:
-        capabilities, capability_locations, capability_error = _detect_layout_capabilities(gateway_sources, cron_contents, cron_py.relative_to(hermes_root).as_posix())
-    else:
-        capabilities, capability_error = _detect_capabilities(contents, cron_contents)
-        capability_locations = {key: ((cron_py.relative_to(hermes_root).as_posix(),) if key == "cron_delivery" and _find_deliver_result_in_contents(cron_contents) else ("gateway/run.py",)) for key, found in capabilities.items() if found}
+    try:
+        if decomposed:
+            capabilities, capability_locations, capability_error = _detect_layout_capabilities(
+                gateway_sources, cron_contents, cron_py.relative_to(hermes_root).as_posix()
+            )
+        else:
+            capabilities, capability_error = _detect_capabilities(contents, cron_contents)
+            capability_locations = {
+                key: ((cron_py.relative_to(hermes_root).as_posix(),)
+                      if key == "cron_delivery" and _find_deliver_result_in_contents(cron_contents)
+                      else ("gateway/run.py",))
+                for key, found in capabilities.items() if found
+            }
+    except AnchorAmbiguityError as exc:
+        anchor_candidates[exc.label] = exc.locations
+        return result(
+            False,
+            str(exc),
+            layout_override=HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value,
+            anchor_candidates_override=anchor_candidates,
+        )
     capability_locations["exact_base_delivery"] = ("gateway/platforms/base.py",) if exact_base_delivery else ()
     capabilities["exact_base_delivery"] = exact_base_delivery
     core_ok = all(capabilities.get(name, False) for name in CORE_CAPABILITIES)
@@ -274,6 +358,7 @@ def detect_hermes(root: str | Path) -> HermesDetection:
             compatibility=compatibility,
             capabilities=capabilities,
             base_required=base_required,
+            layout_override=HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value,
         )
 
     if capability_error != "supported":
@@ -283,6 +368,7 @@ def detect_hermes(root: str | Path) -> HermesDetection:
             compatibility=compatibility,
             capabilities=capabilities,
             base_required=base_required,
+            layout_override=HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value,
         )
 
     if base_required and not exact_base_delivery:
@@ -292,6 +378,7 @@ def detect_hermes(root: str | Path) -> HermesDetection:
             compatibility=compatibility,
             capabilities=capabilities,
             base_required=True,
+            layout_override=HermesLayout.UNSUPPORTED_OR_AMBIGUOUS.value,
         )
 
     if parsed_version is None:
@@ -503,11 +590,13 @@ def _detect_capabilities(
     except SyntaxError as exc:
         return {}, f"gateway/run.py could not be parsed: {exc.__class__.__name__}"
 
-    handler = _find_supported_handler(module)
-    if handler is None:
-        completion_return = None
-    else:
-        completion_return = _find_completion_return(handler)
+    try:
+        handler = _find_supported_handler(module)
+        completion_return = _find_completion_return(handler) if handler is not None else None
+        run_agent = _find_run_agent(module)
+        cron_delivery = _has_cron_delivery(contents, cron_contents)
+    except AnchorAmbiguityError as exc:
+        return {}, str(exc)
 
     callback_capabilities, callback_error = _detect_callback_patchability(
         contents, module
@@ -515,9 +604,9 @@ def _detect_capabilities(
     capabilities = {
         "message_handler": handler is not None,
         "completion_return": completion_return is not None,
-        "run_agent": _find_run_agent(module) is not None,
+        "run_agent": run_agent is not None,
         **callback_capabilities,
-        "cron_delivery": _has_cron_delivery(contents, cron_contents),
+        "cron_delivery": cron_delivery,
         "reply_context": "reply_to_message_id" in contents
         or "_reply_anchor_for_event" in contents,
         "attachment_delivery": "extract_media" in contents
@@ -544,14 +633,16 @@ def _detect_callback_patchability(
         # already-installed file with damaged markers. Preserve the legacy
         # structural capability report here so recovery, not compatibility
         # detection, remains responsible for classifying that state.
+        try:
+            progress = _find_callback(module, "progress_callback")
+            answer = _find_callback(module, "_stream_delta_cb")
+            thinking = _find_callback(module, "_interim_assistant_cb")
+        except AnchorAmbiguityError as exc:
+            return {}, str(exc)
         return {
-            "tool_callback": _find_callback(module, "progress_callback") is not None,
-            "answer_delta_callback": _find_callback(module, "_stream_delta_cb")
-            is not None,
-            "thinking_delta_callback": _find_callback(
-                module, "_interim_assistant_cb"
-            )
-            is not None,
+            "tool_callback": progress is not None,
+            "answer_delta_callback": answer is not None,
+            "thinking_delta_callback": thinking is not None,
             "status_callback": _has_patchable_status_callback(module),
         }, ""
 
@@ -613,31 +704,53 @@ def _find_deliver_result_in_contents(contents: str) -> bool:
     return _find_function(module, "_deliver_result") is not None
 
 
+def _node_location(node: ast.AST) -> str:
+    return f"line {getattr(node, 'lineno', '?')}:column {getattr(node, 'col_offset', '?')}"
+
+
+def _resolve_candidates(candidates: list[ast.AST], label: str) -> AnchorResolution:
+    locations = tuple(_node_location(node) for node in candidates)
+    if not candidates:
+        return AnchorResolution("missing", (), locations)
+    if len(candidates) > 1:
+        return AnchorResolution("ambiguous", tuple(candidates), locations)
+    return AnchorResolution("unique", tuple(candidates), locations)
+
+
+def _require_unique(resolution: AnchorResolution, label: str):
+    if resolution.state == "ambiguous":
+        raise AnchorAmbiguityError(label, resolution.locations)
+    return resolution.unique
+
+
 def _find_supported_handler(module: ast.Module) -> ast.AsyncFunctionDef | None:
+    candidates = []
     for node in module.body:
         if isinstance(node, ast.AsyncFunctionDef) and node.name == HANDLER_NAME:
-            return node
-        if isinstance(node, ast.ClassDef):
-            method = _find_direct_class_handler(node)
-            if method is not None:
-                return method
-    return None
+            candidates.append(node)
+        elif isinstance(node, ast.ClassDef):
+            candidates.extend(
+                child for child in node.body
+                if isinstance(child, ast.AsyncFunctionDef) and child.name == HANDLER_NAME
+            )
+    return _require_unique(_resolve_candidates(candidates, HANDLER_NAME), HANDLER_NAME)
 
 
 def _find_direct_class_handler(class_node: ast.ClassDef) -> ast.AsyncFunctionDef | None:
-    return next(
-        (
-            node
-            for node in class_node.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == HANDLER_NAME
-        ),
-        None,
-    )
+    candidates = [
+        node for node in class_node.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == HANDLER_NAME
+    ]
+    return _require_unique(_resolve_candidates(candidates, HANDLER_NAME), HANDLER_NAME)
 
 
 def _find_completion_return(handler: ast.AsyncFunctionDef) -> ast.Call | None:
     visitor = _HandlerCompletionVisitor()
     visitor.visit_statements(handler.body)
+    if len(visitor.agent_end_nodes) > 1:
+        raise AnchorAmbiguityError(
+            "completion return", tuple(_node_location(node) for node in visitor.agent_end_nodes)
+        )
     return visitor.agent_end_node
 
 
@@ -648,48 +761,52 @@ def _find_run_agent(module: ast.Module) -> ast.AsyncFunctionDef | ast.FunctionDe
 def _find_function(
     module: ast.Module, name: str
 ) -> ast.AsyncFunctionDef | ast.FunctionDef | None:
+    candidates = []
     for node in module.body:
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name:
-            return node
-        if isinstance(node, ast.ClassDef):
-            method = _find_direct_class_function(node, name)
-            if method is not None:
-                return method
-    return None
+            candidates.append(node)
+        elif isinstance(node, ast.ClassDef):
+            candidates.extend(
+                child for child in node.body
+                if isinstance(child, (ast.AsyncFunctionDef, ast.FunctionDef)) and child.name == name
+            )
+    return _require_unique(_resolve_candidates(candidates, name), name)
 
 
 def _find_direct_class_function(
     class_node: ast.ClassDef, name: str
 ) -> ast.AsyncFunctionDef | ast.FunctionDef | None:
-    return next(
-        (
-            node
-            for node in class_node.body
-            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
-            and node.name == name
-        ),
-        None,
-    )
+    candidates = [
+        node for node in class_node.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name
+    ]
+    return _require_unique(_resolve_candidates(candidates, name), name)
 
 
 def _find_callback(
     module: ast.Module, name: str
 ) -> ast.AsyncFunctionDef | ast.FunctionDef | None:
-    for node in ast.walk(module):
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name:
-            return node
-    return None
+    candidates = [
+        node for node in ast.walk(module)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name
+    ]
+    return _require_unique(_resolve_candidates(candidates, name), name)
 
 
 def _find_turn_runner(module: ast.Module) -> ast.ClassDef | None:
-    return next(
-        (
-            node
-            for node in module.body
-            if isinstance(node, ast.ClassDef) and node.name == "TurnRunner"
-        ),
-        None,
-    )
+    candidates = [
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "TurnRunner"
+    ]
+    return _require_unique(_resolve_candidates(candidates, "TurnRunner"), "TurnRunner")
+
+
+def _find_startup_runner(module: ast.Module, names: tuple[str, ...]):
+    candidates = [
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name in names
+    ]
+    return _require_unique(_resolve_candidates(candidates, "/".join(names)), "/".join(names))
 
 
 def _turn_runner_has_callback(turn_runner: ast.ClassDef, name: str) -> bool:
@@ -724,14 +841,13 @@ def _has_patchable_status_callback(module: ast.Module) -> bool:
     )
     if run_agent is None:
         return False
-    callback = next(
-        (
-            node
-            for node in ast.walk(run_agent)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_status_callback_sync"
-        ),
-        None,
+    callback_candidates = [
+        node for node in ast.walk(run_agent)
+        if isinstance(node, ast.FunctionDef) and node.name == "_status_callback_sync"
+    ]
+    callback = _require_unique(
+        _resolve_candidates(callback_candidates, "_status_callback_sync"),
+        "_status_callback_sync",
     )
     if callback is None:
         return False
@@ -782,6 +898,7 @@ def _function_argument_names(node: ast.AsyncFunctionDef | ast.FunctionDef) -> se
 class _HandlerCompletionVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.agent_end_node: ast.Call | None = None
+        self.agent_end_nodes: list[ast.Call] = []
 
     def visit_statements(self, statements: list[ast.stmt]) -> None:
         for statement in statements:
@@ -793,7 +910,9 @@ class _HandlerCompletionVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if _is_agent_end_emit_call(node):
-            self.agent_end_node = node
+            self.agent_end_nodes.append(node)
+            if self.agent_end_node is None:
+                self.agent_end_node = node
             return
         self.generic_visit(node)
 
@@ -926,18 +1045,20 @@ def _detect_layout_capabilities(sources, cron_contents, cron_target):
             handler = patcher._find_handler_node(tree)
             if handler is not None and patcher._find_decomposed_completion_node(tree) is None:
                 errors.append(f"{target}: decomposed completion/agent:end contract missing")
-        except (ValueError, SyntaxError) as exc:
+        except (AnchorAmbiguityError, ValueError, SyntaxError) as exc:
+            if isinstance(exc, AnchorAmbiguityError):
+                locations.setdefault(exc.label, []).extend(exc.locations)
             errors.append(f"{target}: unsafe anchors or ownership ({exc})")
     try:
         if patcher.CRON_PATCH_BEGIN in patcher.apply_cron_patch(cron_contents):
             locations["cron_delivery"].append(cron_target)
         else:
             errors.append(f"{cron_target}: missing cron delivery anchor")
-    except ValueError:
+    except (AnchorAmbiguityError, ValueError):
         errors.append(f"{cron_target}: unsafe cron anchors")
-    for name in _LAYOUT_MARKERS:
+    for name in (*_LAYOUT_MARKERS, "run_agent", "reply_context", "attachment_delivery", "cron_delivery"):
         if len(locations[name]) > 1:
-            errors.append(f"{name}: ambiguous anchors in {', '.join(locations[name])}")
+            errors.append(f"{name}: ambiguous anchors in {', '.join(str(item) for item in locations[name])}")
     capabilities = {key: bool(value) for key, value in locations.items()}
     # Status remains optional exactly as on the legacy layout. All other
     # decomposed delivery/interaction seams are required to preserve features.
