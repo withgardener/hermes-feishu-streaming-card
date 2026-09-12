@@ -52,6 +52,26 @@ def test_completion_token_extraction_uses_agent_result_cache_counts():
     assert tokens["cache_write_tokens"] == 10
 
 
+def test_completion_token_extraction_uses_session_counter_fallbacks():
+    tokens = _completion_tokens(
+        {
+            "tokens": {},
+            "agent_result": {
+                "session_prompt_tokens": 200,
+                "session_input_tokens": 100,
+                "session_output_tokens": 20,
+                "session_cache_read_tokens": 90,
+                "session_cache_write_tokens": 10,
+            },
+        },
+        "ok",
+    )
+
+    assert tokens["prompt_tokens"] == 200
+    assert tokens["cache_read_tokens"] == 90
+    assert tokens["cache_write_tokens"] == 10
+
+
 def test_queued_patcher_path_carries_cache_counts():
     from hermes_feishu_card.install import patcher
 
