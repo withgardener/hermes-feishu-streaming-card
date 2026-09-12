@@ -74,7 +74,7 @@ def test_footer_shows_prompt_cache_hit_rate_when_cache_read_tokens_exist():
 
     footer = _render_footer(session)
 
-    assert "缓存 85%" in footer
+    assert "cache 85%" in footer
 
 
 def test_footer_omits_cache_rate_when_prompt_tokens_are_unavailable():
@@ -84,7 +84,7 @@ def test_footer_omits_cache_rate_when_prompt_tokens_are_unavailable():
 
     footer = _render_footer(session)
 
-    assert "缓存" not in footer
+    assert "cache" not in footer
 
 
 def test_footer_omits_cache_rate_when_custom_fields_do_not_request_it():
@@ -94,4 +94,4 @@ def test_footer_omits_cache_rate_when_custom_fields_do_not_request_it():
 
     footer = _render_footer(session, footer_fields=["duration", "model"])
 
-    assert "缓存" not in footer
+    assert "cache" not in footer

@@ -1505,7 +1505,7 @@ def _render_footer(
     cache_read_tokens = _safe_int(tokens.get("cache_read_tokens"))
     prompt_tokens = _safe_int(tokens.get("prompt_tokens"))
     cache_rate = (
-        f"缓存 {min(100, max(0, round(cache_read_tokens / prompt_tokens * 100)))}%"
+        f"cache {min(100, max(0, round(cache_read_tokens / prompt_tokens * 100)))}%"
         if prompt_tokens > 0 and cache_read_tokens > 0
         else ""
     )
