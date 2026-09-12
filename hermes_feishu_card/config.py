@@ -55,6 +55,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
             "model",
             "input_tokens",
             "output_tokens",
+            "cache_rate",
             "context",
         ],
     },

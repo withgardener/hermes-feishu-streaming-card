@@ -25,6 +25,7 @@ DEFAULT_FOOTER_FIELDS = (
     "model",
     "input_tokens",
     "output_tokens",
+    "cache_rate",
     "context",
 )
 MAIN_CONTENT_CHUNK_CHARS = 2400
@@ -1467,6 +1468,13 @@ def _render_footer(
     tokens = session.tokens if isinstance(session.tokens, dict) else {}
     input_tokens = _safe_int(tokens.get("input_tokens"))
     output_tokens = _safe_int(tokens.get("output_tokens"))
+    cache_read_tokens = _safe_int(tokens.get("cache_read_tokens"))
+    prompt_tokens = _safe_int(tokens.get("prompt_tokens"))
+    cache_rate = (
+        f"缓存 {min(100, max(0, round(cache_read_tokens / prompt_tokens * 100)))}%"
+        if prompt_tokens > 0 and cache_read_tokens > 0
+        else ""
+    )
     try:
         duration = float(session.duration)
     except (TypeError, ValueError):
@@ -1481,6 +1489,7 @@ def _render_footer(
         "model": _colored_model_label(model),
         "input_tokens": f"↑{_format_count(input_tokens)}",
         "output_tokens": f"↓{_format_count(output_tokens)}",
+        "cache_rate": cache_rate,
         "context": (
             f"ctx {_format_count(used_context)}/"
             f"{_format_count(max_context)} {context_percent}%"

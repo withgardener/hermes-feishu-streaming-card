@@ -10297,8 +10297,24 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
         agent_result = {}
 
     input_tokens = _token_value(explicit_tokens, "input_tokens")
+    if input_tokens <= 0:
+        input_tokens = _positive_int(agent_result.get("input_tokens"))
     output_tokens = _token_value(explicit_tokens, "output_tokens")
+    if output_tokens <= 0:
+        output_tokens = _positive_int(agent_result.get("output_tokens"))
+    cache_read_tokens = _token_value(explicit_tokens, "cache_read_tokens")
+    if cache_read_tokens <= 0:
+        cache_read_tokens = _positive_int(agent_result.get("cache_read_tokens"))
+    cache_write_tokens = _token_value(explicit_tokens, "cache_write_tokens")
+    if cache_write_tokens <= 0:
+        cache_write_tokens = _positive_int(agent_result.get("cache_write_tokens"))
+    prompt_tokens = _token_value(explicit_tokens, "prompt_tokens")
+    if prompt_tokens <= 0:
+        prompt_tokens = _positive_int(agent_result.get("prompt_tokens"))
+    if prompt_tokens <= 0:
+        prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
     last_prompt_tokens = _positive_int(agent_result.get("last_prompt_tokens"))
+
     estimated_output_tokens = _estimate_output_tokens(answer) if answer else 0
 
     if last_prompt_tokens > 0 and input_tokens > last_prompt_tokens * 2:
@@ -10326,10 +10342,18 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
     if output_tokens <= 0 and answer:
         output_tokens = estimated_output_tokens
 
-    return {
+    result = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+    for key, value in (
+        ("prompt_tokens", prompt_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+        ("cache_write_tokens", cache_write_tokens),
+    ):
+        if value > 0:
+            result[key] = value
+    return result
 
 
 def _completion_context(local_vars: dict[str, Any]) -> dict[str, int]:

@@ -1588,6 +1588,31 @@ def _find_owned_complete_block(content: str):
     previous_async_without_platform_silent = _with_silent_exception_handler(
         previous_async_without_platform, indent, newline
     )
+    # Older HFC releases predate cache telemetry in the completion payload. Keep
+    # their exact generated blocks removable/upgradable while retaining all
+    # marker, AST, and insertion-location checks below.
+    def _without_cache_fields(block):
+        return [
+            line for line in block
+            if '"prompt_tokens":' not in line
+            and '"cache_read_tokens":' not in line
+            and '"cache_write_tokens":' not in line
+        ]
+
+    legacy_compat = _without_cache_fields(legacy)
+    previous_async_compat = _without_cache_fields(previous_async)
+    previous_async_without_platform_compat = _without_cache_fields(
+        previous_async_without_platform
+    )
+    legacy_compat_silent = _with_silent_exception_handler(
+        legacy_compat, indent, newline
+    )
+    previous_async_compat_silent = _with_silent_exception_handler(
+        previous_async_compat, indent, newline
+    )
+    previous_async_without_platform_compat_silent = _with_silent_exception_handler(
+        previous_async_without_platform_compat, indent, newline
+    )
     actual = lines[begin_index : end_index + 1]
     if actual not in (
         expected_with_anchor,
@@ -1599,6 +1624,9 @@ def _find_owned_complete_block(content: str):
         legacy,
         previous_async,
         previous_async_without_platform,
+        legacy_compat,
+        previous_async_compat,
+        previous_async_without_platform_compat,
         expected_with_anchor_silent,
         expected_silent,
         v400_silent,
@@ -1608,6 +1636,9 @@ def _find_owned_complete_block(content: str):
         legacy_silent,
         previous_async_silent,
         previous_async_without_platform_silent,
+        legacy_compat_silent,
+        previous_async_compat_silent,
+        previous_async_without_platform_compat_silent,
     ):
         raise ValueError("corrupt completion patch markers")
     return begin_index, end_index
@@ -2715,8 +2746,11 @@ def _render_complete_hook_block(indent: str, newline: str):
         f"{deeper_indent}\"duration\": _response_time,{newline}",
         f"{deeper_indent}\"model\": agent_result.get(\"model\", \"\"),{newline}",
         f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"prompt_tokens\": agent_result.get(\"prompt_tokens\", 0),{newline}",
         f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
         f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_read_tokens\": agent_result.get(\"cache_read_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_write_tokens\": agent_result.get(\"cache_write_tokens\", 0),{newline}",
         f"{deeper_indent}}},{newline}",
         f"{deeper_indent}\"context\": {{{newline}",
         f"{deeper_indent}    \"used_tokens\": agent_result.get(\"last_prompt_tokens\", 0),{newline}",
@@ -2807,8 +2841,11 @@ def _render_pre_exact_complete_hook_block(indent: str, newline: str):
         f"{deeper_indent}\"duration\": _response_time,{newline}",
         f"{deeper_indent}\"model\": agent_result.get(\"model\", \"\"),{newline}",
         f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"prompt_tokens\": agent_result.get(\"prompt_tokens\", 0),{newline}",
         f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
         f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_read_tokens\": agent_result.get(\"cache_read_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_write_tokens\": agent_result.get(\"cache_write_tokens\", 0),{newline}",
         f"{deeper_indent}}},{newline}",
         f"{deeper_indent}\"context\": {{{newline}",
         f"{deeper_indent}    \"used_tokens\": agent_result.get(\"last_prompt_tokens\", 0),{newline}",
@@ -2910,8 +2947,11 @@ def _render_queued_complete_hook_block(indent: str, newline: str):
         f"{deeper_indent}    \"duration\": result.get(\"duration\", 0.0) if isinstance(result, dict) else 0.0,{newline}",
         f"{deeper_indent}    \"model\": result.get(\"model\", \"\") if isinstance(result, dict) else \"\",{newline}",
         f"{deeper_indent}    \"tokens\": {{{newline}",
+        f"{deeper_indent}        \"prompt_tokens\": result.get(\"prompt_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
         f"{deeper_indent}        \"input_tokens\": result.get(\"input_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
         f"{deeper_indent}        \"output_tokens\": result.get(\"output_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
+        f"{deeper_indent}        \"cache_read_tokens\": result.get(\"cache_read_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
+        f"{deeper_indent}        \"cache_write_tokens\": result.get(\"cache_write_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
         f"{deeper_indent}    }},{newline}",
         f"{deeper_indent}    \"context\": {{{newline}",
         f"{deeper_indent}        \"used_tokens\": result.get(\"last_prompt_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
@@ -2951,8 +2991,11 @@ def _render_legacy_complete_hook_block(indent: str, newline: str):
         f"{deeper_indent}\"answer\": response,{newline}",
         f"{deeper_indent}\"duration\": _response_time,{newline}",
         f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"prompt_tokens\": agent_result.get(\"prompt_tokens\", 0),{newline}",
         f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
         f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_read_tokens\": agent_result.get(\"cache_read_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_write_tokens\": agent_result.get(\"cache_write_tokens\", 0),{newline}",
         f"{deeper_indent}}},{newline}",
         f"{inner_indent}}}, event_name=\"message.completed\"){newline}",
         *_render_hook_exception_handler(indent, newline),
@@ -2975,8 +3018,11 @@ def _render_previous_async_complete_hook_block(indent: str, newline: str):
         f"{deeper_indent}\"answer\": response,{newline}",
         f"{deeper_indent}\"duration\": _response_time,{newline}",
         f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"prompt_tokens\": agent_result.get(\"prompt_tokens\", 0),{newline}",
         f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
         f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_read_tokens\": agent_result.get(\"cache_read_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_write_tokens\": agent_result.get(\"cache_write_tokens\", 0),{newline}",
         f"{deeper_indent}}},{newline}",
         f"{inner_indent}}}, event_name=\"message.completed\"){newline}",
         f"{inner_indent}if _hfc_card_delivered and source.platform.value == \"feishu\":{newline}",
@@ -3003,8 +3049,11 @@ def _render_previous_async_complete_hook_block_without_platform_guard(
         f"{deeper_indent}\"answer\": response,{newline}",
         f"{deeper_indent}\"duration\": _response_time,{newline}",
         f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"prompt_tokens\": agent_result.get(\"prompt_tokens\", 0),{newline}",
         f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
         f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_read_tokens\": agent_result.get(\"cache_read_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"cache_write_tokens\": agent_result.get(\"cache_write_tokens\", 0),{newline}",
         f"{deeper_indent}}},{newline}",
         f"{inner_indent}}}, event_name=\"message.completed\"){newline}",
         f"{inner_indent}if _hfc_card_delivered:{newline}",
