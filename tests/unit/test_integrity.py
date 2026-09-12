@@ -365,6 +365,45 @@ def test_migrate_integrity_manifest_requires_healthy_installed_git_state(
         migrate_integrity_manifest(detection)
 
 
+def test_explicit_migration_binds_reversible_local_git_customization_to_snapshot(
+    git_installed_state,
+):
+    root, detection, _run_source, cron_source = git_installed_state
+    custom_cron_source = cron_source + "\n# intentional local prefill\n"
+    custom_cron_patched = apply_cron_patch(custom_cron_source)
+    cron_backup = detection.cron_py.with_name(
+        "scheduler.py.hermes_feishu_card.bak"
+    )
+    cron_backup.write_text(custom_cron_source, encoding="utf-8")
+    detection.cron_py.write_text(custom_cron_patched, encoding="utf-8")
+    manifest_path = root / ".hermes_feishu_card_manifest"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cron_patched_sha256"] = sha256(
+        custom_cron_patched.encode()
+    ).hexdigest()
+    manifest["cron_backup_sha256"] = sha256(
+        custom_cron_source.encode()
+    ).hexdigest()
+    manifest.pop("integrity")
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+
+    migrated = migrate_integrity_manifest(detect_hermes(root))
+
+    assert migrated["kind"] == "verified_owned_snapshot"
+    assert "git_head" not in migrated
+    detection = detect_hermes(root)
+    plan = plan_integrity_repair(detection)
+    assert plan.reason == "recovery_not_required"
+    assert integrity_acknowledgement_eligible(
+        detection, plan_recovery(detection), plan
+    )
+
+    detection.cron_py.write_text(custom_cron_source + "# later drift\n")
+    drifted = plan_integrity_repair(detect_hermes(root))
+    assert drifted.executable is False
+    assert drifted.reason != "verified_git_upgrade"
+
+
 def test_integrity_transaction_rolls_back_when_post_commit_validation_fails(tmp_path):
     existing = tmp_path / "existing.txt"
     created = tmp_path / "created.txt"
@@ -637,3 +676,38 @@ def test_integrity_plan_refuses_owned_backup_mismatch(git_installed_state):
 
     assert plan.executable is False
     assert plan.reason in {"owned_backup_mismatch", "recovery_evidence_not_executable"}
+
+
+def test_gitless_monolithic_install_and_migration_prove_snapshot_only(git_installed_state, monkeypatch):
+    root, detection, run_source, cron_source = git_installed_state
+    shutil.rmtree(root / ".git")
+    def refuse_git(*_args, **_kwargs):
+        raise AssertionError("snapshot verification must not invoke Git")
+    monkeypatch.setattr(integrity_module, "_run_git", refuse_git)
+    _write_manifest(root, detection, run_source, cron_source)
+    manifest_path = root / integrity_module.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["integrity"]["kind"] == "verified_owned_snapshot"
+    assert "git_head" not in manifest["integrity"]
+    assert plan_integrity_repair(detection).reason == "recovery_not_required"
+    manifest.pop("integrity")
+    manifest_path.write_text(json.dumps(manifest))
+    evidence = migrate_integrity_manifest(detection)
+    assert evidence["layout"] == "gateway-monolithic"
+    plan = plan_integrity_repair(detection)
+    assert integrity_acknowledgement_eligible(detection, plan_recovery(detection), plan)
+    detection.run_py.write_text(run_source + "\n# source archive upgraded\n")
+    detection.cron_py.write_text(cron_source + "\n# source archive upgraded\n")
+    plan = plan_integrity_repair(detection)
+    assert not plan.executable and plan.reason == "git_history_unavailable"
+
+
+def test_gitless_snapshot_still_refuses_backup_drift(git_installed_state):
+    root, detection, run_source, cron_source = git_installed_state
+    shutil.rmtree(root / ".git")
+    _write_manifest(root, detection, run_source, cron_source)
+    backup = detection.run_py.with_name(detection.run_py.name + integrity_module.BACKUP_SUFFIX)
+    backup.write_text(run_source + "\n# edited backup\n")
+    assert not plan_integrity_repair(detection).executable
+    with pytest.raises(IntegrityRepairRefused):
+        migrate_integrity_manifest(detection)

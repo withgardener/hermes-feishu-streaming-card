@@ -2016,10 +2016,14 @@ def _exact_base_delivery_hook_available() -> bool:
         method = getattr(BasePlatformAdapter, "_process_message_background", None)
         code = getattr(method, "__code__", None)
         names = set(getattr(code, "co_names", ()) or ())
-        return {
-            "prepare_exact_base_final_delivery",
-            "finalize_exact_base_no_text",
-        }.issubset(names)
+        if {"prepare_exact_base_final_delivery", "finalize_exact_base_no_text"}.issubset(names):
+            return True
+        send = getattr(BasePlatformAdapter, "_send_final_text", None)
+        send_names = set(getattr(getattr(send, "__code__", None), "co_names", ()))
+        return {"capture_decomposed_base_context", "finalize_exact_base_no_text", "_send_final_text"}.issubset(names) and {
+            "prepare_decomposed_base_final_delivery", "_record_delivery_obligation",
+            "_send_with_retry", "_finalize_delivery_obligation",
+        }.issubset(send_names)
     except Exception:
         return False
 
@@ -2490,6 +2494,31 @@ async def _recover_exact_terminal_native_handoff(
         )
         return True
     return False
+
+
+def capture_decomposed_base_context(local_vars: dict[str, Any]) -> None:
+    """Carry extracted attachments across Base's helper call in this exact turn."""
+    stage = _exact_completion_stage_for_current_task()
+    if stage is not None:
+        stage["base_context"] = {
+            key: local_vars[key] for key in ("images", "local_files", "media_files")
+        }
+
+
+async def prepare_decomposed_base_final_delivery(
+    local_vars: dict[str, Any],
+) -> tuple[Any, str, Any, Any]:
+    stage = _exact_completion_stage_for_current_task()
+    if stage is not None:
+        context = stage.pop("base_context", None)
+        if not isinstance(context, dict):
+            # Missing extraction evidence must never grant a text-only ACK.
+            _HFC_EXACT_COMPLETION_STAGE.set(None)
+            _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+            return (local_vars.get("delivery_adapter"), str(local_vars.get("content") or ""),
+                    local_vars.get("reply_to"), local_vars.get("metadata"))
+        local_vars = {**local_vars, **context}
+    return await prepare_exact_base_final_delivery(local_vars)
 
 
 async def prepare_exact_base_final_delivery(
@@ -3265,19 +3294,13 @@ def _hfc_native_feishu_command_cards_available(local_vars: dict[str, Any]) -> bo
         if _platform_name(local_vars, source_obj) != "feishu":
             return False
         runner = local_vars.get("self") or local_vars.get("runner")
-        adapters = getattr(runner, "adapters", None)
-        if not isinstance(adapters, dict):
+        adapter = _hfc_feishu_adapter_from_runner(runner, source_obj)
+        if adapter is None or not getattr(adapter, "_client", None):
             return False
-        for key, adapter in list(adapters.items()):
-            if not _is_feishu_adapter_key(key, adapter):
-                continue
-            if not getattr(adapter, "_client", None):
-                continue
-            if not hasattr(adapter, "_feishu_send_with_retry"):
-                continue
-            install_feishu_command_card_adapter_methods(runner)
-            return callable(getattr(adapter, "send_slash_confirm", None))
-        return False
+        if not hasattr(adapter, "_feishu_send_with_retry"):
+            return False
+        install_feishu_command_card_adapter_methods(runner)
+        return callable(getattr(adapter, "send_slash_confirm", None))
     except Exception:
         return False
 
@@ -3868,13 +3891,7 @@ async def _hfc_try_resume_picker(
         if not visible:
             return False
 
-        adapter = None
-        adapters = getattr(runner, "adapters", None)
-        if isinstance(adapters, dict):
-            for key, candidate in adapters.items():
-                if _is_feishu_adapter_key(key, candidate):
-                    adapter = candidate
-                    break
+        adapter = _hfc_feishu_adapter_from_runner(runner, source)
         if adapter is None or not getattr(adapter, "_client", None):
             return False
         send_picker = getattr(adapter, "send_resume_picker", None)
@@ -5858,8 +5875,17 @@ async def _hfc_send_raw_message_with_native_handoff_route(self: Any, **kwargs: A
         raise RuntimeError("original Feishu raw send unavailable")
     metadata = kwargs.get("metadata")
     thread_id = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    reply_to = str(kwargs.get("reply_to") or "").strip()
+    if not reply_to and thread_id:
+        metadata_reply_to = _metadata_reply_to(
+            metadata if isinstance(metadata, dict) else None
+        )
+        if metadata_reply_to.startswith("om_"):
+            kwargs = dict(kwargs)
+            kwargs["reply_to"] = metadata_reply_to
+            reply_to = metadata_reply_to
     send_kwargs = kwargs
-    if thread_id and not kwargs.get("reply_to"):
+    if thread_id and not reply_to:
         # Feishu's create API accepts chat_id but not thread_id. Preserve the
         # logical topic binding for native-handoff identity/UUID derivation,
         # while making the actual unanchored create fall back to the parent chat.
@@ -5870,9 +5896,9 @@ async def _hfc_send_raw_message_with_native_handoff_route(self: Any, **kwargs: A
     if _HFC_NATIVE_HANDOFF_SEND_TRACKER.get() is None:
         return await original(self, **send_kwargs)
     if thread_id:
-        route = "thread-reply" if kwargs.get("reply_to") else "thread-create"
+        route = "thread-reply" if reply_to else "thread-create"
     else:
-        route = "reply" if kwargs.get("reply_to") else "create"
+        route = "reply" if reply_to else "create"
     token = _HFC_NATIVE_HANDOFF_ROUTE.set(route)
     try:
         return await original(self, **send_kwargs)
@@ -6198,16 +6224,49 @@ async def _hfc_deliver_platform_notice_with_card(
     return None
 
 
+def _hfc_registered_adapter_items(runner: Any) -> list[tuple[Any, Any]]:
+    """Include connected secondary transports without duplicating shared instances."""
+    registries = [getattr(runner, "adapters", None)]
+    profiles = getattr(runner, "_profile_adapters", None)
+    if isinstance(profiles, dict):
+        registries.extend(list(profiles.values()))
+    result = []
+    seen = set()
+    for registry in registries:
+        if not isinstance(registry, dict):
+            continue
+        for key, adapter in list(registry.items()):
+            if adapter is not None and id(adapter) not in seen:
+                seen.add(id(adapter))
+                result.append((key, adapter))
+    return result
+
+
 def _hfc_feishu_adapter_from_runner(runner: Any, source: Any) -> Any:
-    adapters = getattr(runner, "adapters", {})
+    if source is None or _platform_name({}, source) != "feishu":
+        return None
+    # Current Hermes validates retained transport provenance before profile lookup.
+    # A shared bot may own a turn routed to another profile; preserve that contract.
+    resolver = getattr(runner, "_adapter_for_source", None)
+    if callable(resolver):
+        try:
+            adapter = resolver(source)
+        except Exception:
+            return None
+        return adapter if adapter is not None and _is_feishu_adapter_key(None, adapter) else None
+    adapters = getattr(runner, "adapters", None)
+    profile = _first_attr_string(source, ("profile", "profile_id", "hermes_profile"))
+    if profile and profile != "default":
+        profiles = getattr(runner, "_profile_adapters", None)
+        if isinstance(profiles, dict) and profile in profiles:
+            adapters = profiles[profile]
+        elif profile != getattr(runner, "_primary_profile_name", None):
+            return None
     if not isinstance(adapters, dict):
         return None
-    adapter = adapters.get(getattr(source, "platform", None))
-    if adapter is not None:
-        return adapter
-    for key, candidate in list(adapters.items()):
-        if _is_feishu_adapter_key(key, candidate):
-            return candidate
+    for key, adapter in list(adapters.items()):
+        if _is_feishu_adapter_key(key, adapter):
+            return adapter
     return None
 
 
@@ -8393,8 +8452,23 @@ def request_approval_choice_from_hermes_locals(
     interaction_id: str,
     timeout_seconds: float | None = None,
 ) -> str | None:
+    import html
+
     command = str(approval_data.get("command") or "").strip()
     description = str(approval_data.get("description") or "dangerous command").strip()
+    # Ordinary Markdown wraps long commands on mobile, unlike fenced blocks.
+    # Escape formatting so command text cannot hide parts behind links or tags.
+    def approval_text(value: str) -> str:
+        return re.sub(r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1", html.escape(value, quote=False))
+
+    approval_description = (
+        f"**操作说明**\n{approval_text(description)}\n\n"
+        f"**完整命令**\n{approval_text(command)}"
+    )
+    # Reserve room for the header, options, callbacks, and footer inside the
+    # 28 KB card envelope. Never offer approval for a truncated command.
+    if len(json.dumps(approval_description, ensure_ascii=False).encode("utf-8")) > 12_000:
+        return None
     smart_denied = approval_data.get("smart_denied") is True
     allow_session = approval_data.get("allow_session", True) is not False
     allow_permanent = approval_data.get("allow_permanent", True) is not False
@@ -8410,11 +8484,15 @@ def request_approval_choice_from_hermes_locals(
         kind="approval",
         interaction_id=interaction_id,
         prompt="需要授权后继续执行",
-        description=f"```\n{command[:3000]}\n```\n\n{description}",
+        description=approval_description,
         options=options,
         timeout_seconds=timeout_seconds,
         allow_custom_input=allow_custom_input,
     )
+    if isinstance(result, dict) and result.get("status") in {"failed", "timeout"}:
+        # The card was accepted. Expiry must resolve this approval safely,
+        # rather than return None and reopen native approval outside its topic.
+        return "deny"
     if isinstance(result, dict) and result.get("status") == "completed":
         choice = str(result.get("choice") or "").strip()
         allowed_choices = {str(option["value"]) for option in options}
@@ -8492,19 +8570,55 @@ def _hfc_install_policy_adapter_method(
     return True
 
 
+def _hfc_thread_metadata_for_target_with_feishu_reply_anchor(
+    self: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    original = getattr(
+        type(self),
+        "_hfc_original_thread_metadata_for_target",
+        None,
+    )
+    if not callable(original):
+        return None
+    metadata = original(self, *args, **kwargs)
+    platform = kwargs.get("platform", args[0] if len(args) > 0 else None)
+    thread_id = kwargs.get("thread_id", args[2] if len(args) > 2 else None)
+    reply_to_message_id = kwargs.get("reply_to_message_id")
+    platform_name = str(getattr(platform, "value", platform) or "").strip().lower()
+    thread = str(thread_id or "").strip()
+    reply_anchor = str(reply_to_message_id or "").strip()
+    if platform_name != "feishu" or not thread or not reply_anchor:
+        return metadata
+    routed = dict(metadata) if isinstance(metadata, dict) else {}
+    routed.setdefault("thread_id", thread)
+    routed.setdefault("reply_to_message_id", reply_anchor)
+    return routed
+
+
 def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) -> bool:
     try:
         _remember_gateway_runner(runner)
         _ensure_runtime_control_started()
         _install_delivery_ledger_mark_delivered_wrapper()
-        adapters = getattr(runner, "adapters", None)
-        if not isinstance(adapters, dict):
+        adapters = _hfc_registered_adapter_items(runner)
+        if not isinstance(getattr(runner, "adapters", None), dict) and not isinstance(
+            getattr(runner, "_profile_adapters", None), dict
+        ):
             if event is not None:
                 _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
             _HFC_FEISHU_NOTICE_CONTEXT.set(None)
             _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
             return False
         runner_type = type(runner)
+        if callable(getattr(runner_type, "_thread_metadata_for_target", None)):
+            _hfc_install_policy_adapter_method(
+                runner_type,
+                method_name="_thread_metadata_for_target",
+                wrapper=_hfc_thread_metadata_for_target_with_feishu_reply_anchor,
+                original_name="_hfc_original_thread_metadata_for_target",
+            )
         _hfc_install_resume_picker_handler(runner_type)
         _hfc_install_compress_command_handler(runner_type)
         _hfc_install_update_command_handler(runner_type)
@@ -8541,7 +8655,7 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
             _hfc_delivery_context_from_event(event) if event is not None else None
         )
         installed = False
-        for key, adapter in list(adapters.items()):
+        for key, adapter in adapters:
             if not _is_feishu_adapter_key(key, adapter):
                 continue
             adapter_type = type(adapter)
@@ -9237,6 +9351,11 @@ def build_cron_event(local_vars: dict[str, Any]) -> dict[str, Any] | None:
     origin_platform = str(origin.get("platform") or "").strip().lower()
     origin_chat_id = origin.get("chat_id") if origin_platform == "feishu" else ""
     origin_thread_id = origin.get("thread_id") if origin_platform == "feishu" else ""
+    origin_message_id = (
+        str(origin.get("message_id") or "").strip()
+        if origin_platform == "feishu"
+        else ""
+    )
     chat_id = str(
         resolved_chat_id
         or _deliver_chat_id(job.get("deliver"))
@@ -9251,7 +9370,7 @@ def build_cron_event(local_vars: dict[str, Any]) -> dict[str, Any] | None:
     # inside a topic group).  Priority: resolved targets > origin > env var.
     thread_id = str(
         _resolved_target_thread_id(resolved_targets, "feishu")
-        or origin_thread_id
+        or (origin_thread_id if chat_id == str(origin_chat_id or "").strip() else "")
         or os.environ.get("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "")
     ).strip() or ""
 
@@ -9279,6 +9398,13 @@ def build_cron_event(local_vars: dict[str, Any]) -> dict[str, Any] | None:
         "data": {
             "answer": content,
             "delivery_kind": "cron",
+            **(
+                {"reply_to_message_id": origin_message_id}
+                if origin_message_id.startswith("om_")
+                and chat_id == str(origin_chat_id or "").strip()
+                and thread_id == str(origin_thread_id or "").strip()
+                else {}
+            ),
             "profile_id": profile_id,
             "profile_source": profile_source,
             "attachments": attachments,
@@ -9685,6 +9811,17 @@ def _event_data(
         return data
     if event_name == "message.completed":
         answer = _completion_answer(local_vars)
+        # The completion envelope also carries failed/partial Gateway returns.
+        # Keep its delivery/attachment contract, but do not lose exact outcome
+        # flags or infer task success from the presence of response text.
+        result = local_vars.get("agent_result")
+        if isinstance(result, dict):
+            if result.get("interrupted") is True:
+                data["turn_outcome"] = "interrupted"
+            elif result.get("failed") is True:
+                data["turn_outcome"] = "failed"
+            elif result.get("completed") is False or result.get("partial") is True:
+                data["turn_outcome"] = "incomplete"
         attachments = _extract_attachments(answer, local_vars)
         data.update({
             "answer": _card_visible_answer(answer),
@@ -9784,6 +9921,12 @@ def _event_data(
                 value = _first_attr_string(local_vars.get("event"), (reply_key,))
             if value:
                 data[reply_key] = value
+        if local_vars.get("redirect_followup") is True:
+            data["redirect_followup"] = True
+            for key in ("redirect_from_turn_id", "redirect_from_message_id"):
+                value = _first_string(local_vars, (key,))
+                if value:
+                    data[key] = value
         return data
     return {}
 
@@ -9837,8 +9980,14 @@ def _is_lower_hex(value: str, length: int) -> bool:
 
 
 def _profile_identity(local_vars: dict[str, Any], source_obj: Any, message_obj: Any) -> tuple[str, str]:
+    runner = local_vars.get("self") or local_vars.get("runner")
+    registered = _GATEWAY_RUNNER_REF() if _GATEWAY_RUNNER_REF is not None else None
+    multiplex = any(
+        getattr(getattr(item, "config", None), "multiplex_profiles", False) is True
+        for item in (runner, registered)
+    )
     env_profile = os.environ.get("HERMES_FEISHU_CARD_PROFILE_ID", "").strip()
-    if env_profile:
+    if env_profile and not multiplex:
         return legacy_profile_identity(env_profile, "env")
     direct = (
         _first_string(local_vars, ("profile_id", "hermes_profile", "profile"))
@@ -9847,6 +9996,17 @@ def _profile_identity(local_vars: dict[str, Any], source_obj: Any, message_obj: 
     )
     if direct:
         return legacy_profile_identity(direct, "locals")
+    if multiplex:
+        # Hermes scopes get_hermes_home() with a ContextVar for each turn;
+        # process-wide HERMES_HOME belongs to the primary profile only.
+        try:
+            from hermes_constants import get_hermes_home
+            profile = profile_from_hermes_home_path(str(get_hermes_home()))
+        except (ImportError, AttributeError):
+            profile = None
+        if profile:
+            return legacy_profile_identity(profile, "hermes_home")
+        return "default", "fallback_default"
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     profile = profile_from_hermes_home_path(hermes_home)
     if profile:
@@ -9941,6 +10101,42 @@ def _first_string(source: dict[str, Any], names: tuple[str, ...]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def bind_agent_turn_identity(agent: Any, source: Any) -> bool:
+    """Bind a cached agent to the already admitted source turn, never a reply anchor."""
+    try:
+        # Cached agents are reused: failure to prove this turn invalidates the
+        # previous binding rather than allowing a later redirect to reuse it.
+        setattr(agent, "_hfc_turn_binding", None)
+        turn_id = getattr(source, _CANONICAL_TURN_ATTR, None)
+        if _platform_name({}, source) != "feishu" or not isinstance(turn_id, str) or not turn_id.strip():
+            return False
+        profile, profile_source = _profile_identity({}, source, None)
+        chat_id = _first_attr_string(source, ("chat_id",))
+        thread_id = _first_attr_string(source, ("thread_id",)) or ""
+        if not chat_id or profile_source.startswith("sanitized_"):
+            return False
+        setattr(agent, "_hfc_turn_binding", (turn_id.strip(), profile, chat_id, thread_id))
+        return True
+    except Exception:
+        return False
+
+
+def redirect_turn_id_for_agent(agent: Any, source: Any) -> str:
+    """Return the exact callback owner only within the same profile/chat/topic."""
+    try:
+        binding = getattr(agent, "_hfc_turn_binding", None)
+        if not isinstance(binding, tuple) or len(binding) != 4:
+            return ""
+        profile, profile_source = _profile_identity({}, source, None)
+        scope = (profile, _first_attr_string(source, ("chat_id",)),
+                 _first_attr_string(source, ("thread_id",)) or "")
+        if _platform_name({}, source) != "feishu" or profile_source.startswith("sanitized_"):
+            return ""
+        return binding[0] if binding[1:] == scope else ""
+    except Exception:
+        return ""
 
 
 def _turn_id_for_runtime_event(
@@ -10290,6 +10486,23 @@ def _completion_model(local_vars: dict[str, Any]) -> str:
     return "Unknown"
 
 
+def effective_response_model(agent: Any) -> str:
+    """Capture the actual fallback route before Gateway discards result fields."""
+    route = getattr(agent, "_provider_fallback_route", None)
+    if isinstance(route, (tuple, list)) and len(route) == 2:
+        model, provider = route
+    else:
+        model, provider = getattr(agent, "model", None), getattr(agent, "provider", None)
+    if not isinstance(model, str) or not model.strip():
+        return ""
+    model = model.strip()
+    # A URL or arbitrary secret-bearing runtime value is not a provider label.
+    if isinstance(provider, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", provider):
+        if not model.startswith(provider + "/"):
+            return f"{provider}/{model}"
+    return model
+
+
 def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int]:
     explicit_tokens = local_vars.get("tokens")
     agent_result = local_vars.get("agent_result")
@@ -10297,8 +10510,24 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
         agent_result = {}
 
     input_tokens = _token_value(explicit_tokens, "input_tokens")
+    if input_tokens <= 0:
+        input_tokens = _positive_int(agent_result.get("input_tokens"))
     output_tokens = _token_value(explicit_tokens, "output_tokens")
+    if output_tokens <= 0:
+        output_tokens = _positive_int(agent_result.get("output_tokens"))
+    cache_read_tokens = _token_value(explicit_tokens, "cache_read_tokens")
+    if cache_read_tokens <= 0:
+        cache_read_tokens = _positive_int(agent_result.get("cache_read_tokens"))
+    cache_write_tokens = _token_value(explicit_tokens, "cache_write_tokens")
+    if cache_write_tokens <= 0:
+        cache_write_tokens = _positive_int(agent_result.get("cache_write_tokens"))
+    prompt_tokens = _token_value(explicit_tokens, "prompt_tokens")
+    if prompt_tokens <= 0:
+        prompt_tokens = _positive_int(agent_result.get("prompt_tokens"))
+    if prompt_tokens <= 0:
+        prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
     last_prompt_tokens = _positive_int(agent_result.get("last_prompt_tokens"))
+
     estimated_output_tokens = _estimate_output_tokens(answer) if answer else 0
 
     if last_prompt_tokens > 0 and input_tokens > last_prompt_tokens * 2:
@@ -10326,10 +10555,18 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
     if output_tokens <= 0 and answer:
         output_tokens = estimated_output_tokens
 
-    return {
+    result = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+    for key, value in (
+        ("prompt_tokens", prompt_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+        ("cache_write_tokens", cache_write_tokens),
+    ):
+        if value > 0:
+            result[key] = value
+    return result
 
 
 def _completion_context(local_vars: dict[str, Any]) -> dict[str, int]:

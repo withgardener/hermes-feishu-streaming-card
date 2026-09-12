@@ -134,11 +134,21 @@ def test_reusable_ci_checks_out_requested_ref_in_every_job():
     ]
 
     assert checkout_steps
-    assert all(
-        step.get("with", {}).get("ref")
-        == "${{ inputs.checkout_ref || github.sha }}"
-        for step in checkout_steps
-    )
+    import json
+
+    sources = json.loads((ROOT / "tests/fixtures/hermes_upstream_sources.json").read_text())
+    upstream_checkouts = {}
+    for step in checkout_steps:
+        inputs = step.get("with", {})
+        if "repository" not in inputs:
+            assert inputs.get("ref") == "${{ inputs.checkout_ref || github.sha }}"
+        else:
+            assert inputs["repository"] == "NousResearch/hermes-agent"
+            upstream_checkouts[inputs.get("path")] = inputs.get("ref")
+    assert upstream_checkouts == {
+        f".upstream/{baseline}": evidence["commit"]
+        for baseline, evidence in sources.items()
+    }
 
 
 def test_official_actions_are_sha_pinned_to_node24_capable_releases():
@@ -147,8 +157,8 @@ def test_official_actions_are_sha_pinned_to_node24_capable_releases():
         "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",
         "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         "actions/download-artifact": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-        "github/codeql-action/init": "ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd",
-        "github/codeql-action/analyze": "ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd",
+        "github/codeql-action/init": "cdf488f595d80d6e07e03d4674febd5ab45fa938",
+        "github/codeql-action/analyze": "cdf488f595d80d6e07e03d4674febd5ab45fa938",
     }
     workflow_paths = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
 

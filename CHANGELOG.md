@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.4.5 — 2026-09-10
+
+### Fixed
+- Preserve unsuccessful Gateway outcomes in the final card and suppress success notifications for failed, interrupted or incomplete turns.
+- End superseded cards without claiming that the interrupted task completed; retain partial content and keep late events isolated from the new turn.
+- Recognize the reported decomposed Hermes split-ledger contract, with strict delivery-order, adapter, arguments and reversible ownership checks. Based on tidytorch's PR #286, with additional rejection and execution regressions.
+
+### Maintenance
+- Require scenario-based stability evidence, failure/late-event regressions and explicit real-client acceptance boundaries in the maintainer policy and PR template.
+
+## V4.4.4 — 2026-09-08
+
+See [release notes](docs/release-notes-v4.4.4.md) and [English notes](docs/release-notes-v4.4.4.en.md).
+
+### Fixed
+- Preserve Hermes' synthetic `reply_to_message_id` in Feishu topic metadata so restart and shutdown notices use the reply API with `reply_in_thread=true` instead of falling back to the parent chat.
+- Install HFC's Feishu routing wrappers before current Hermes `start()` runs boot notifications and delivery redelivery.
+
+### Safety
+- The wrapper applies only when the platform is Feishu and both a topic id and a reply anchor are present. Other platforms and unanchored sends retain their existing metadata.
+- Hermes source remains modified only through the owned, reversible patcher block.
+
+### Validation
+- Focused hot-file regressions passed with `943 passed, 1 skipped`; documentation/package metadata regressions passed with `101 passed`; full pytest passed with `3533 passed, 9 skipped in 752.17s`, followed by `git diff --check`.
+- PEP 517 sdist/wheel and a fresh Python 3.12 regular-wheel install passed package/distribution `4.4.4`, single-entrypoint, 24-slice provenance, and CLI checks.
+- Local production Hermes 0.21.0 loaded the candidate from its runtime venv and returned to `runtime_ready / integrity=safe`. A real Feishu group-topic `/restart` kept its success notice in the original topic; the exact active-work shutdown path remains automation-backed.
+
+### Credits
+- [mouyong](https://github.com/mouyong): [#270](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/270) restart/shutdown notice routing report.
+
+## V4.4.3 — 2026-09-08
+
+See [release notes](docs/release-notes-v4.4.3.md) and [English notes](docs/release-notes-v4.4.3.en.md).
+
+### Fixed
+- Accept explicitly approved Hermes upgrades that still contain older HFC-owned primary hook blocks, after strict manifest/backup proof and bounded lenient removal both succeed.
+- Let explicit integrity migration bind a healthy reversible local Git customization to installation-only snapshot provenance; it still cannot authorize automatic upstream repair.
+- Hide the empty “思考与工具 · 0 次工具调用” panel and redundant zero-tool summary while retaining the timeline as soon as a real reasoning, tool, subagent, or notice entry exists.
+- Add the current local production Hermes source snapshot to the pinned compatibility gate.
+
+### Validation
+- Full pytest passed with `3530 passed, 9 skipped in 843.13s`; `git diff --check`, PEP 517 package build, and a fresh Python 3.12 wheel-only `site-packages`/entrypoint/CLI provenance check passed.
+- Local production Hermes 0.21.0 loaded the candidate wheel from its runtime venv, completed safe integrity migration, restarted the sidecar and Gateway, and reached `healthy / runtime_ready`.
+- A real Feishu DM smoke and an inbound Hermes turn both reached the sidecar; observed sends and event applications completed without send failure.
+- Real multi-bot multiplex remains unverified because the available production Gateway has only the `default` profile; two named bot/profile/topic identities are covered by the executable upstream-handler regression.
+
+### Credits
+- [mouyong](https://github.com/mouyong): [#268](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/268) multiplex production report and [#269](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/269) empty timeline feedback.
+
+## V4.4.2 — 2026-09-08
+
+See [release notes](docs/release-notes-v4.4.2.md) and [English notes](docs/release-notes-v4.4.2.en.md).
+
+### Fixed
+- PR #267: complete ownership verification, decomposed integrity migration and conservative source-only snapshots, including metadata rollback on source drift.
+- Wrap secondary multiplex adapters while retaining Hermes transport ownership.
+- Number interaction buttons, retain full option descriptions, deny expired accepted approvals, and reject oversized requests before admission.
+- Add pinned upstream Hermes compatibility gates on Python 3.12/3.13 and Docker/s6 deployment guidance.
+
+### Credits
+- [ywarmy](https://github.com/ywarmy): [#261](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/261), Hermes 0.21 completion-marker report.
+- [Ricadre](https://github.com/Ricadre): [#265](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/265), stale integrity migration reproduction.
+- [mouyong](https://github.com/mouyong): [#83](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/83), [#263](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/263), [#264](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/264), [#266](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/266), Docker/source-only and multiplex evidence; [#258](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/258), approval readability feedback.
+
+## V4.4.1 — 2026-09-07
+
+See also: [Chinese release notes](docs/release-notes-v4.4.1.md) and [English release notes](docs/release-notes-v4.4.1.en.md).
+
+### Fixed
+- PR #257 / Issues #254, #255, #256: support Hermes 0.21 facade/mixin source layouts with validated multi-file ownership, reversible patching, and conservative handling of stale or edited installations.
+- PR #251 / Issue #252: preserve topic reply anchors for follow-up, queued, redirected, and cron messages while keeping explicit turn identity authoritative.
+- Issues #83 and #259: preserve message-level profile identity for single-process multiplexing and avoid assuming that every configuration contains a profile named `default`.
+- Issue #258: remove silent 3,000-character approval-command truncation, escape command markup, use wrapping text, and return oversized authorization requests to native Hermes approval before creating a card.
+- PRs #247 and #248: update CodeQL init/analyze together and align the workflow contract tests.
+
+### Added
+- Issue #253: opt-in `card.reasoning_format: code` displays recorded reasoning outside the collapsed tool panel; the default `panel` layout and card limits are retained.
+- Issue #250: footer model labels include the provider reported by the runtime, preserving fallback attribution and avoiding duplicate prefixes.
+
+### Validation
+- Focused renderer/config/runtime tests and server rendering integration passed. Full-suite and built-wheel results are recorded during the release gate; no current real Feishu/Lark client acceptance is claimed.
+- Historical Issue #73 still requires the reporter's current environment evidence; do not infer its exact cause or close it solely from compatibility tests.
+
 ## V4.4.0 — 2026-08-31
 
 See also: [docs/release-notes-v4.4.0.md](docs/release-notes-v4.4.0.md)

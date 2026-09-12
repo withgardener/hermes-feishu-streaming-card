@@ -25,6 +25,7 @@ DEFAULT_FOOTER_FIELDS = (
     "model",
     "input_tokens",
     "output_tokens",
+    "cache_rate",
     "context",
 )
 MAIN_CONTENT_CHUNK_CHARS = 2400
@@ -111,6 +112,7 @@ def render_card(
     table_overflow_mode: str = "compact",
     interaction_profile_id: str = "default",
     mentions_enabled: bool = True,
+    reasoning_format: str = "panel",
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -127,6 +129,7 @@ def render_card(
         table_overflow_mode=table_overflow_mode,
         interaction_profile_id=interaction_profile_id,
         mentions_enabled=mentions_enabled,
+        reasoning_format=reasoning_format,
     ).card
 
 
@@ -145,6 +148,7 @@ def render_card_result(
     table_overflow_mode: str = "compact",
     interaction_profile_id: str = "default",
     mentions_enabled: bool = True,
+    reasoning_format: str = "panel",
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(session)
     table_overflow = transform_table_overflow(
@@ -166,6 +170,7 @@ def render_card_result(
         table_overflow_mode=table_overflow_mode,
         interaction_profile_id=interaction_profile_id,
         mentions_enabled=mentions_enabled,
+        reasoning_format=reasoning_format,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -207,6 +212,7 @@ def _render_card_unchecked(
     table_overflow_mode: str = "compact",
     interaction_profile_id: str = "default",
     mentions_enabled: bool = True,
+    reasoning_format: str = "panel",
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -240,6 +246,11 @@ def _render_card_unchecked(
         else _runtime_header_title(session, configured_title)
     )
     pending_interaction = session.active_interaction
+    pending_approval = (
+        pending_interaction is not None
+        and pending_interaction.status == "pending"
+        and pending_interaction.kind == "approval"
+    )
     if (
         pending_interaction is not None
         and pending_interaction.status == "pending"
@@ -253,6 +264,10 @@ def _render_card_unchecked(
         header_title = f"{prefix}{header_title}"
     main_role = "notice" if session.delivery_kind == "notice" else "body"
     elements = []
+    if pending_approval:
+        # Keep the authorization scope and choices together. Prior answers and
+        # the execution timeline must not push this decision below old output.
+        primary_text = pending_interaction.prompt
     if primary_text:
         elements = _render_main_content_elements(
             primary_text,
@@ -265,7 +280,7 @@ def _render_card_unchecked(
             ),
         )
     timeline_elements: list[Dict[str, Any]] = []
-    if show_reasoning:
+    if show_reasoning and not pending_approval:
         timeline_elements = _render_timeline_elements(
             session,
             expanded=timeline_expanded,
@@ -274,6 +289,7 @@ def _render_card_unchecked(
             max_tool_result_chars=max_tool_result_chars,
             text_sizes=text_sizes,
             used_text_size_roles=used_text_size_roles,
+            reasoning_format=reasoning_format,
         )
         elements.extend(timeline_elements)
     elements.extend(
@@ -283,7 +299,7 @@ def _render_card_unchecked(
             mentions_enabled=mentions_enabled,
         )
     )
-    if attachment_summary:
+    if attachment_summary and not pending_approval:
         elements.append(
             {
                 "tag": "markdown",
@@ -292,7 +308,7 @@ def _render_card_unchecked(
             }
         )
     elements.append({"tag": "hr", "element_id": "main_divider"})
-    if not timeline_elements:
+    if not timeline_elements and not pending_approval and session.tool_count:
         tool_summary = {
             "tag": "markdown",
             "element_id": "tool_summary",
@@ -466,6 +482,9 @@ def _render_legacy_callback_card(
     description = normalize_stream_text(interaction.description).strip()
     if description:
         elements.append({"tag": "markdown", "content": description})
+
+    if interaction.kind in {"approval", "clarify"}:
+        elements.extend(_interaction_option_descriptions(interaction))
 
     mention = _interaction_mention_content(
         session,
@@ -812,6 +831,8 @@ def _render_interaction_elements(
         return elements
 
     if interaction.status == "pending":
+        if interaction.kind in {"approval", "clarify"}:
+            elements.extend(_interaction_option_descriptions(interaction))
         if interaction.multi_select:
             if mention:
                 hint = f"{mention} 请选择（可多选）"
@@ -943,6 +964,21 @@ def _interaction_callback_value(
     return value
 
 
+def _interaction_option_descriptions(interaction: Any) -> list[Dict[str, Any]]:
+    # Labels were plain_text on buttons. Preserve that meaning in the body:
+    # do not let Markdown links or tags hide any part of a decision.
+    lines = []
+    for index, option in enumerate(interaction.options, start=1):
+        label = re.sub(
+            r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1",
+            html.escape(option.label, quote=False),
+        )
+        lines.append(f"{index}. {label}")
+    if not lines:
+        return []
+    return [{"tag": "markdown", "content": "\n\n".join(lines)}]
+
+
 def _render_choice_button(
     interaction: Any,
     index: int,
@@ -957,7 +993,10 @@ def _render_choice_button(
         # the submitted value stays the clean option value.
         "text": {
             "tag": "plain_text",
-            "content": f"{index + 1}. {option.label}",
+            "content": (
+                str(index + 1) if interaction.kind in {"approval", "clarify"}
+                else f"{index + 1}. {option.label}"
+            ),
         },
         "type": _button_type(option.style),
         "size": "medium",
@@ -1033,7 +1072,10 @@ def _render_multi_select_form(
         {
             "text": {
                 "tag": "plain_text",
-                "content": f"{index}. {option.label}",
+                "content": (
+                    str(index) if interaction.kind in {"approval", "clarify"}
+                    else f"{index}. {option.label}"
+                ),
             },
             "value": option.value,
         }
@@ -1118,30 +1160,17 @@ def _render_timeline_elements(
     max_tool_result_chars: int,
     text_sizes: Mapping[str, Any] | None = None,
     used_text_size_roles: set[str] | None = None,
+    reasoning_format: str = "panel",
 ) -> list[Dict[str, Any]]:
     if not getattr(session, "timeline", None):
         return []
     all_entries = session.timeline.snapshot()
+    if not all_entries:
+        return []
     entries = _select_timeline_entries(all_entries, max_items=max_items)
     folded = max(0, len(all_entries) - len(entries))
-    if not entries and not folded:
-        empty_content = (
-            '<font color="grey">等待工具事件…</font>'
-            if _is_initial_loading(session)
-            else '<font color="grey">暂无可展示的思考或工具记录。</font>'
-        )
-        panel_elements = _timeline_markdown_elements(
-            empty_content,
-            "auxiliary_timeline_loading",
-            text_size=_role_text_size(
-                text_sizes,
-                "tool",
-                default="x-small",
-                used_roles=used_text_size_roles,
-            ),
-        )
-        return [_timeline_panel(session, panel_elements, expanded=expanded)]
     panel_elements: list[Dict[str, Any]] = []
+    reasoning_elements: list[Dict[str, Any]] = []
     if folded:
         panel_elements.extend(
             _timeline_markdown_elements(
@@ -1164,8 +1193,14 @@ def _render_timeline_elements(
             )
             lines = [f"**{item.title}** · {item.status}"]
             if content:
-                lines.append(content)
-            panel_elements.extend(
+                if reasoning_format == "code":
+                    # A longer fence preserves embedded backticks literally.
+                    fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", content)), default=0))
+                    lines.append(f"{fence}text\n{content}\n{fence}")
+                else:
+                    lines.append(content)
+            target_elements = reasoning_elements if reasoning_format == "code" else panel_elements
+            target_elements.extend(
                 _timeline_markdown_elements(
                     "\n".join(lines),
                     f"auxiliary_timeline_reasoningentry_{index}",
@@ -1246,9 +1281,9 @@ def _render_timeline_elements(
                     ),
                 )
             )
-    if not panel_elements:
-        return []
-    return [_timeline_panel(session, panel_elements, expanded=expanded)]
+    if panel_elements:
+        reasoning_elements.append(_timeline_panel(session, panel_elements, expanded=expanded))
+    return reasoning_elements
 
 
 def _timeline_panel(
@@ -1467,11 +1502,23 @@ def _render_footer(
     tokens = session.tokens if isinstance(session.tokens, dict) else {}
     input_tokens = _safe_int(tokens.get("input_tokens"))
     output_tokens = _safe_int(tokens.get("output_tokens"))
+    cache_read_tokens = _safe_int(tokens.get("cache_read_tokens"))
+    prompt_tokens = _safe_int(tokens.get("prompt_tokens"))
+    cache_rate = (
+        f"缓存 {min(100, max(0, round(cache_read_tokens / prompt_tokens * 100)))}%"
+        if prompt_tokens > 0 and cache_read_tokens > 0
+        else ""
+    )
     try:
         duration = float(session.duration)
     except (TypeError, ValueError):
         duration = 0.0
     model = session.model if isinstance(session.model, str) and session.model.strip() else "Unknown"
+    provider = getattr(session, "provider", "")
+    if isinstance(provider, str) and provider.strip() and model != "Unknown":
+        provider = provider.strip()
+        if not model.startswith(provider + "/"):
+            model = f"{provider}/{model}"
     context = session.context if isinstance(session.context, dict) else {}
     used_context = _safe_int(context.get("used_tokens"))
     max_context = _safe_int(context.get("max_tokens"))
@@ -1481,6 +1528,7 @@ def _render_footer(
         "model": _colored_model_label(model),
         "input_tokens": f"↑{_format_count(input_tokens)}",
         "output_tokens": f"↓{_format_count(output_tokens)}",
+        "cache_rate": cache_rate,
         "context": (
             f"ctx {_format_count(used_context)}/"
             f"{_format_count(max_context)} {context_percent}%"

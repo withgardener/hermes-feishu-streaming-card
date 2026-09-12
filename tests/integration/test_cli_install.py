@@ -1299,6 +1299,31 @@ profiles:
     assert "child-secret" not in captured.out
 
 
+@pytest.mark.parametrize("stale_default", [False, True])
+def test_setup_named_profiles_without_default_does_not_pin_gateway(tmp_path, monkeypatch, capsys, stale_default):
+    hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "profiles:\n  ai-secretary:\n    feishu:\n      app_id: test\n      app_secret: test\n"
+        "  engineering:\n    feishu:\n      app_id: test-eng\n      app_secret: test-eng\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_FEISHU_CARD_PROFILE_ID", raising=False)
+    if stale_default:
+        (tmp_path / ".env").write_text("HERMES_FEISHU_CARD_PROFILE_ID=default\n")
+    monkeypatch.setattr(cli, "_run_install", lambda args: 0)
+    exit_code = cli.main([
+        "setup", "--hermes-dir", str(hermes_dir), "--config", str(config_path),
+        "--yes", "--skip-start",
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.err
+    assert "config_profile: ai-secretary" in captured.out
+    assert "HERMES_FEISHU_CARD_PROFILE_ID=\n" in (tmp_path / ".env").read_text()
+    assert "profile_unknown" not in captured.err
+
+
 def test_setup_starts_sidecar_with_selected_env_file(tmp_path, monkeypatch, capsys):
     hermes_dir = copy_hermes(tmp_path)
     runtime_python, runtime_identity = stub_setup_runtime(monkeypatch, hermes_dir)
@@ -3844,6 +3869,42 @@ def test_reinstall_migrates_manifestless_legacy_owned_patch(tmp_path):
     assert "manifest: rebuilt" in result.stdout
     assert run_py(hermes_dir).read_text(encoding="utf-8") == current_patched
     assert manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_accepts_carried_forward_legacy_patch_on_supported_upgrade(
+    tmp_path,
+):
+    hermes_dir = copy_hermes(tmp_path)
+    install_result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert install_result.returncode == 0, install_result.stderr
+    upgraded_source = backup_path(hermes_dir).read_text(encoding="utf-8") + (
+        "\n# supported Hermes upgrade\n"
+    )
+    carried = patcher.apply_patch(upgraded_source).replace(
+        "        _hfc_emit(locals())\n",
+        "        _hfc_emit({**locals(), \"legacy\": True})\n",
+    )
+    assert carried != upgraded_source
+    run_py(hermes_dir).write_text(carried, encoding="utf-8")
+
+    refused = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert refused.returncode != 0
+
+    accepted = run_cli(
+        "install",
+        "--hermes-dir",
+        str(hermes_dir),
+        "--yes",
+        "--accept-hermes-upgrade",
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert "owned hooks: removed from accepted Hermes upgrade source" in accepted.stdout
+    current = run_py(hermes_dir).read_text(encoding="utf-8")
+    assert patcher.remove_patch(current) == upgraded_source
+    assert backup_path(hermes_dir).read_text(encoding="utf-8") == upgraded_source
+    assert manifest_path(hermes_dir).exists()
+    assert list((hermes_dir / "gateway").glob("run.py.hfc-corrupt-*"))
 
 
 def test_reinstall_migrates_manifestless_legacy_patch_without_dirfd_support(

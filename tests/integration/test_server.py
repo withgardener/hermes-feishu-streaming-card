@@ -67,6 +67,7 @@ from hermes_feishu_card.server import (
     NATIVE_HANDOFF_STORE_KEY,
     RUNTIME_CLEANUP_INTERVAL_SECONDS,
     SESSION_ALIASES_KEY,
+    REDIRECT_SESSION_ALIASES_KEY,
     SESSION_CARD_CONFIGS_KEY,
     SESSIONS_KEY,
     create_app as _create_app,
@@ -884,6 +885,343 @@ async def test_serial_and_concurrent_conflict_reject_before_session_mutation(cli
     assert len(feishu_client.sent) == 1
 
 
+@pytest.mark.parametrize("flags", [
+    {"failed": True}, {"interrupted": True}, {"completed": False},
+])
+async def test_gateway_unsuccessful_completion_renders_terminal_without_success(client, flags):
+    test_client, feishu_client = client
+    test_client.app[sidecar_server.BASE_CARD_CONFIG_KEY]["completion_notify"] = {
+        "enabled": True, "mention": False,
+    }
+    context = {
+        "chat_id": "oc_abc", "conversation_id": "conversation-1",
+        "message_id": "hermes-message-1", "profile_id": "default",
+        "answer": "已取得部分结果", "agent_result": flags,
+    }
+    started = hook_runtime.build_event("message.started", context)
+    await test_client.post("/events", json=started)
+    payload = hook_runtime.build_event("message.completed", context)
+    response = await test_client.post("/events", json=payload)
+    assert response.status == 200
+    assert (await response.json())["applied"] is True
+    await wait_for_card_update(feishu_client, "本轮")
+    matching = [s for s in test_client.app[SESSIONS_KEY].values()
+                if "本轮" in s.answer_text]
+    assert len(matching) == 1
+    assert matching[0].status == "failed"
+    assert matching[0].completion_notify_state == "idle"
+    assert "已取得部分结果" in matching[0].answer_text
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.texts == []
+
+
+async def test_redirect_followup_aliases_interrupted_card_to_new_card(client):
+    test_client, feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_user_original"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_redirect_prompt",
+            "redirect_followup": True,
+            "redirect_from_message_id": "om_old_turn",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_original_delta = event_payload(
+        "answer.delta",
+        1,
+        {"text": "redirected answer"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    second = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_original_delta)
+
+    assert first.status == second.status == late.status == 200
+    assert test_client.app[SESSION_ALIASES_KEY]["om_old_turn"] == "om_redirect_turn"
+    old_session = test_client.app[SESSIONS_KEY]["om_old_turn"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_turn"]
+    assert old_session.status == "failed"
+    assert old_session.answer_text == "> 本轮已被新对话替代，任务尚未确认完成。"
+    assert "redirected answer" in new_session.answer_text
+    assert len(feishu_client.sent) == 2
+
+
+async def test_redirect_followup_aliases_interrupted_turn_id_stream_to_new_card(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_user_original"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_redirect_prompt",
+            "redirect_followup": True,
+            "redirect_from_turn_id": "turn-old-runtime",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_original_delta = event_payload(
+        "answer.delta",
+        1,
+        {"text": "redirected answer"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    second = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_original_delta)
+
+    assert first.status == second.status == late.status == 200
+    assert (
+        test_client.app[SESSION_ALIASES_KEY]["turn-old-runtime"]
+        == "om_redirect_turn"
+    )
+    assert (
+        test_client.app[REDIRECT_SESSION_ALIASES_KEY]["turn-old-runtime"]
+        == "om_redirect_turn"
+    )
+    old_session = test_client.app[SESSIONS_KEY]["turn-old-runtime"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_turn"]
+    assert old_session.status == "failed"
+    assert old_session.answer_text == "> 本轮已被新对话替代，任务尚未确认完成。"
+    assert "redirected answer" in new_session.answer_text
+
+
+async def test_redirect_followup_recovers_turn_terminalized_before_redirect(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_deep_search_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+    interrupted_terminal = event_payload(
+        "message.completed",
+        1,
+        {"answer": "partial answer", "reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_deep_search_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_deep_search_user",
+            "redirect_followup": True,
+            "redirect_from_turn_id": "turn-old-runtime",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_final = event_payload(
+        "message.completed",
+        2,
+        {"answer": "final redirected answer", "reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_deep_search_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    terminal = await test_client.post("/events", json=interrupted_terminal)
+    redirect = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_final)
+
+    assert first.status == terminal.status == redirect.status == late.status == 200
+    assert (
+        test_client.app[REDIRECT_SESSION_ALIASES_KEY]["turn-old-runtime"]
+        == "om_redirect_user"
+    )
+    assert test_client.app[SESSION_ALIASES_KEY]["om_original_question"] == "om_redirect_user"
+    old_session = test_client.app[SESSIONS_KEY]["turn-old-runtime"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_user"]
+    assert old_session.status == "completed"
+    assert old_session.answer_text == "partial answer"
+    assert new_session.answer_text == "final redirected answer"
+
+
+async def test_redirect_followup_receives_legacy_completion_on_original_anchor(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    interrupted_terminal = event_payload(
+        "message.completed",
+        1,
+        {"answer": "partial answer"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_original_question",
+            "redirect_followup": True,
+            "redirect_from_message_id": "om_original_question",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_final = event_payload(
+        "message.completed",
+        2,
+        {"answer": "final redirected answer"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    terminal = await test_client.post("/events", json=interrupted_terminal)
+    redirect = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_final)
+
+    assert first.status == terminal.status == redirect.status == late.status == 200
+    assert test_client.app[SESSION_ALIASES_KEY]["om_original_question"] == "om_redirect_user"
+    old_session = test_client.app[SESSIONS_KEY]["om_original_question"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_user"]
+    assert old_session.status == "completed"
+    assert old_session.answer_text == "partial answer"
+    assert new_session.answer_text == "final redirected answer"
+
+
+async def test_redirect_followup_hook_payload_aliases_terminalized_card(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_original_question", "profile_id": "default"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    interrupted_terminal = event_payload(
+        "message.completed",
+        1,
+        {"answer": "partial answer", "profile_id": "default"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    redirect_started = hook_runtime.build_event(
+        "message.started",
+        {
+            "source": SimpleNamespace(
+                platform="feishu",
+                chat_id="oc_topic",
+                thread_id="omt_topic",
+            ),
+            "chat_id": "oc_topic",
+            "message_id": "om_redirect_user",
+            "reply_to_message_id": "om_original_question",
+            "redirect_followup": True,
+            "redirect_from_message_id": "om_original_question",
+        },
+    )
+    assert redirect_started is not None
+
+    first = await test_client.post("/events", json=old_started)
+    terminal = await test_client.post("/events", json=interrupted_terminal)
+    redirect = await test_client.post("/events", json=redirect_started)
+
+    assert first.status == terminal.status == redirect.status == 200
+    assert test_client.app[SESSION_ALIASES_KEY]["default:om_original_question"] == "default:om_redirect_user"
+    assert test_client.app[REDIRECT_SESSION_ALIASES_KEY]["default:om_original_question"] == "default:om_redirect_user"
+
+
+async def test_redirect_does_not_move_unrelated_historical_turn(client):
+    test_client, _ = client
+    common = {"chat_id": "oc_topic", "conversation_id": "omt_topic", "thread_id": "omt_topic"}
+    for message, turn in (("om_history", "turn-history"), ("om_active", "turn-active")):
+        await test_client.post("/events", json=event_payload(
+            "message.started", 0, message_id=message, turn_id=turn, **common))
+        await test_client.post("/events", json=event_payload(
+            "message.completed", 1, {"answer": message}, message_id=message, turn_id=turn, **common))
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0,
+        {"redirect_followup": True, "redirect_from_turn_id": "turn-active"},
+        message_id="om_redirect", turn_id="turn-redirect", **common))
+    await test_client.post("/events", json=event_payload(
+        "message.completed", 2, {"answer": "STALE HISTORY"},
+        message_id="om_history", turn_id="turn-history", **common))
+    assert "turn-history" not in test_client.app[REDIRECT_SESSION_ALIASES_KEY]
+    assert test_client.app[SESSIONS_KEY]["turn-redirect"].answer_text == ""
+    await test_client.post("/events", json=event_payload(
+        "message.completed", 2, {"answer": "redirect answer"},
+        message_id="om_active", turn_id="turn-active", **common))
+    assert test_client.app[SESSIONS_KEY]["turn-redirect"].answer_text == "redirect answer"
+
+
+async def test_redirect_without_source_identity_cannot_alias_explicit_turn(client):
+    test_client, _ = client
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0, message_id="om_old", turn_id="turn-old"))
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0, {"redirect_followup": True, "reply_to_message_id": "om_old"},
+        message_id="om_new", turn_id="turn-new"))
+    assert not test_client.app[REDIRECT_SESSION_ALIASES_KEY]
+    await test_client.post("/events", json=event_payload(
+        "answer.delta", 1, {"text": "late old output"}, message_id="om_old", turn_id="turn-old"))
+    assert test_client.app[SESSIONS_KEY]["turn-new"].answer_text == ""
+
+
 async def test_error_response_is_replayed_without_retrying_delivery(tmp_path):
     feishu_client = FakeFeishuClient()
     feishu_client.fail_send = True
@@ -1540,7 +1878,7 @@ async def test_new_turn_abandons_interrupted_session_in_same_conversation(client
         json=event_payload("answer.delta", 0, {"text": "follow-up"}, **second),
     )
 
-    assert test_client.app[SESSIONS_KEY]["message-interrupted"].status == "completed"
+    assert test_client.app[SESSIONS_KEY]["message-interrupted"].status == "failed"
     assert test_client.app[SESSIONS_KEY]["message-follow-up"].status == "thinking"
 
 
@@ -1590,7 +1928,8 @@ async def test_interrupted_terminal_update_cannot_be_overwritten_by_stale_delta(
         for message_id, card in feishu_client.updated
         if message_id == "feishu-message-1"
     ]
-    assert "已完成" in str(old_card_updates[-1])
+    assert "本轮已被新对话替代" in str(old_card_updates[-1])
+    assert "已完成" not in str(old_card_updates[-1])
 
 
 async def test_interrupted_session_log_does_not_expose_chat_id(client, caplog):
@@ -8096,6 +8435,25 @@ async def test_completion_notify_rejects_spoofed_sender_and_failed_send_is_retry
         await test_client.close()
 
 
+async def test_card_config_reasoning_code_reaches_live_renderer():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"reasoning_format": "code"})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post("/events", json=event_payload("answer.delta", 1, {"text": "检查参数后执行"}))
+        await test_client.post("/events", json=event_payload("tool.updated", 2, {"tool_id": "t", "name": "terminal", "status": "completed"}))
+        await test_client.post("/events", json=event_payload("message.completed", 3, {"answer": "处理完成"}))
+        await wait_for_card_update(feishu_client, "处理完成")
+        elements = feishu_client.updated[-1][1]["body"]["elements"]
+        reasoning = next(item for item in elements if "reasoningentry" in item.get("element_id", ""))
+        assert "```text\n检查参数后执行\n```" in reasoning["content"]
+        assert any(item.get("tag") == "collapsible_panel" for item in elements)
+    finally:
+        await test_client.close()
+
+
 async def test_card_config_controls_timeline_rendering():
     feishu_client = FakeFeishuClient()
     app = create_app(
@@ -8600,6 +8958,53 @@ async def test_topic_system_notice_with_reply_anchor_updates_existing_card(clien
     assert message_id == "feishu-message-1"
     assert "上下文窗口提示" in str(card)
     assert len(feishu_client.sent) == 1
+
+
+async def test_turn_system_notice_with_user_message_id_updates_existing_card(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_quote"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+            turn_id="turn-runtime-1",
+        ),
+    )
+    notice = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "reply_to_message_id": "om_topic_user",
+                "title": "运行中",
+                "content": "⏳ Working — 3 min — iteration 7/300, terminal",
+                "level": "info",
+                "notice_kind": "heartbeat",
+                "notice_id": "heartbeat",
+                "notice_scope": "session",
+                "notice_terminal": False,
+            },
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+
+    assert started.status == notice.status == 200
+    assert await notice.json() == {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "accepted"},
+    }
+    assert len(feishu_client.sent) == 1
+    _message_id, card = await wait_for_card_update(feishu_client, "Working — 3 min")
+    assert "运行中" in str(card)
 
 
 async def test_existing_session_notice_update_failure_is_observable():
@@ -10843,7 +11248,8 @@ async def test_independent_background_notices_do_not_abandon_active_cards(client
         ),
     )
 
-    assert sessions["main-turn-1"].status == "completed"
+    assert sessions["main-turn-1"].status == "failed"
+    assert "本轮已被新对话替代" in sessions["main-turn-1"].answer_text
     assert sessions["notice-process-one"].status == "running"
     assert sessions["notice-process-two"].status == "running"
 
@@ -12154,7 +12560,7 @@ async def test_session_key_explicit_empty_profile_uses_default_composite_key():
 async def test_interrupt_abandons_stale_session_via_session_creating_event(client):
     """When a new session is created via SESSION_CREATING_EVENTS (e.g. answer.delta
     after an interrupt with no message.started), the old active session for the
-    same chat+conversation should be marked completed and its card updated."""
+    same chat+conversation should be marked unsuccessful and its card updated."""
     test_client, feishu_client = client
 
     # First turn: message.started + some streaming
@@ -12188,7 +12594,7 @@ async def test_interrupt_abandons_stale_session_via_session_creating_event(clien
     assert len(updates_for_old) >= 2
     # The last update should contain the completed marker (subtitle)
     last_card = str(updates_for_old[-1])
-    assert "已完成" in last_card
+    assert "本轮已被新对话替代" in last_card
 
 
 async def test_interrupt_abandons_stale_session_via_message_started(client):
@@ -12216,7 +12622,7 @@ async def test_interrupt_abandons_stale_session_via_message_started(client):
         card for mid, card in feishu_client.updated if mid == "feishu-message-1"
     ]
     assert len(updates_for_old) >= 2
-    assert "已完成" in str(updates_for_old[-1])
+    assert "本轮已被新对话替代" in str(updates_for_old[-1])
 
 
 async def test_late_terminal_with_turn_id_does_not_complete_new_quoted_turn(client):
@@ -12489,7 +12895,7 @@ async def test_interrupt_does_not_abandon_different_conversation(client):
 
 async def test_terminal_event_on_abandoned_session_returns_applied_true(client):
     """When message.completed arrives for a session that was already abandoned
-    (status=completed), the sidecar should return applied=True so the gateway
+    (status=failed), the sidecar should return applied=True so the gateway
     hook suppresses the native plain-text delivery."""
     test_client, feishu_client = client
 
@@ -12507,7 +12913,7 @@ async def test_terminal_event_on_abandoned_session_returns_applied_true(client):
         "/events",
         json=event_payload("answer.delta", 0, {"text": "新回答"}, **msg2),
     )
-    await wait_for_card_update(feishu_client, "已完成")
+    await wait_for_card_update(feishu_client, "本轮已被新对话替代")
     old_updates_before_late_terminal = len(
         [
             card
@@ -12560,3 +12966,58 @@ async def test_interrupt_abandon_does_not_affect_completed_sessions(client):
         assert mid != "feishu-message-1", (
             "Already-completed session should not get extra updates on abandon"
         )
+
+
+async def test_topic_approval_expiry_updates_current_card_without_main_stream_send(client):
+    test_client, feishu_client = client
+    routing = {"reply_in_thread": True, "reply_to_message_id": "om_topic_anchor"}
+    await test_client.post("/events", json=event_payload("message.started", 0, routing))
+    await test_client.post("/events", json=event_payload("interaction.requested", 1, {
+        **routing,
+        "interaction_id": "topic-expiry", "kind": "approval", "prompt": "授权",
+        "options": [{"label": "允许一次", "value": "once"}], "timeout_seconds": 300,
+    }))
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    session.active_interaction.requested_at = 100.0
+    current_card_id = test_client.app[FEISHU_MESSAGE_IDS_KEY][session.message_id]
+    sent_count = len(feishu_client.sent)
+    assert all(item[3] == "om_topic_anchor" for item in feishu_client.sent)
+    assert all(feishu_client.sent_reply_in_thread)
+    assert await sidecar_server._expire_pending_interactions(test_client.app, now=400.0) == 1
+    updated_id, card = await wait_for_card_update(feishu_client, "交互已过期")
+    assert updated_id == current_card_id
+    assert len(feishu_client.sent) == sent_count
+    assert not feishu_client.texts
+    assert not interaction_buttons(card)
+
+
+@pytest.mark.parametrize("existing_session", [False, True])
+async def test_oversized_interaction_declines_before_claiming_or_sending(client, existing_session):
+    test_client, feishu_client = client
+    if existing_session:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+    sent_count = len(feishu_client.sent)
+    response = await test_client.post("/events", json=event_payload("interaction.requested", 1, {
+        "interaction_id": "too-large-choice", "kind": "approval", "prompt": "授权",
+        "options": [{"label": "完整说明" * 4000, "value": "once"}],
+    }))
+    assert response.status == 200
+    assert await response.json() == {"ok": True, "applied": False, "reason": "interaction_card_limit"}
+    assert len(feishu_client.sent) == sent_count
+    assert all(session.active_interaction is None for session in test_client.app[SESSIONS_KEY].values())
+    assert "too-large-choice" not in test_client.app[INTERACTION_RESULTS_KEY]
+
+
+async def test_approval_preflight_uses_compact_card_even_after_long_answer(client):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    session.answer_text = "历史正文" * 10000
+    response = await test_client.post("/events", json=event_payload("interaction.requested", 1, {
+        "interaction_id": "compact-approval", "kind": "approval", "prompt": "授权",
+        "options": [{"label": "允许一次", "value": "once"}],
+    }))
+    assert response.status == 200
+    assert (await response.json())["applied"] is True
+    assert interaction_buttons(feishu_client.sent[-1][1])[0]["value"]["choice"] == "once"
+    assert not feishu_client.texts

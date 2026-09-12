@@ -1928,6 +1928,40 @@ def test_build_interaction_event_reuses_active_card_message_id():
     assert interaction["data"]["allow_custom_input"] is False
 
 
+def test_approval_command_is_complete_after_former_3000_character_boundary(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hook_runtime, "request_interaction_from_hermes_locals", lambda _, **kwargs: calls.append(kwargs))
+    command = "echo " + "x" * 3500 + " LASTARGUMENT"
+    hook_runtime.request_approval_choice_from_hermes_locals(
+        {}, {"command": command, "description": "review everything"}, interaction_id="long-command",
+    )
+    assert command in calls[0]["description"]
+    assert "```" not in calls[0]["description"]
+
+
+def test_approval_oversized_command_falls_back_before_request(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime, "request_interaction_from_hermes_locals",
+        lambda *_args, **_kwargs: pytest.fail("oversized authorization must use native fallback"),
+    )
+    result = hook_runtime.request_approval_choice_from_hermes_locals(
+        {}, {"command": "命令" * 8000}, interaction_id="oversized",
+    )
+    assert result is None
+
+
+def test_approval_command_cannot_hide_scope_in_markdown(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hook_runtime, "request_interaction_from_hermes_locals", lambda _, **kwargs: calls.append(kwargs))
+    hook_runtime.request_approval_choice_from_hermes_locals(
+        {}, {"command": "echo [safe](danger) <at id=all> `hidden`"}, interaction_id="markup-command",
+    )
+    text = calls[0]["description"]
+    assert "[safe](danger)" not in text
+    assert "<at" not in text
+    assert "danger" in text and "hidden" in text
+
+
 def test_approval_and_clarify_publish_distinct_custom_input_capabilities(monkeypatch):
     calls = []
 
@@ -7606,6 +7640,51 @@ def test_build_cron_event_from_feishu_job_origin():
     ]["attachments"]
 
 
+def test_build_cron_event_uses_origin_message_as_topic_reply_anchor():
+    payload = hook_runtime.build_cron_event(
+        {
+            "job": {
+                "id": "job-topic",
+                "origin": {
+                    "platform": "feishu",
+                    "chat_id": "oc_cron",
+                    "thread_id": "omt_topic",
+                    "message_id": "om_create",
+                },
+            },
+            "delivery_content": "定时结果",
+        }
+    )
+
+    assert payload["conversation_id"] == "omt_topic"
+    assert payload["thread_id"] == "omt_topic"
+    assert payload["data"]["reply_to_message_id"] == "om_create"
+
+
+@pytest.mark.parametrize("origin_message", ["om_origin", "omt_not_a_message"])
+def test_cron_explicit_destination_does_not_reuse_other_chat_anchor(origin_message):
+    payload = hook_runtime.build_cron_event({
+        "job": {"id": "job", "deliver": "feishu:oc_other", "origin": {
+            "platform": "feishu", "chat_id": "oc_origin", "thread_id": "omt_origin",
+            "message_id": origin_message,
+        }},
+        "delivery_content": "result",
+    })
+    assert payload["chat_id"] == "oc_other"
+    assert not payload["thread_id"]
+    assert "reply_to_message_id" not in payload["data"]
+
+
+def test_cron_thread_identifier_is_not_a_reply_message():
+    payload = hook_runtime.build_cron_event({
+        "job": {"id": "job", "origin": {
+            "platform": "feishu", "chat_id": "oc_origin", "thread_id": "omt_origin",
+            "message_id": "omt_origin",
+        }}, "delivery_content": "result",
+    })
+    assert "reply_to_message_id" not in payload["data"]
+
+
 def test_build_cron_event_extracts_chat_id_from_deliver_string():
     payload = hook_runtime.build_cron_event(
         {
@@ -8169,6 +8248,25 @@ def test_extract_real_platform():
     assert hook_runtime._extract_real_platform("origin,all") == ""
     assert hook_runtime._extract_real_platform("") == ""
     assert hook_runtime._extract_real_platform(None) == ""
+
+
+@pytest.mark.parametrize("result,outcome", [
+    ({"failed": True}, "failed"),
+    ({"interrupted": True, "completed": True}, "interrupted"),
+    ({"completed": False}, "incomplete"),
+    ({"partial": True, "completed": True}, "incomplete"),
+    ({"completed": True, "failed": False}, None),
+    ({"failed": "true", "completed": 0}, None),
+    ({}, None),
+])
+def test_completion_carries_explicit_unsuccessful_outcome(result, outcome):
+    payload = hook_runtime.build_event("message.completed", {
+        "chat_id": "oc_abc", "message_id": "msg_outcome",
+        "answer": "partial response", "agent_result": result,
+    }, preview=True)
+    assert payload["event"] == "message.completed"
+    assert payload["data"].get("turn_outcome") == outcome
+    assert payload["data"]["answer"] == "partial response"
 
 
 def test_build_completed_event_uses_agent_result_token_fallbacks():
@@ -9271,6 +9369,108 @@ async def test_adapter_thread_create_without_reply_anchor_falls_back_to_chat_cre
 
     assert reply_result.success is True
     assert adapter.raw_calls[-1][2] == "thread"
+
+
+@pytest.mark.asyncio
+async def test_adapter_metadata_reply_anchor_preserves_topic_thread_placement():
+    adapter = _NativeAckAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+
+    result = await adapter.send(
+        "oc_native",
+        "queued reply",
+        metadata={
+            "thread_id": "omt_topic",
+            "reply_to_message_id": "om_parent",
+        },
+    )
+
+    assert result.success is True
+    assert adapter.raw_calls == [
+        ("{\"text\": \"queue\"}", "text", "thread", "random-reply"),
+        ("{\"text\": \"d rep\"}", "text", "thread", "random-reply"),
+        ("{\"text\": \"ly\"}", "text", "thread", "random-reply"),
+    ]
+
+
+def test_gateway_synthetic_feishu_route_preserves_reply_anchor_for_topic():
+    class DummyRunner:
+        def __init__(self, adapter):
+            self.adapters = {"feishu": adapter}
+
+        def _thread_metadata_for_target(
+            self,
+            platform,
+            chat_id,
+            thread_id,
+            *,
+            chat_type=None,
+            reply_to_message_id=None,
+            adapter=None,
+        ):
+            del platform, chat_id, chat_type, reply_to_message_id, adapter
+            return {"thread_id": thread_id} if thread_id else None
+
+    adapter = _NativeAckAdapter()
+    runner = DummyRunner(adapter)
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    metadata = runner._thread_metadata_for_target(
+        SimpleNamespace(value="feishu"),
+        "oc_parent",
+        "omt_topic",
+        reply_to_message_id="om_topic_message",
+        adapter=adapter,
+    )
+
+    assert metadata == {
+        "thread_id": "omt_topic",
+        "reply_to_message_id": "om_topic_message",
+    }
+
+
+def test_gateway_synthetic_route_wrapper_keeps_non_feishu_metadata_unchanged():
+    class DummyRunner:
+        def __init__(self, adapter):
+            self.adapters = {"feishu": adapter}
+
+        def _thread_metadata_for_target(self, platform, chat_id, thread_id, **kwargs):
+            del platform, chat_id, kwargs
+            return {"thread_id": thread_id, "trace": "preserved"}
+
+    adapter = _NativeAckAdapter()
+    runner = DummyRunner(adapter)
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    metadata = runner._thread_metadata_for_target(
+        SimpleNamespace(value="slack"),
+        "C123",
+        "T123",
+        reply_to_message_id="M123",
+    )
+
+    assert metadata == {"thread_id": "T123", "trace": "preserved"}
+
+
+def test_build_started_event_preserves_redirect_followup_marker():
+    payload = hook_runtime.build_event(
+        "message.started",
+        {
+            "source": SimpleNamespace(
+                platform="feishu",
+                chat_id="oc_topic",
+                thread_id="omt_topic",
+            ),
+            "chat_id": "oc_topic",
+            "message_id": "om_redirect",
+            "reply_to_message_id": "om_original",
+            "redirect_followup": True,
+        },
+    )
+
+    assert payload is not None
+    assert payload["data"]["redirect_followup"] is True
 
 
 def _install_native_ack_context(

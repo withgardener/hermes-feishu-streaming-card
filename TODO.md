@@ -2,9 +2,50 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9 / V4.2.10 / V4.2.11 / V4.2.12 / V4.3.0 / V4.3.1 / V4.3.2 / V4.3.3 / V4.3.4 / V4.3.5 / V4.3.6 / V4.3.7 / V4.3.8 / V4.4.0
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9 / V4.2.10 / V4.2.11 / V4.2.12 / V4.3.0 / V4.3.1 / V4.3.2 / V4.3.3 / V4.3.4 / V4.3.5 / V4.3.6 / V4.3.7 / V4.3.8 / V4.4.0 / V4.4.1 / V4.4.2 / V4.4.3 / V4.4.4
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
+
+### V4.4.5：终态与安装稳定性修复
+
+- [x] Gateway 失败、中断和未完成状态不再显示成功或发送成功通知。
+- [x] 新轮替代旧轮时保留内容并明确尚未确认完成。
+- [x] 已验证的 decomposed split-ledger 契约支持、危险漂移拒绝与执行回归。
+- [x] 稳定性测试规则与 PR 验证模板。
+- [ ] #282 授权首次点击、#283 空卡、#275/#278 Topic 问题的真实环境根因验证。
+
+### V4.4.4：飞书话题重启通知路由热修
+
+- [x] #270：活跃话题的关闭/重启通知保留原消息 reply anchor，继续落在同一 Topic。
+- [x] 当前 Hermes `start()` 布局在 boot 通知之前安装 HFC 路由 wrapper。
+- [x] 完整 pytest、普通 wheel 构建与隔离 `site-packages` provenance。
+- [x] 本机生产 Hermes 与真实飞书 Topic `/restart` smoke。
+- [ ] GitHub CI、exact merge、annotated tag、public tagged install 与 Release assets/checksums。
+
+### V4.4.3：生产升级与空 timeline 热修
+
+- [x] 显式接受 Hermes 升级时验证并移除遗留的 owned primary hook block。
+- [x] 允许健康、逐字可逆的本机 Git 源码定制迁移为仅限当前安装的 ownership 快照。
+- [x] 零思考、零工具且无 timeline 条目时不渲染空面板或零工具摘要。
+- [x] 本机生产 Hermes 0.21.0、真实飞书 DM smoke 与实际入站事件完成候选验证。
+- [ ] #268 报告者真实多 bot multiplex 环境复验。
+
+### V4.4.2：完整性迁移与 multiplex
+
+- [x] 完整 ownership 校验、源码安装快照与迁移回滚。
+- [x] 次级 profile adapter、审批超时与选项展示修复。
+- [ ] 报告者实际 Docker/multiplex 与飞书客户端复验。
+
+### V4.4.1：Hermes 0.21、多 profile 与话题兼容修复（发布候选）
+
+- [x] PR #257 / Issues #254/#255/#256：按已验证 facade/mixin 契约安装，保留多文件 ownership 与可逆恢复。
+- [x] PR #251 / Issue #252：话题后续、queue/redirect 与 cron 回复锚点；显式 turn 身份保持隔离。
+- [x] Issues #83/#259：单进程多 profile 身份与缺少字面 `default` 的路由处理。
+- [x] Issues #253/#258：可选 reasoning code、审批完整范围与超限原生回退；Issue #250：实际 provider 页脚归属。
+- [x] PRs #247/#248：CodeQL init/analyze 与测试同步更新；保留全部历史贡献者。
+- [ ] 当前候选普通 wheel、完整 pytest、GitHub CI、exact release merge、annotated tag 与 Release assets/checksums 按最终结果登记。
+- [ ] 真实 Feishu/Lark 私聊、群聊、话题重启后 queue/interrupt、审批手机/桌面阅读、多 profile 复测。
+- [ ] Issue #73：等待新版环境诊断，不能从旧版本报告推断已解决。
 
 ### V4.4.0：新版 Hermes 原生能力中心与可视化交互（发布候选）
 

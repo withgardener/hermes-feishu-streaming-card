@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.4.0`. This cycle targets Hermes `v2026.8.27` / `0.20.6` and forward-validates against `main@4f225435`: Feishu `/commands` becomes a live native capability center, safe quick actions return to Hermes' original handlers, common command results gain KPI visualization, and real backlog depth plus extreme-Markdown fail-safes are added. Full automation and real Feishu private/group smoke are complete. The release PR, exact merge SHA, public tag/install, and Release assets are marked passed only after completion; automation is not represented as platform acceptance.
+Current release candidate: `4.4.5`. This cycle preserves unsuccessful and superseded turn outcomes, supports the verified decomposed split-ledger contract, and strengthens stability regressions. Production acceptance, cross-platform CI, exact merge and release assets are recorded by the final release gate.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -82,6 +82,24 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 ```
 
 Real Feishu integration must use local config or environment variables for `FEISHU_APP_ID` and `FEISHU_APP_SECRET`. Do not commit App Secret, tenant token, real chat_id, or sensitive screenshots. Public screenshots must be checked for secrets and private conversation content before being added to the repository.
+
+## V4.4.5 Release Gates
+
+- Current Hermes `start()` ordering, Feishu topic reply anchors, and unchanged non-Feishu metadata: **focused regressions passed**.
+- Patch relocation, idempotent reinstallation, and byte-reversible removal against local production Hermes source: **read-only roundtrip passed**.
+- Focused hot-file regressions: **`943 passed, 1 skipped`**; documentation/package metadata: **`101 passed`**; full pytest: **`3533 passed, 9 skipped in 752.17s`**; `git diff --check`: **passed**.
+- PEP 517 sdist/wheel, plus a fresh Python 3.12 regular-wheel install with `site-packages` package/distribution `4.4.5`, one Hermes plugin entrypoint, all 24 provenance slices, and CLI help: **passed**.
+- Local production Hermes 0.21.0 loaded 4.4.5 from its runtime venv. After the official patcher install, only managed `gateway/run.py` changed as expected; the restarted sidecar/Gateway reached `runtime_ready / integrity=safe`: **passed**.
+- On 2026-09-08, a real Feishu group-topic `/restart` kept its success notice in the original topic without posting to the parent chat's main stream: **passed**. The exact active-work shutdown notice remains covered by the same metadata-wrapper automation.
+- GitHub CI, exact merge, annotated tag, public tagged install, and Release assets/checksums: **pending final gate evidence**.
+
+## V4.4.3 Release Gates
+
+- Expanded integrity, recovery, patcher, and CLI-install regressions passed; the fixed Hermes source test requires its explicit snapshot path.
+- Empty-timeline renderer regressions passed (`109 passed`), as did the executable two named bot/profile/topic Hermes-handler suite (`12 passed`).
+- The candidate wheel loaded in local production Hermes 0.21.0. Hook recovery, the safe integrity snapshot, and sidecar/Gateway restart passed; sidecar reached `healthy / runtime_ready / integrity=safe`.
+- A real Feishu DM smoke and an actual Hermes inbound turn passed with no observed send or event-application failure. Real multi-bot multiplex and mobile/desktop approval readability still require their corresponding environments.
+- Full pytest: **`3530 passed, 9 skipped in 843.13s`**; `git diff --check`: **passed**. The PEP 517 sdist/wheel, fresh Python 3.12 `site-packages` package/distribution `4.4.3`, single Hermes plugin entrypoint, 24 provenance slices, and CLI help also passed. The remaining release gate records GitHub CI, exact merge, tag, and Release assets.
 
 ## V4.4.0 Release Gates
 
