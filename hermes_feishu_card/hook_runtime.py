@@ -1953,6 +1953,12 @@ def handle_status_from_hermes_locals(
     event_type: str,
     message: str,
 ) -> bool:
+    # LOCAL PATCH (PATCH-016): user asked for the "🗜️ Compacting context —
+    # summarizing earlier conversation..." card notice to be fully suppressed
+    # (compression should stay silent background work, no screen space).
+    # This function's only job is emitting that one notice, so short-circuit
+    # it entirely rather than special-casing the emit call below.
+    return False
     try:
         source = local_vars.get("source")
         if _platform_name(local_vars, source) != "feishu":
@@ -11312,6 +11318,19 @@ def _completion_model(local_vars: dict[str, Any]) -> str:
     return "Unknown"
 
 
+def _hfc_channel_label(base_provider: Any, candidate: Any) -> Any:
+    """LOCAL PATCH (PATCH-002): return the uppercased named channel from a "base:channel"
+    identity string, or *base_provider* unchanged when *candidate* isn't a more specific
+    match for it."""
+    if not isinstance(base_provider, str) or not isinstance(candidate, str):
+        return base_provider
+    base_norm = base_provider.strip().lower()
+    if not candidate.strip().lower().startswith(f"{base_norm}:"):
+        return base_provider
+    channel_name = candidate.strip().split(":", 1)[1].strip()
+    return channel_name.upper() if channel_name else base_provider
+
+
 def effective_response_model(agent: Any) -> str:
     """Capture the actual fallback route before Gateway discards result fields."""
     route = getattr(agent, "_provider_fallback_route", None)
@@ -11319,6 +11338,15 @@ def effective_response_model(agent: Any) -> str:
         model, provider = route
     else:
         model, provider = getattr(agent, "model", None), getattr(agent, "provider", None)
+        # LOCAL PATCH (PATCH-002): prefer the pre-normalization requested provider so the
+        # footer shows the named channel (OKHEMA/...) instead of the runtime bucket (custom/...).
+        requested = getattr(agent, "requested_provider", None)
+        if isinstance(requested, str) and isinstance(provider, str):
+            provider = _hfc_channel_label(provider, requested)
+    if isinstance(provider, str) and ":" in provider:
+        # LOCAL PATCH (PATCH-002): named custom-provider channel from fallback config
+        # (e.g. "custom:okhema") — show the concrete channel, not the generic bucket.
+        provider = _hfc_channel_label(provider.split(":", 1)[0], provider)
     if not isinstance(model, str) or not model.strip():
         return ""
     model = model.strip()
@@ -11337,6 +11365,24 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
 
     input_tokens = _token_value(explicit_tokens, "input_tokens")
     output_tokens = _token_value(explicit_tokens, "output_tokens")
+    # LOCAL PATCH (PATCH-007 carry): session cache/prompt token fields for the card footer.
+    cache_read_tokens = _token_value(explicit_tokens, "cache_read_tokens")
+    if cache_read_tokens <= 0:
+        cache_read_tokens = _positive_int(agent_result.get("cache_read_tokens"))
+    if cache_read_tokens <= 0:
+        cache_read_tokens = _positive_int(agent_result.get("session_cache_read_tokens"))
+    cache_write_tokens = _token_value(explicit_tokens, "cache_write_tokens")
+    if cache_write_tokens <= 0:
+        cache_write_tokens = _positive_int(agent_result.get("cache_write_tokens"))
+    if cache_write_tokens <= 0:
+        cache_write_tokens = _positive_int(agent_result.get("session_cache_write_tokens"))
+    prompt_tokens = _token_value(explicit_tokens, "prompt_tokens")
+    if prompt_tokens <= 0:
+        prompt_tokens = _positive_int(agent_result.get("prompt_tokens"))
+    if prompt_tokens <= 0:
+        prompt_tokens = _positive_int(agent_result.get("session_prompt_tokens"))
+    if prompt_tokens <= 0:
+        prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
     last_prompt_tokens = _positive_int(agent_result.get("last_prompt_tokens"))
     estimated_output_tokens = _estimate_output_tokens(answer) if answer else 0
 
@@ -11365,10 +11411,28 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
     if output_tokens <= 0 and answer:
         output_tokens = estimated_output_tokens
 
-    return {
+    result = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+    for key, value in (
+        ("prompt_tokens", prompt_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+        ("cache_write_tokens", cache_write_tokens),
+    ):
+        if value > 0:
+            result[key] = value
+    # LOCAL PATCH (PATCH-007): rolling per-call cache history from the agent's
+    # _api_cache_history deque — [[prompt, cache_read], ...] most-recent-last.
+    # Pass through verbatim so the renderer can show a rolling hit rate; absent when
+    # the agent copy predates the counter (fall back to cumulative rates downstream).
+    cache_history = agent_result.get("cache_history")
+    if isinstance(cache_history, list) and cache_history:
+        result["cache_history"] = [
+            [int(p), int(c)] for p, c in cache_history
+            if isinstance(p, (int, float)) and isinstance(c, (int, float)) and p > 0
+        ] or None
+    return result
 
 
 def _completion_context(local_vars: dict[str, Any]) -> dict[str, int]:
