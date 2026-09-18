@@ -120,6 +120,7 @@ def render_card(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
+    hide_completed_tool_activity: bool = False,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -138,6 +139,7 @@ def render_card(
         mentions_enabled=mentions_enabled,
         reasoning_format=reasoning_format,
         completion_mention=completion_mention,
+        hide_completed_tool_activity=hide_completed_tool_activity,
     ).card
 
 
@@ -158,6 +160,7 @@ def render_card_result(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
+    hide_completed_tool_activity: bool = False,
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(session)
     table_overflow = transform_table_overflow(
@@ -181,6 +184,7 @@ def render_card_result(
         mentions_enabled=mentions_enabled,
         reasoning_format=reasoning_format,
         completion_mention=completion_mention,
+        hide_completed_tool_activity=hide_completed_tool_activity,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -224,6 +228,7 @@ def _render_card_unchecked(
     mentions_enabled: bool = True,
     reasoning_format: str = "panel",
     completion_mention: bool = False,
+    hide_completed_tool_activity: bool = False,
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -305,12 +310,19 @@ def _render_card_unchecked(
     # LOCAL PATCH (PATCH-012): user asked to hide the always-visible tool
     # activity row directly under the answer text (duplicate of the full row
     # already shown inside the collapsible 思考过程 panel). Keep the panel
-    # itself; only suppress this content-area summary. Original upstream
-    # call preserved as a comment for easy restoration.
+    # itself; only suppress this content-area summary — unconditionally, for
+    # every session status. Upstream v4.6.2 added an opt-in
+    # `hide_completed_tool_activity` flag (default False, completed/failed
+    # only) via #331; our local patch already hides this row in ALL states,
+    # which is a strict superset of upstream's behavior, so upstream's new
+    # conditional is folded in but effectively always short-circuited by the
+    # unconditional empty list below. Original upstream call preserved as a
+    # comment for easy restoration.
+    hide_terminal_tools = hide_completed_tool_activity and session.status in {"completed", "failed"}
     tool_activity_elements: list[Dict[str, Any]] = []
     # tool_activity_elements = (
     #     []
-    #     if pending_approval
+    #     if pending_approval or hide_terminal_tools
     #     else _render_tool_activity_elements(
     #         session,
     #         text_sizes=text_sizes,
@@ -353,6 +365,7 @@ def _render_card_unchecked(
     elements.append({"tag": "hr", "element_id": "main_divider"})
     if (
         not timeline_elements
+        and not hide_terminal_tools
         and not tool_activity_elements
         and not pending_approval
         and session.tool_count
