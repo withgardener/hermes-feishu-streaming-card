@@ -476,6 +476,16 @@ def render_legacy_interaction_callback_card(
         # prompt text — the prompt is already shown in the card body, and the
         # large-font header duplicating it was the exact complaint.
         header_title = "待审批" if interaction.kind == "approval" else "待选择"
+    elif (
+        interaction.status == "completed"
+        and interaction.kind in {"approval", "clarify"}
+    ):
+        # LOCAL PATCH (PATCH-015): same simplification for the completed
+        # state — the full prompt is already shown in the card body (via
+        # _interaction_review_elements), and the large-font header repeating
+        # it a second time was the exact complaint. The body still carries
+        # the full question + "已选择：..." result line, unchanged.
+        header_title = "已审批" if interaction.kind == "approval" else "已选择"
     header = {
         "template": template,
         "title": {
@@ -511,10 +521,7 @@ def _render_legacy_callback_card(
 
     elements: list[Dict[str, Any]] = []
     if interaction.status == "completed":
-        # LOCAL PATCH (PATCH-014): user found the full original prompt text
-        # re-appearing in the card body on completion (duplicate of the
-        # already-simplified header). Drop _interaction_review_elements()
-        # here — keep only the terse "已选择：..." result line.
+        elements.extend(_interaction_review_elements(interaction))
         choice = interaction.choice_label or interaction.choice or "已完成"
         user = f" by {interaction.user_name}" if interaction.user_name else ""
         elements.append(
@@ -1177,12 +1184,10 @@ def _render_interaction_elements(
         return elements
 
     if interaction.status == "completed":
-        # LOCAL PATCH (PATCH-014): same fix as the CardKit v1 rail above —
-        # drop the full-prompt review block on completion, keep only the
-        # terse "已选择：..." result line.
         choice = interaction.choice_label or interaction.choice or "已完成"
         user = f" by {interaction.user_name}" if interaction.user_name else ""
         content = f"已选择：{choice}{user}"
+        elements.extend(_interaction_review_elements(interaction))
         elements.append({
             "tag": "markdown", "element_id": "interaction_result",
             "content": content,

@@ -1952,6 +1952,12 @@ def handle_status_from_hermes_locals(
     event_type: str,
     message: str,
 ) -> bool:
+    # LOCAL PATCH (PATCH-016): user asked for the "🗜️ Compacting context —
+    # summarizing earlier conversation..." card notice to be fully suppressed
+    # (compression should stay silent background work, no screen space).
+    # This function's only job is emitting that one notice, so short-circuit
+    # it entirely rather than special-casing the emit call below.
+    return False
     try:
         source = local_vars.get("source")
         if _platform_name(local_vars, source) != "feishu":
