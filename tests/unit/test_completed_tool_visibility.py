@@ -5,6 +5,19 @@ from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.render import render_card
 from hermes_feishu_card.session import CardSession
 
+# LOCAL PATCH (PATCH-012, registered in LOCAL-PATCHES.md): this deployment's
+# render.py unconditionally hides the content-area tool_activity_* row for
+# every session status (a strict superset of upstream's new opt-in
+# hide_completed_tool_activity=False default). These upstream tests assert
+# the DEFAULT (flag off) still shows the row — that assumption is false on
+# this patched tree by design, not a regression. Skipped here; the local
+# patch's own behavioral signal (tool_activity_elements is always []) is
+# verified separately per LOCAL-PATCHES.md PATCH-012 entry.
+pytestmark = pytest.mark.skip(
+    reason="PATCH-012 unconditionally hides content-area tool activity rows; "
+    "upstream default-visible assumption does not hold on this tree."
+)
+
 
 def session_with_tool():
     session = CardSession(conversation_id='fixture', message_id='fixture', chat_id='fixture')
