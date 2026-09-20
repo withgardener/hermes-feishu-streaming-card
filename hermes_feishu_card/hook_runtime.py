@@ -1955,12 +1955,6 @@ def handle_status_from_hermes_locals(
     event_type: str,
     message: str,
 ) -> bool:
-    # LOCAL PATCH (PATCH-016): user asked for the "🗜️ Compacting context —
-    # summarizing earlier conversation..." card notice to be fully suppressed
-    # (compression should stay silent background work, no screen space).
-    # This function's only job is emitting that one notice, so short-circuit
-    # it entirely rather than special-casing the emit call below.
-    return False
     try:
         source = local_vars.get("source")
         if _platform_name(local_vars, source) != "feishu":
@@ -1969,7 +1963,27 @@ def handle_status_from_hermes_locals(
             event_type == "lifecycle" and isinstance(message, str) and len(message) <= 1000
             and re.fullmatch(r"❌ (?:API failed|Rate limited) after [1-9][0-9]{0,2} retries — [^\r\n]+", message)
         )
-        if not provider_failure and not _CONTEXT_COMPACTION_STATUS_RE.search(str(message or "")):
+        # LOCAL PATCH (PATCH-016): user asked for the "🗜️ Compacting context —
+        # summarizing earlier conversation..." card notice to be fully suppressed
+        # (compression should stay silent background work, no screen space).
+        # Originally (v4.6.0) this function's ONLY job was emitting that one
+        # notice, so an unconditional `return False` at the top was correct.
+        # v4.6.5 extended the SAME function with an unrelated new feature
+        # (provider-failure notices, `provider_failure` branch below) — a
+        # blanket short-circuit now also silently killed that new feature,
+        # which the user never asked to suppress. Narrow the patch to only
+        # the compaction-notice branch so the new provider-failure branch
+        # keeps upstream's native behavior.
+        is_compaction = bool(_CONTEXT_COMPACTION_STATUS_RE.search(str(message or "")))
+        if not provider_failure and not is_compaction:
+            return False
+        if not provider_failure and is_compaction:
+            # PATCH-016: user asked for the "🗜️ Compacting context —
+            # summarizing earlier conversation..." card notice to be fully
+            # suppressed (compression should stay silent background work).
+            # Everything else below this point builds a system.notice for
+            # either the compaction case or the (unaffected) provider_failure
+            # case, so only the compaction branch is short-circuited here.
             return False
         run_guard = local_vars.get("_run_still_current")
         if callable(run_guard) and not run_guard():
