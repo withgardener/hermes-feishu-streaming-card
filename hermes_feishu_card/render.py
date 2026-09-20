@@ -122,6 +122,7 @@ def render_card(
     completion_mention: bool = False,
     hide_completed_tool_activity: bool = False,
     stream_thinking_to_body: bool = True,
+    hide_successful_tool_activity: bool = False,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -142,6 +143,7 @@ def render_card(
         completion_mention=completion_mention,
         hide_completed_tool_activity=hide_completed_tool_activity,
         stream_thinking_to_body=stream_thinking_to_body,
+        hide_successful_tool_activity=hide_successful_tool_activity,
     ).card
 
 
@@ -164,6 +166,7 @@ def render_card_result(
     completion_mention: bool = False,
     hide_completed_tool_activity: bool = False,
     stream_thinking_to_body: bool = True,
+    hide_successful_tool_activity: bool = False,
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(
         session, stream_thinking_to_body=stream_thinking_to_body
@@ -191,6 +194,7 @@ def render_card_result(
         completion_mention=completion_mention,
         hide_completed_tool_activity=hide_completed_tool_activity,
         stream_thinking_to_body=stream_thinking_to_body,
+        hide_successful_tool_activity=hide_successful_tool_activity,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -236,6 +240,7 @@ def _render_card_unchecked(
     completion_mention: bool = False,
     hide_completed_tool_activity: bool = False,
     stream_thinking_to_body: bool = True,
+    hide_successful_tool_activity: bool = False,
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -322,12 +327,16 @@ def _render_card_unchecked(
     # itself; only suppress this content-area summary — unconditionally, for
     # every session status. Upstream v4.6.2 added an opt-in
     # `hide_completed_tool_activity` flag (default False, completed/failed
-    # only) via #331; our local patch already hides this row in ALL states,
-    # which is a strict superset of upstream's behavior, so upstream's new
-    # conditional is folded in but effectively always short-circuited by the
-    # unconditional empty list below. Original upstream call preserved as a
-    # comment for easy restoration.
-    hide_terminal_tools = hide_completed_tool_activity and session.status in {"completed", "failed"}
+    # only) via #331, and v4.6.4 added a second opt-in
+    # `hide_successful_tool_activity` flag (completed-only); our local patch
+    # already hides this row in ALL states, which is a strict superset of
+    # both upstream flags, so upstream's new conditionals are folded in but
+    # effectively always short-circuited by the unconditional empty list
+    # below. Original upstream call preserved as a comment for easy
+    # restoration.
+    hide_terminal_tools = (
+        hide_completed_tool_activity and session.status in {"completed", "failed"}
+    ) or (hide_successful_tool_activity and session.status == "completed")
     tool_activity_elements: list[Dict[str, Any]] = []
     # tool_activity_elements = (
     #     []
