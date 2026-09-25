@@ -1249,6 +1249,7 @@ class GatewayEventObject:
 
 
 def test_status_from_hermes_emits_compaction_notice_with_topic_context(monkeypatch):
+    pytest.skip("LOCAL PATCH (PATCH-016): compaction card notice is suppressed on purpose; see LOCAL-PATCHES.md")
     posted = []
 
     def capture(local_vars, event_name="message.started"):
@@ -1362,6 +1363,7 @@ def test_status_from_hermes_ignores_non_feishu_or_stale_run(monkeypatch, local_v
 
 
 def test_compaction_status_and_next_delta_use_increasing_sequence(monkeypatch):
+    pytest.skip("LOCAL PATCH (PATCH-016): compaction card notice is suppressed on purpose; see LOCAL-PATCHES.md")
     posted = []
 
     def capture(local_vars, event_name="message.started"):
@@ -1846,6 +1848,11 @@ def test_build_completed_event_preserves_duration_and_tokens():
     )
 
     native_handoff = payload["data"].pop("native_handoff")
+    # LOCAL PATCH (PATCH-007): the token payload also carries prompt/cache fields for the
+    # rolling cache-rate footer; drop them so the rest of the upstream contract is checked as-is.
+    payload["data"]["tokens"] = {
+        k: v for k, v in payload["data"]["tokens"].items() if k in {"input_tokens", "output_tokens"}
+    }
     assert len(native_handoff["generation"]) == 32
     assert set(native_handoff) == {"generation"}
     assert payload["data"] == {
@@ -8454,7 +8461,9 @@ def test_build_completed_event_sanitizes_cumulative_token_counts():
         },
     )
 
-    assert payload["data"]["tokens"] == {
+    # LOCAL PATCH (PATCH-007): base keys keep upstream's sanitized values; prompt_tokens is
+    # the extra field the rolling cache-rate footer consumes.
+    assert {k: payload["data"]["tokens"][k] for k in ("input_tokens", "output_tokens")} == {
         "input_tokens": 35_400,
         "output_tokens": 6,
     }
@@ -9433,6 +9442,14 @@ def test_native_handoff_plan_fingerprint_binds_loaded_runtime_semantics(monkeypa
 def test_native_handoff_plan_fingerprint_fails_closed_without_loaded_helper(
     monkeypatch,
 ):
+    # LOCAL ENV SKIP (PATCH-007 registration): in the combined Hermes+HFC venv
+    # gateway.platforms.helpers re-imports successfully, so the fail-closed path is
+    # unreachable here (upstream CI has no Hermes install). Fails on pristine v4.6.9 too.
+    try:
+        import gateway.platforms.helpers  # noqa: F401
+        pytest.skip("combined Hermes+HFC venv: helper always importable")
+    except ImportError:
+        pass
     adapter = _NativeAckAdapter()
     runner = SimpleNamespace(adapters={"feishu": adapter})
     assert hook_runtime.install_feishu_command_card_adapter_methods(runner)

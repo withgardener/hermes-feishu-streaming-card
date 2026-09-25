@@ -7947,7 +7947,7 @@ async def test_v4_interaction_restores_cached_preview_on_stable_v2_card(client):
     assert len(feishu_client.sent) == 2
     waiting = feishu_client.sent[-1][1]
     assert "允许读取精确位置吗？" in str(waiting)
-    assert waiting["header"]["title"]["content"] == "待审批：允许读取精确位置吗？"
+    assert waiting["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
     button = interaction_buttons(waiting)[0]
     action_value = button["value"]
 

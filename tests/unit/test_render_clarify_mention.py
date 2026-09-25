@@ -44,7 +44,11 @@ def test_clarify_pending_legacy_card_includes_mention():
     card = render_card(session)
 
     elements = _card_elements(card)
-    assert elements[1] == {
+    # LOCAL PATCH (PATCH-013 follow-up): the full question is now always the first body
+    # element (header only says 待选择), so the mention row sits right after it + options.
+    mention_row = next(e for e in elements if "<at id=" in str(e.get("content", "")))
+    assert elements[0]["content"] == session.active_interaction.prompt
+    assert mention_row == {
         "tag": "markdown",
         "content": '<at id="ou_clarify_123"></at> 请选择一个选项',
     }
@@ -120,8 +124,12 @@ def test_clarify_mention_multiselect_legacy_precedes_form():
     card = render_card(session)
 
     elements = _card_elements(card)
+    # LOCAL PATCH (PATCH-013 follow-up): question first, then the mention, then the form.
+    mention_idx = next(i for i, e in enumerate(elements) if "<at id=" in str(e.get("content", "")))
+    form_idx = next(i for i, e in enumerate(elements) if isinstance(e, dict) and e.get("tag") == "form")
+    assert mention_idx < form_idx
     assert (
-        elements[1]["content"]
+        elements[mention_idx]["content"]
         == '<at id="ou_clarify_123"></at> 请选择（可多选）'
     )
     assert any(

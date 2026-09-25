@@ -630,8 +630,13 @@ def _render_legacy_callback_card(
 
     # Mobile clients truncate long headers without exposing their full text.
     # Keep the complete question in the body before options and controls.
+    # LOCAL PATCH (PATCH-013 follow-up, 2026-09-25): upstream only repeats the
+    # prompt in the body when it is > 40 chars, because the header already
+    # carried the full question. PATCH-013 reduced the header to the bare
+    # "待审批"/"待选择" word, so a short question was shown NOWHERE on the card.
+    # Always put the full question in the body.
     prompt = normalize_stream_text(interaction.prompt).strip()
-    if len(prompt) > 40:
+    if prompt:
         elements.append({"tag": "markdown", "content": prompt})
     description = mask_approval_scope(normalize_stream_text(interaction.description).strip())
     if description:

@@ -28,7 +28,7 @@ def test_render_mentions_enabled_false_keeps_pending_approval_card():
 
     card = render_card(session, title="研发助手", mentions_enabled=False)
 
-    assert card["header"]["title"]["content"] == "待审批：允许继续执行吗？"
+    assert card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
 
 
 def test_render_mentions_enabled_true_keeps_pending_approval_card():
@@ -36,7 +36,7 @@ def test_render_mentions_enabled_true_keeps_pending_approval_card():
 
     card = render_card(session, title="研发助手", mentions_enabled=True)
 
-    assert card["header"]["title"]["content"] == "待审批：允许继续执行吗？"
+    assert card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
 
 
 def test_render_mentions_enabled_false_completed_interaction_still_renders():
@@ -58,7 +58,7 @@ def test_render_card_result_plumbs_mentions_enabled_to_legacy_callback_card():
     result = render_card_result(session, mentions_enabled=False)
 
     assert result.disposition == "card"
-    assert result.card["header"]["title"]["content"] == "待审批：允许继续执行吗？"
+    assert result.card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
 
 
 def result_text(card: dict) -> str:

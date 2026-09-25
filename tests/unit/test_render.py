@@ -195,10 +195,12 @@ def test_running_tool_without_model_text_removes_loading_placeholder_from_body()
 
     card = render_card(session)
 
-    row = next(
-        item for item in card["body"]["elements"]
-        if item.get("element_id") == "tool_activity_0"
+    # LOCAL PATCH (PATCH-012): the content-area tool row is hidden in every state;
+    # the running tool stays visible in the 思考过程 panel instead.
+    assert not any(
+        item.get("element_id") == "tool_activity_0" for item in card["body"]["elements"]
     )
+    assert "pytest" in str(card)
     assert not any(
         str(item.get("element_id", "")).startswith("main_content")
         for item in card["body"]["elements"]
@@ -258,7 +260,7 @@ def test_pending_interaction_has_priority_over_compaction_phase():
 
     card = render_card(session, title="研发助手")
 
-    assert card["header"]["title"]["content"] == "待审批：允许继续执行吗？"
+    assert card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
     assert "正在压缩上下文" not in str(card["header"])
 
 
@@ -311,7 +313,7 @@ def test_an_interaction_with_its_own_card_is_not_rendered_into_the_turn_card():
         if str(element.get("element_id", "")).startswith("interaction")
     ] == []
     # ...and the pending approval is still announced.
-    assert card["header"]["title"]["content"] == "待审批：允许继续执行吗？"
+    assert card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
 
 
 def test_tool_activity_clears_compaction_and_restores_tool_subtitle():
@@ -348,11 +350,11 @@ def test_tool_activity_clears_compaction_and_restores_tool_subtitle():
     # the sub-title carries phrase + target now, same source as the content-area tool row.
     assert card["header"]["title"]["content"] == "⏳ 研发助手 · 工具 #1"
     assert card["header"]["subtitle"]["content"] == "执行命令：pytest"
-    row = next(
-        item for item in card["body"]["elements"]
-        if item.get("element_id") == "tool_activity_0"
+    # LOCAL PATCH (PATCH-012): no content-area tool row; the concrete work is on the
+    # header sub-title (asserted above) and in the 思考过程 panel.
+    assert not any(
+        item.get("element_id") == "tool_activity_0" for item in card["body"]["elements"]
     )
-    assert "pytest" in row["content"]
 
 
 def test_tool_row_names_the_work_when_only_the_arguments_are_known():
@@ -526,7 +528,7 @@ def test_v4_waiting_prompt_moves_to_header_without_body_duplication():
         if item.get("tag") == "markdown"
     )
 
-    assert card["header"]["title"]["content"] == "待审批：允许覆盖文件吗？"
+    assert card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
     assert "subtitle" not in card["header"]
     assert str(card).count("允许覆盖文件吗？") == 1
     assert "目标文件：report.html" in str(card)
@@ -2857,14 +2859,13 @@ def test_render_tool_activity_keeps_tool_names_when_reasoning_hidden():
     )
 
     card = render_card(session, show_reasoning=False)
-    row = next(
-        item for item in card["body"]["elements"]
-        if item.get("element_id") == "tool_activity_0"
+    # LOCAL PATCH (PATCH-012): the content-area tool row is suppressed unconditionally
+    # (production keeps show_reasoning=True, so tools remain visible in the panel there).
+    # With reasoning hidden too, the header still carries the running tool count.
+    assert not any(
+        item.get("element_id") == "tool_activity_0" for item in card["body"]["elements"]
     )
-
-    assert "search" in str(row)
-    assert "#1" in str(row)
-    assert "执行中" in str(row)
+    assert "#1" in card["header"]["title"]["content"]
     assert "auxiliary_timeline" not in str(card)
 
 

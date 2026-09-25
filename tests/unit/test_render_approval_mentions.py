@@ -53,7 +53,7 @@ def test_approval_legacy_callback_card_title_prefix():
 
     card = render_card(session, title="研发助手")
 
-    assert card["header"]["title"]["content"] == "待审批：需要授权后继续执行"
+    assert card["header"]["title"]["content"] == "待审批"  # LOCAL PATCH (PATCH-013): terse status title
 
 
 def test_approval_mention_absent_when_config_disabled():
