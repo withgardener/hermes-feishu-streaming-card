@@ -2519,14 +2519,6 @@ if obligation_id is not None:
     await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
 return result, delivery_adapter
 """).body
-    # LOCAL PATCH (PATCH-018): Hermes v0.21.5 (v2026.9.24) releases the durable turn marker
-    # right after recording the obligation (upstream HFC issue #352). Accept exactly this
-    # statement, once, directly after the record call; ordering stays record -> send -> finalize.
-    release_marker = ast.dump(ast.parse(
-        "if obligation_id is not None:\n"
-        "    await self._release_turn_marker(event)\n"
-    ).body[0])
-    release_seen = False
     body = []
     # Hermes may hand crash recovery from the turn marker to the ledger here.
     # Accept only this exact optional guard, once, after recording and before
@@ -2544,9 +2536,6 @@ return result, delivery_adapter
         if (len(body) == 1 and isinstance(node, ast.Expr)
                 and isinstance(node.value, ast.Call)
                 and _call_function(node.value) == ("logger", "info")):
-            continue
-        if len(body) == 2 and not release_seen and ast.dump(node) == release_marker:
-            release_seen = True
             continue
         owned_hooks = (
             _render_split_base_final_delivery_hook_block("", "\n"),
