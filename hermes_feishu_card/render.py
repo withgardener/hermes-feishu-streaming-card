@@ -741,9 +741,11 @@ def _render_legacy_callback_card(
     # prompt in the body when it is > 40 chars, because the header already
     # carried the full question. PATCH-013 reduced the header to the bare
     # "待审批"/"待选择" word, so a short question was shown NOWHERE on the card.
-    # Always put the full question in the body.
+    # Always put the full question in the body (classic). v4.7.0's opt-in task
+    # presentation re-inserts a short question at the top of the card itself
+    # (presentation.py), so keep upstream's `> 40` rule there to preserve its order.
     prompt = normalize_stream_text(interaction.prompt).strip()
-    if prompt:
+    if prompt and (presentation != "task" or len(prompt) > 40):
         elements.append({"tag": "markdown", "content": prompt})
     description = mask_approval_scope(normalize_stream_text(interaction.description).strip())
     if description:

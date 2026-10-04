@@ -39,6 +39,23 @@ INTENTIONAL_LOCAL_BEHAVIOUR = {
     "tests/unit/test_card_layout_state_and_tools.py::test_verb_only_tool_line_is_dropped_from_the_row": _PATCH_012,
     "tests/unit/test_stream_thinking_to_body.py::test_opt_out_moves_live_thinking_to_bounded_panel_only": _PATCH_012,
     "tests/unit/test_timeline_active_visibility.py::test_terminal_compaction_keeps_old_interrupted_body_tools_in_the_panel": _PATCH_012,
+    # v4.7.0 (2026-10-04): opt-in task-presentation tests that read the content-area
+    # tool_activity_ row PATCH-012 removes (StopIteration / any() over that row).
+    # Verified: all pass on pristine v4.7.0, fail only on the patched tree.
+    "tests/unit/test_presentation.py::test_task_current_action_keeps_identifiable_target_when_upstream_preview_was_shortened": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_does_not_hide_parameters_when_no_detail_panel_exists": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_event_sourced_generic_interrupt_uses_header_and_keeps_tool_evidence": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_parallel_tools_only_move_parameters_that_are_in_the_rendered_panel": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_reused_tool_id_cannot_hide_current_parameters_using_old_detail": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_running_card_has_one_state_and_one_visible_action": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_silent_tool_is_last_observed_action_not_live_claim": _PATCH_012,
+    "tests/unit/test_presentation.py::test_task_truncated_process_detail_keeps_parameters_in_body": _PATCH_012,
+    "tests/unit/test_task_clarify_summary.py::test_classic_clarify_keeps_existing_json_rendering": _PATCH_012,
+    "tests/unit/test_task_clarify_summary.py::test_task_batch_question_summary_is_bounded_and_full_questions_remain_in_process": _PATCH_012,
+    "tests/unit/test_task_clarify_summary.py::test_task_clarify_summarizes_known_question_without_json_or_state_mutation": _PATCH_012,
+    "tests/unit/test_task_clarify_summary.py::test_task_keeps_argument_fallback_without_complete_current_process_detail": _PATCH_012,
+    "tests/unit/test_task_clarify_summary.py::test_unknown_or_invalid_question_shape_uses_existing_fallback": _PATCH_012,
+    "tests/unit/test_task_terminal_presentation.py::test_task_approval_stop_merges_only_event_notice": _PATCH_012,
 }
 
 

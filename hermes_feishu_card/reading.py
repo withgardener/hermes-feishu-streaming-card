@@ -197,7 +197,10 @@ def explain_reading_config(
     fields = resolved.get("footer_fields")
     if not isinstance(fields, list):
         fields = DEFAULT_CONFIG["card"]["footer_fields"]
-    allowed_fields = {"duration", "model", "input_tokens", "output_tokens", "context", "subscription_usage"}
+    # LOCAL PATCH (PATCH-007): `cache_rate` is a locally added footer field
+    # (render.py); keep it in the card-config report/preview so they match
+    # what the runtime loader (config.py) actually renders.
+    allowed_fields = {"duration", "model", "input_tokens", "output_tokens", "cache_rate", "context", "subscription_usage"}
     resolved["footer_fields"] = [key for key in fields if isinstance(key, str) and key in allowed_fields]
     mode = resolved.get("interaction_mode", "auto")
     mode = mode.strip().lower() if isinstance(mode, str) else "callback"
