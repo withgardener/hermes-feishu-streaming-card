@@ -3119,3 +3119,27 @@ def test_requester_mentions_preserve_existing_at_markup_and_plain_urls():
     session = CardSession('c', 'm', 'oc', sender_open_id='ou_requester', sender_name='牟勇')
     original = '<at id="ou_requester">@牟勇</at> https://example.com/@牟勇 `@牟勇'
     assert _render_known_requester_mentions(original, session) == original
+
+
+def test_task_compact_footer_keeps_local_cache_rate_field():
+    """LOCAL PATCH (PATCH-007): the task preset renders a compact footer whose availability
+    whitelist must include the locally added `cache_rate` field, or it is silently dropped."""
+    from hermes_feishu_card.render import _render_footer
+
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.status = "completed"
+    session.duration = 12.0
+    session.model = "OKHEMA/CLAUDE/Opus-5.5"
+    session.tokens = {"input_tokens": 1, "output_tokens": 2,
+                      "prompt_tokens": 1000, "cache_read_tokens": 900,
+                      "cache_history": [[1000, 970]]}
+    fields = ["duration", "model", "cache_rate", "context"]
+
+    compact = _render_footer(session, fields, display_status="completed", compact=True, include_status=False)
+    classic = _render_footer(session, fields, display_status="completed", compact=False, include_status=False)
+
+    assert "cache 97%" in classic
+    assert "cache 97%" in compact
+
+    session.tokens = {"input_tokens": 1, "output_tokens": 2}
+    assert "cache" not in _render_footer(session, fields, display_status="completed", compact=True, include_status=False)

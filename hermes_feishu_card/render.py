@@ -2842,6 +2842,8 @@ def _render_footer(
             "input_tokens": "input_tokens" in tokens,
             "output_tokens": "output_tokens" in tokens,
             "context": max_context > 0, "subscription_usage": bool(subscription_usage),
+            # LOCAL PATCH (PATCH-007): the task preset renders compact; keep cache_rate visible.
+            "cache_rate": bool(cache_rate),
         }
         fields = [field for field in fields if available.get(field, False)]
     for field in fields:
