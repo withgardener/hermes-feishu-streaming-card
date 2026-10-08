@@ -6978,11 +6978,21 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
 ):
     state_root = tmp_path / "handoff-state"
     feishu = FakeFeishuClient()
-    feishu.update_delay = 0.5
+    notice_started = asyncio.Event()
+    notice_cancelled = asyncio.Event()
+    async def blocked_update(*args, **kwargs):
+        notice_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            notice_cancelled.set()
+            raise
+    feishu.update_card_message = blocked_update
     store = NativeHandoffStore(state_root)
     app = create_app(feishu, native_handoff_store=store)
     first_client = TestClient(TestServer(app))
     await first_client.start_server()
+
     generation = "7" * 32
     obligation_key = "8" * 64
     answer = "SLOW-NATIVE-" + ("密" * 40_000)
@@ -6996,8 +7006,7 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
                 message_id="message-slow-native-notice",
             ),
         )
-        started_at = asyncio.get_running_loop().time()
-        response = await first_client.post(
+        response_task = asyncio.create_task(first_client.post(
             "/events",
             json=event_payload(
                 "message.completed",
@@ -7013,12 +7022,13 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
                 message_id="message-slow-native-notice",
             ),
         )
-        elapsed = asyncio.get_running_loop().time() - started_at
+        )
+        # A blocking notice would time out; no absolute latency performance claim.
+        response = await asyncio.wait_for(response_task, timeout=5.0)
+        await asyncio.wait_for(notice_started.wait(), timeout=5.0)
         payload = await response.json()
 
         assert response.status == 200
-        assert elapsed < 0.2
-        assert elapsed < feishu.update_delay
         assert payload["applied"] is False
         assert payload["disposition"] == "native"
         descriptor = payload["native_handoff"]
@@ -7028,6 +7038,7 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
         # in flight. Shutdown cancels that in-memory task only.
         await first_client.close()
 
+    assert notice_cancelled.is_set()
     second_app = create_app(
         FakeFeishuClient(),
         native_handoff_store=NativeHandoffStore(state_root),
@@ -9761,20 +9772,22 @@ async def test_runtime_interaction_owner_cancellation_keeps_delivery_and_canonic
         listener.close()
 
 
-async def test_runtime_interaction_expiry_during_blocked_callback_erases_admission(client):
+async def test_runtime_interaction_expiry_during_blocked_callback_erases_admission(client, monkeypatch):
     test_client, feishu_client = client
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
     entered = threading.Event()
     release = threading.Event()
 
     def resolve(payload):
         entered.set()
-        release.wait(timeout=1.0)
+        release.wait(timeout=5.0)
         return True
 
     listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
     listener.start()
     descriptor = runtime_descriptor(listener)
-    descriptor["expires_at"] = time.time() + 0.15
+    descriptor["expires_at"] = clock[0] + 1.0
     try:
         await test_client.post(
             "/events",
@@ -9801,11 +9814,12 @@ async def test_runtime_interaction_expiry_during_blocked_callback_erases_admissi
                 },
             )
         )
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 5.0
         while not entered.is_set() and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
         assert entered.is_set()
-        await asyncio.sleep(0.2)
+        # Expire only after the callback has entered, independent of host speed.
+        clock[0] += 2.0
         release.set()
         response = await action
         assert response.status in {409, 503}
@@ -14227,3 +14241,39 @@ async def test_native_group_turns_use_gateway_execution_scope(client, same_scope
             ))
             mid, card = await wait_for_card_update(feishu_client, f"NATIVE FINAL {index}")
             assert mid == f"feishu-message-{index + 1}"
+
+
+async def test_health_responds_while_integrity_source_scan_is_blocked():
+    from hermes_feishu_card.integrity import RuntimeIntegrityCoordinator
+
+    entered, release = threading.Event(), threading.Event()
+    def detect(_root):
+        entered.set()
+        assert release.wait(5)
+        return object()
+
+    app = create_app(FakeFeishuClient())
+    coordinator = RuntimeIntegrityCoordinator(
+        mode="safe", hermes_root="/sanitized-in-test",
+        supervisor=SimpleNamespace(snapshot=lambda: {
+            "status": "degraded", "reason": "runtime_heartbeat_missing",
+        }),
+        detector=detect,
+        planner=lambda _: SimpleNamespace(state="installed"),
+    )
+    app[sidecar_server.RUNTIME_INTEGRITY_COORDINATOR_KEY] = coordinator
+    async with TestClient(TestServer(app)) as client:
+        check = asyncio.create_task(asyncio.to_thread(coordinator.check_once))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            response = await asyncio.wait_for(client.get("/health"), timeout=2)
+            assert response.status == 200
+            body = await response.json()
+            assert body["integrity"]["last_status"] == "idle"
+            assert not release.is_set()
+            assert not check.done()
+        finally:
+            release.set()
+            await check
+        body = await (await client.get("/health")).json()
+        assert body["integrity"]["last_reason"] == "recovery_not_required"
