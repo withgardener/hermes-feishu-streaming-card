@@ -157,6 +157,7 @@ class UpdateJob:
     pre_sidecar_pid: int = 0
     pre_runtime_id_hash: str = ""
     pre_runtime_sequence: int = 0
+    hermes_home: Path | None = None
 
 
 def maintenance_paths(root: Path | None = None) -> MaintenancePaths:
@@ -454,6 +455,7 @@ def create_job(
     paths: MaintenancePaths,
     *,
     hermes_root: Path,
+    hermes_home: Path | None = None,
     config_path: Path,
     env_file: Path | None,
     profile_id: str,
@@ -491,6 +493,7 @@ def create_job(
         path=job_path.resolve(strict=False),
         phase="locking",
         hermes_root=_absolute_path(hermes_root, "Hermes root"),
+        hermes_home=_absolute_path(hermes_home, "Hermes home") if hermes_home is not None else None,
         config_path=_absolute_path(config_path, "config path"),
         env_file=(
             _absolute_path(env_file, "env file") if env_file is not None else None
@@ -565,6 +568,8 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         "pre_runtime_id_hash",
         "pre_runtime_sequence",
     }
+    if "hermes_home" in payload:
+        expected_keys.add("hermes_home")
     if set(payload) != expected_keys:
         raise MaintenanceRefused("job schema fields are invalid")
     if payload.get("schema_version") != JOB_SCHEMA_VERSION:
@@ -586,6 +591,7 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         path=selected.resolve(strict=False),
         phase=phase,
         hermes_root=_serialized_absolute_path(payload, "hermes_root"),
+        hermes_home=_serialized_absolute_path(payload, "hermes_home") if "hermes_home" in payload else None,
         config_path=_serialized_absolute_path(payload, "config_path"),
         env_file=(
             _absolute_path(Path(env_value), "env file") if env_value else None
@@ -1123,6 +1129,7 @@ def _safe_result(value: object) -> dict[str, object]:
 
 def _job_payload(job: UpdateJob) -> dict[str, object]:
     return {
+        **({"hermes_home": str(job.hermes_home)} if job.hermes_home is not None else {}),
         "schema_version": job.schema_version,
         "job_id": job.job_id,
         "phase": job.phase,

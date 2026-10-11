@@ -14,6 +14,7 @@ from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from .persistent_service import persistent_sidecar_active
 from .install.detect import detect_hermes
+from .install.runtime_python import PMRuntimeRefused, pm_managed_runtime_python
 from .install.recovery import plan_recovery
 from .maintenance_store import (
     ArtifactMetadata,
@@ -167,6 +168,8 @@ _BASE_PROCESS_ENV_KEYS = frozenset(
 def inspect_update(
     *,
     hermes_root: Path,
+    hermes_home: Path | None = None,
+    shared_source: bool = False,
     artifact: ArtifactMetadata,
     installed_hfc_version: str,
     active_sessions: int,
@@ -216,6 +219,14 @@ def inspect_update(
         return result(False, "artifact_version_mismatch")
     if not _is_sha256(artifact.sha256):
         return result(False, "artifact_hash_invalid")
+
+    if shared_source:
+        return result(False, "shared_source_requires_manual_update")
+
+    if hermes_home is not None and Path(hermes_home).resolve() != root.parent:
+        # Source updates affect every Gateway sharing this checkout. HFC has no
+        # cross-instance drain authority; keep terminal coordinated maintenance.
+        return result(False, "split_home_requires_manual_update")
 
     if persistent_sidecar_active():
         return result(False, "persistent_sidecar_requires_manual_update")
@@ -337,7 +348,7 @@ def inspect_update(
         )
 
     try:
-        binding = resolve_hermes_command_binding(root)
+        binding = resolve_hermes_command_binding(root, hermes_home=hermes_home)
     except MaintenanceRefused:
         return result(
             False,
@@ -522,8 +533,14 @@ def run_command(
     )
 
 
-def detect_runtime_python(hermes_root: Path) -> Path | None:
+def detect_runtime_python(hermes_root: Path, *, hermes_home: Path | None = None) -> Path | None:
     root = Path(hermes_root).expanduser()
+    try:
+        managed = pm_managed_runtime_python(root, hermes_home=hermes_home)
+    except PMRuntimeRefused as exc:
+        raise MaintenanceRefused("Hermes PM runtime is unavailable") from exc
+    if managed is not None:
+        return managed
     candidates = (
         root / "venv" / "bin" / "python",
         root / "venv" / "bin" / "python3",
@@ -544,9 +561,12 @@ def detect_runtime_python(hermes_root: Path) -> Path | None:
     return None
 
 
-def resolve_hermes_command_binding(root: Path) -> HermesCommandBinding:
+def resolve_hermes_command_binding(root: Path, *, hermes_home: Path | None = None) -> HermesCommandBinding:
     selected_root = Path(root).expanduser().resolve(strict=False)
-    runtime_python = detect_runtime_python(selected_root)
+    home = Path(hermes_home).resolve() if hermes_home is not None else selected_root.parent
+    if home != selected_root.parent and (not home.is_dir() or not (home / "config.yaml").is_file()):
+        raise MaintenanceRefused("Hermes HOME binding is unavailable")
+    runtime_python = detect_runtime_python(selected_root, hermes_home=home)
     if runtime_python is None:
         raise MaintenanceRefused("Hermes runtime is unavailable")
     entrypoint_name = "hermes.exe" if os.name == "nt" else "hermes"
@@ -558,7 +578,7 @@ def resolve_hermes_command_binding(root: Path) -> HermesCommandBinding:
     )
     return HermesCommandBinding(
         root=selected_root,
-        home=selected_root.parent,
+        home=home,
         runtime_python=runtime_python,
         argv_prefix=prefix,
     )
@@ -653,13 +673,14 @@ def set_gateway_external_drain(
     hermes_root: Path,
     *,
     active: bool,
+    hermes_home: Path | None = None,
     run: Optional[CommandRunner] = None,
     binding: Optional[HermesCommandBinding] = None,
     base_environment: Optional[Mapping[str, str]] = None,
     proxy_environment: Optional[Mapping[str, str]] = None,
 ) -> bool:
     try:
-        selected = binding or resolve_hermes_command_binding(hermes_root)
+        selected = binding or resolve_hermes_command_binding(hermes_root, hermes_home=hermes_home)
     except MaintenanceRefused:
         return False
     result = run_bound_runtime_python(
@@ -839,9 +860,12 @@ def _cleanup_terminal_owned_job(
         discard_job_credentials(paths, job_id=result.job_id)
     except (MaintenanceRefused, OSError):
         pass
+    if result.result.get("error_code") in {"split_home_requires_manual_update", "shared_source_requires_manual_update", "hermes_home_binding_changed"}:
+        return
     try:
         set_gateway_external_drain(
             result.hermes_root,
+            hermes_home=result.hermes_home,
             active=False,
             run=run,
             base_environment=base_environment,
@@ -915,9 +939,24 @@ def _run_state_machine(
                 "no_mutation",
                 publisher,
             )
+        if current.hermes_home is not None and current.hermes_home.resolve() != current.hermes_root.resolve().parent:
+            return _fail_job(current, "split_home_requires_manual_update", "no_mutation", publisher)
+        try:
+            from .config import load_config
+            from .instance_binding import configured_hermes_home
+            fresh_config = load_config(current.config_path, env_file=current.env_file)
+            if (fresh_config.get("service") or {}).get("shared_source", False):
+                return _fail_job(current, "shared_source_requires_manual_update", "no_mutation", publisher)
+            # Pre-binding jobs keep their legacy HOME, but must not execute after
+            # that configuration has been repurposed for another instance.
+            job_home = current.hermes_home or current.hermes_root.resolve().parent
+            if configured_hermes_home(current.hermes_root, fresh_config) != job_home:
+                raise ValueError("HOME changed")
+        except (OSError, ValueError):
+            return _fail_job(current, "hermes_home_binding_changed", "no_mutation", publisher)
         boundary = _DRAIN_RECONCILIATION_BOUNDARIES[current.phase]
         try:
-            binding = resolve_hermes_command_binding(current.hermes_root)
+            binding = resolve_hermes_command_binding(current.hermes_root, hermes_home=current.hermes_home)
         except (MaintenanceRefused, OSError, ValueError):
             return _fail_job(
                 current,
@@ -979,6 +1018,7 @@ def _run_state_machine(
             active_sessions = _active_maintenance_sessions(health)
             inspection = inspect_update(
                 hermes_root=current.hermes_root,
+                hermes_home=current.hermes_home,
                 artifact=artifact,
                 installed_hfc_version=current.artifact_version,
                 active_sessions=active_sessions,
@@ -1175,7 +1215,7 @@ def _run_state_machine(
                     )
                 try:
                     binding = resolve_hermes_command_binding(
-                        current.hermes_root
+                        current.hermes_root, hermes_home=current.hermes_home
                     )
                 except MaintenanceRefused:
                     return _fail_job(
@@ -1223,7 +1263,7 @@ def _run_state_machine(
                     publisher,
                 )
             try:
-                binding = resolve_hermes_command_binding(current.hermes_root)
+                binding = resolve_hermes_command_binding(current.hermes_root, hermes_home=current.hermes_home)
             except MaintenanceRefused:
                 return _fail_job(
                     current,
@@ -1292,7 +1332,7 @@ def _run_state_machine(
 
         if current.phase == "starting_services":
             try:
-                binding = resolve_hermes_command_binding(current.hermes_root)
+                binding = resolve_hermes_command_binding(current.hermes_root, hermes_home=current.hermes_home)
             except MaintenanceRefused:
                 return _fail_job(
                     current,
@@ -1347,7 +1387,7 @@ def _run_state_machine(
 
         if current.phase == "verifying":
             try:
-                binding = resolve_hermes_command_binding(current.hermes_root)
+                binding = resolve_hermes_command_binding(current.hermes_root, hermes_home=current.hermes_home)
             except MaintenanceRefused:
                 return _fail_job(
                     current,
@@ -1802,7 +1842,7 @@ def _restore_old_hfc_after_update_failure(
     if status is None or status:
         return False
     try:
-        binding = resolve_hermes_command_binding(job.hermes_root)
+        binding = resolve_hermes_command_binding(job.hermes_root, hermes_home=job.hermes_home)
     except MaintenanceRefused:
         return False
     runtime_python = binding.runtime_python

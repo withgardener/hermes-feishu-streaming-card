@@ -352,6 +352,32 @@ def build_diagnostic_report(
         route=route,
     )
     runtime = _build_runtime(health_data, runtime_import, feishu_sdk)
+    from .instance_binding import configured_hermes_home
+    binding_findings = ()
+    try:
+        home = configured_hermes_home(detection.root, config)
+        split_home = home != Path(detection.root).resolve().parent
+        shared_source = (config.get("service") or {}).get("shared_source", False)
+        runtime["maintenance_binding"] = {
+            "selection": "explicit" if (config.get("service") or {}).get("hermes_home") is not None else "source_parent_default",
+            "split_home": split_home, "runtime_verified": False,
+            "card_update": "terminal_only" if split_home or shared_source else "requires_runtime_evidence",
+        }
+        if split_home or shared_source:
+            binding_findings = (DiagnosticFinding(
+                "split_home_requires_manual_update", "warning",
+                "Hermes uses a split HOME or shared source checkout.",
+                "Source compatibility does not prove live Gateway identity; shared-source updates require coordinated terminal maintenance.",
+                ("Restart both services and verify authenticated readiness. Use the original service owner for terminal updates.",),
+            ),)
+    except (OSError, ValueError):
+        runtime["maintenance_binding"] = {"selection": "invalid", "runtime_verified": False}
+        binding_findings = (DiagnosticFinding(
+            "hermes_home_binding_invalid", "error", "Hermes HOME binding is invalid.",
+            "Maintenance identity cannot be verified.",
+            ("Set service.hermes_home to the absolute process HOME containing config.yaml.",),
+        ),)
+
     findings = _build_findings(
         config,
         detection,
@@ -372,6 +398,7 @@ def build_diagnostic_report(
     )
     findings = (
         *findings,
+        *binding_findings,
         *_runtime_integrity_findings(
             health_data,
             acknowledgement_eligible=acknowledgement_eligible,

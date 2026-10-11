@@ -3092,6 +3092,7 @@ def test_update_confirmation_creates_durable_job_before_admission_fence(
         sidecar_server.PACKAGE_VERSION_KEY: "4.2.0",
         sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY: supervisor,
         sidecar_server.OPERATIONS_HERMES_ROOT_KEY: tmp_path / "hermes",
+        sidecar_server.OPERATIONS_HERMES_HOME_KEY: tmp_path,
         sidecar_server.OPERATIONS_CONFIG_PATH_KEY: tmp_path / "config.yaml",
         sidecar_server.OPERATIONS_ENV_FILE_KEY: None,
     }

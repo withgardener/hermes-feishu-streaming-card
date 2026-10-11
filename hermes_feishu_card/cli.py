@@ -22,6 +22,7 @@ import yaml
 
 from hermes_feishu_card import __version__ as PACKAGE_VERSION
 from hermes_feishu_card.config import load_config
+from hermes_feishu_card.instance_binding import configured_hermes_home, setup_hermes_home
 from hermes_feishu_card.delivery_policy import normalize_native_chats
 from hermes_feishu_card.bots import BotRegistry, RoutingContext
 from hermes_feishu_card.diagnostics import (
@@ -249,6 +250,7 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--config", required=True)
     doctor.add_argument("--hermes-dir")
     doctor.add_argument("--hermes-home")
+    doctor.add_argument("--env-file")
     doctor.add_argument("--skip-hermes", action="store_true")
     doctor.add_argument("--profile-id")
     doctor_output = doctor.add_mutually_exclusive_group()
@@ -479,6 +481,11 @@ def _run_setup(args: argparse.Namespace) -> int:
             if selected_env_path != config_path.parent / ".env"
             else load_config(config_path)
         )
+        setup_home = setup_hermes_home(
+            Path(args.hermes_dir), config, getattr(args, "hermes_home", None),
+        )
+        if setup_home is not None:
+            config.setdefault("service", {})["hermes_home"] = str(setup_home)
         profiles = config.get("profiles")
         if (profiles and getattr(args, "profile_id", None) is None
                 and route_settings["profile_id"] == "default" and "default" not in profiles):
@@ -494,6 +501,7 @@ def _run_setup(args: argparse.Namespace) -> int:
                 ),
                 "HERMES_FEISHU_CARD_EVENT_URL": route_settings["event_url"],
                 "HERMES_DIR": str(Path(args.hermes_dir).expanduser()),
+                **({"HERMES_FEISHU_CARD_HERMES_HOME": str(setup_home)} if setup_home is not None else {}),
             },
         )
     except Exception as exc:
@@ -546,13 +554,13 @@ def _run_setup(args: argparse.Namespace) -> int:
         return 1
     print("doctor: ok")
     print(_format_hermes_detection(detection))
-    _print_hermes_streaming_guidance(Path(args.hermes_dir))
+    _print_hermes_streaming_guidance(Path(args.hermes_dir), **({"hermes_home": setup_home} if setup_home is not None else {}))
 
     if args.repair and not args.no_repair:
         repair_code = _run_repair(
             argparse.Namespace(
                 hermes_dir=args.hermes_dir,
-                hermes_home=getattr(args, "hermes_home", None),
+                hermes_home=setup_home,
                 yes=True,
                 accept_hermes_upgrade=args.accept_hermes_upgrade,
             )
@@ -563,7 +571,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     install_code = _run_install(
         argparse.Namespace(
             hermes_dir=args.hermes_dir,
-            hermes_home=getattr(args, "hermes_home", None),
+            hermes_home=setup_home,
             yes=True,
             no_repair=args.no_repair,
             accept_hermes_upgrade=args.accept_hermes_upgrade,
@@ -572,7 +580,10 @@ def _run_setup(args: argparse.Namespace) -> int:
     if install_code != 0:
         return install_code
 
-    _provision_setup_maintenance(Path(args.hermes_dir).expanduser())
+    if setup_home is not None and setup_home != verified_hermes_root.resolve().parent:
+        print("maintenance: split HOME requires coordinated terminal updates")
+    else:
+        _provision_setup_maintenance(Path(args.hermes_dir).expanduser())
 
     try:
         runtime_python, runtime_identity = _resolve_sidecar_runtime_identity(
@@ -961,7 +972,10 @@ def _run_doctor(args: argparse.Namespace) -> int:
         args._profile_id = route_settings["profile_id"]
         args._profile_source = route_settings["profile_source"]
         args._event_url = route_settings["event_url"]
-        config = load_config(config_path)
+        config = load_config(config_path, env_file=route_settings["env_path"])
+        if args.hermes_dir and args.hermes_home is not None:
+            selected_home = setup_hermes_home(Path(args.hermes_dir), config, args.hermes_home)
+            config.setdefault("service", {})["hermes_home"] = str(selected_home)
     except Exception as exc:
         if args.json_output:
             print(
@@ -1015,17 +1029,25 @@ def _run_doctor(args: argparse.Namespace) -> int:
         detection = detect_hermes(args.hermes_dir)
         print(_format_hermes_detection(detection))
         if detection.supported:
-            runtime_import = _doctor_runtime_import_report(detection)
+            home_options = {}
+            try:
+                if (config.get("service") or {}).get("hermes_home") is not None:
+                    home_options["hermes_home"] = configured_hermes_home(detection.root, config)
+                    print("maintenance binding: explicit HOME; verify authenticated readiness after restart")
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            runtime_import = _doctor_runtime_import_report(detection, **home_options)
             print(
                 "runtime_import: "
                 f"{runtime_import['status']} - {runtime_import.get('message', '')}"
             )
-            feishu_sdk = _doctor_feishu_sdk_report(detection)
+            feishu_sdk = _doctor_feishu_sdk_report(detection, **home_options)
             print(
                 "feishu_sdk: "
                 f"{feishu_sdk['status']} - {feishu_sdk.get('message', '')}"
             )
-            _print_hermes_streaming_guidance(Path(args.hermes_dir))
+            _print_hermes_streaming_guidance(Path(args.hermes_dir), **home_options)
         return 0 if detection.supported else 1
     print("hermes: not checked")
     return 0
@@ -1281,13 +1303,24 @@ def _build_doctor_report(
             }
         )
 
-    runtime_import = _doctor_runtime_import_report(detection)
+    home_options = {}
+    try:
+        if (config.get("service") or {}).get("hermes_home") is not None:
+            home_options["hermes_home"] = configured_hermes_home(detection.root, config)
+    except (ValueError, OSError):
+        report["maintenance_binding"] = {"status": "invalid", "runtime_verified": False}
+        recommendations.append({"severity": "error", "code": "hermes_home_binding_invalid",
+            "message": "The configured Hermes HOME cannot be verified.",
+            "next_step": "Set service.hermes_home to the absolute process HOME containing config.yaml."})
+        return _finalize_doctor_report(report)
+
+    runtime_import = _doctor_runtime_import_report(detection, **home_options)
     report["runtime_import"] = runtime_import
     _append_runtime_import_recommendation(recommendations, runtime_import)
-    feishu_sdk = _doctor_feishu_sdk_report(detection)
+    feishu_sdk = _doctor_feishu_sdk_report(detection, **home_options)
     report["feishu_sdk"] = feishu_sdk
 
-    streaming = _doctor_streaming_report(Path(args.hermes_dir))
+    streaming = _doctor_streaming_report(Path(args.hermes_dir), **home_options)
     report["streaming"] = streaming
     if streaming["status"] == "disabled":
         recommendations.append(
@@ -1315,7 +1348,7 @@ def _build_doctor_report(
         )
 
     if _manifest_version_candidate(_manifest_path(detection.root)) == 3:
-        install_state, recovery_plan = _diagnose_v3_install_state(detection, args)
+        install_state, recovery_plan = _diagnose_v3_install_state(detection, args, **home_options)
         integrity_plan = None
     else:
         install_state = _diagnose_install_state(detection)
@@ -1598,8 +1631,8 @@ def _exact_delivery_contract_status(detection: HermesDetection) -> str:
     return "missing_or_unsupported"
 
 
-def _doctor_streaming_report(hermes_root: Path) -> dict[str, str]:
-    config = _load_hermes_user_config(hermes_root)
+def _doctor_streaming_report(hermes_root: Path, *, hermes_home: Path | None = None) -> dict[str, str]:
+    config = _load_hermes_user_config(hermes_root, hermes_home=hermes_home)
     status = _detect_hermes_streaming_status(config)
     if status == "enabled":
         message = "Hermes Gateway streaming config appears enabled for Feishu."
@@ -1614,9 +1647,9 @@ def _doctor_streaming_report(hermes_root: Path) -> dict[str, str]:
     return {"status": status, "message": message}
 
 
-def _doctor_runtime_import_report(detection: HermesDetection) -> dict[str, Any]:
+def _doctor_runtime_import_report(detection: HermesDetection, *, hermes_home: Path | None = None) -> dict[str, Any]:
     try:
-        runtime_python = _detect_hermes_runtime_python(detection.root)
+        runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
     except PMRuntimeRefused as exc:
         return {"checked": True, "status": "failed", "message": str(exc)}
     if runtime_python is None:
@@ -1629,7 +1662,7 @@ def _doctor_runtime_import_report(detection: HermesDetection) -> dict[str, Any]:
     return _check_runtime_hook_import(runtime_python)
 
 
-def _doctor_feishu_sdk_report(detection: HermesDetection) -> dict[str, Any]:
+def _doctor_feishu_sdk_report(detection: HermesDetection, *, hermes_home: Path | None = None) -> dict[str, Any]:
     if not _hermes_requires_feishu_sdk_capability(detection.root):
         return {
             "checked": False,
@@ -1641,7 +1674,7 @@ def _doctor_feishu_sdk_report(detection: HermesDetection) -> dict[str, Any]:
             ),
         }
     try:
-        runtime_python = _detect_hermes_runtime_python(detection.root)
+        runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
     except PMRuntimeRefused as exc:
         return {"checked": True, "status": "failed", "message": str(exc)}
     if runtime_python is None:
@@ -1780,9 +1813,10 @@ def _append_runtime_import_recommendation(
     )
 
 
-def _detect_hermes_runtime_python(hermes_root: Path | str) -> Path | None:
+def _detect_hermes_runtime_python(hermes_root: Path | str, *, hermes_home: Path | None = None) -> Path | None:
     root = Path(hermes_root).expanduser()
-    pm_managed = _pm_managed_runtime_python(root)
+    pm_managed = (_pm_managed_runtime_python(root, hermes_home=hermes_home)
+                  if hermes_home is not None else _pm_managed_runtime_python(root))
     if pm_managed is not None:
         return pm_managed
     candidates = (
@@ -1810,6 +1844,7 @@ def _detect_hermes_runtime_python(hermes_root: Path | str) -> Path | None:
 
 def _resolve_start_runtime_identity(
     hermes_root: Path | str | None = None,
+    *, hermes_home: Path | None = None,
 ) -> tuple[Path, str]:
     if hermes_root is None:
         candidate = Path(sys.executable).expanduser()
@@ -1822,7 +1857,7 @@ def _resolve_start_runtime_identity(
         except (OSError, RuntimeError):
             runtime_python = None
     else:
-        runtime_python = _detect_hermes_runtime_python(hermes_root)
+        runtime_python = _detect_hermes_runtime_python(hermes_root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
     if runtime_python is None:
         raise ValueError(
             "Sidecar runtime Python could not be verified. Rerun the official "
@@ -1849,7 +1884,10 @@ def _resolve_sidecar_runtime_identity(
 ) -> tuple[Path, str]:
     # Hooks still have to load in the selected Hermes environment. A separate
     # delivery process must never turn into an escape from that installation gate.
-    default = _resolve_start_runtime_identity(hermes_root)
+    home_options = {}
+    if hermes_root is not None and (config.get("service") or {}).get("hermes_home") is not None:
+        home_options["hermes_home"] = configured_hermes_home(Path(hermes_root), config)
+    default = _resolve_start_runtime_identity(hermes_root, **home_options)
     selected = (config.get("service") or {}).get("python_executable")
     if selected is None:
         return default
@@ -2002,8 +2040,8 @@ def _hermes_runtime_cwd(runtime_python: Path) -> Path | None:
     return root if root.exists() else None
 
 
-def _ensure_hermes_runtime_package(detection: HermesDetection) -> None:
-    runtime_python = _detect_hermes_runtime_python(detection.root)
+def _ensure_hermes_runtime_package(detection: HermesDetection, *, hermes_home: Path | None = None) -> None:
+    runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
     if runtime_python is None:
         print("runtime package: skipped (Hermes venv Python not found)")
         return
@@ -2057,10 +2095,10 @@ def _ensure_hermes_runtime_package(detection: HermesDetection) -> None:
         print(f"runtime package: installed into {runtime_python}")
 
 
-def _ensure_hermes_feishu_sdk(detection: HermesDetection) -> None:
+def _ensure_hermes_feishu_sdk(detection: HermesDetection, *, hermes_home: Path | None = None) -> None:
     if not _hermes_requires_feishu_sdk_capability(detection.root):
         return
-    runtime_python = _detect_hermes_runtime_python(detection.root)
+    runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
     if runtime_python is None:
         print("feishu sdk: skipped (Hermes venv Python not found)")
         return
@@ -2282,12 +2320,13 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
 def _diagnose_v3_install_state(
     detection: HermesDetection,
     args: argparse.Namespace,
+    *, hermes_home: Path | None = None,
 ) -> tuple[dict[str, Any], RecoveryPlan]:
     manifest_path = _manifest_path(detection.root)
     try:
         binding = resolve_runtime_binding(
             checkout_root=detection.root,
-            hermes_home=getattr(args, "hermes_home", None),
+            hermes_home=hermes_home if hermes_home is not None else getattr(args, "hermes_home", None),
             profile_id=getattr(args, "profile_id", None),
         )
         entrypoint = probe_plugin_entrypoint(
@@ -2597,8 +2636,8 @@ def _format_hermes_detection(detection: HermesDetection) -> str:
     return "\n".join(lines)
 
 
-def _print_hermes_streaming_guidance(hermes_root: Path) -> None:
-    config = _load_hermes_user_config(hermes_root)
+def _print_hermes_streaming_guidance(hermes_root: Path, *, hermes_home: Path | None = None) -> None:
+    config = _load_hermes_user_config(hermes_root, hermes_home=hermes_home)
     status = _detect_hermes_streaming_status(config)
     if status == "disabled":
         print(
@@ -2620,8 +2659,10 @@ def _print_hermes_streaming_guidance(hermes_root: Path) -> None:
         )
 
 
-def _load_hermes_user_config(hermes_root: Path) -> dict[str, object]:
-    for config_path in _candidate_hermes_config_paths(hermes_root):
+def _load_hermes_user_config(hermes_root: Path, *, hermes_home: Path | None = None) -> dict[str, object]:
+    paths = ((hermes_home / "config.yaml",) if hermes_home is not None
+             else _candidate_hermes_config_paths(hermes_root))
+    for config_path in paths:
         if not config_path.exists() or not config_path.is_file():
             continue
         try:
@@ -2728,9 +2769,15 @@ def _lifecycle_hook_check(args: argparse.Namespace) -> dict[str, object] | None:
     manifest_path = verified_root / MANIFEST_NAME
     if _manifest_version_candidate(manifest_path) == 3:
         try:
+            lifecycle_config = load_config(
+                args.config, env_file=getattr(args, "env_file", None) or os.environ.get("HFC_ENV_FILE"),
+            )
+            selected_home = getattr(args, "hermes_home", None)
+            if (lifecycle_config.get("service") or {}).get("hermes_home") is not None:
+                selected_home = setup_hermes_home(verified_root, lifecycle_config, selected_home)
             binding = resolve_runtime_binding(
                 checkout_root=verified_root,
-                hermes_home=getattr(args, "hermes_home", None),
+                hermes_home=selected_home,
                 profile_id=getattr(args, "profile_id", None),
             )
             entrypoint = probe_plugin_entrypoint(
@@ -3817,8 +3864,13 @@ def _run_install(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        _ensure_hermes_runtime_package(detection)
-        _ensure_hermes_feishu_sdk(detection)
+        home_options = {}
+        if getattr(args, "hermes_home", None) is not None:
+            home_options["hermes_home"] = configured_hermes_home(
+                detection.root, {"service": {"hermes_home": str(args.hermes_home)}},
+            )
+        _ensure_hermes_runtime_package(detection, **home_options)
+        _ensure_hermes_feishu_sdk(detection, **home_options)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

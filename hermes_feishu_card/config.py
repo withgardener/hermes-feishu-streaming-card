@@ -391,6 +391,12 @@ def _validate_service_manager(config: dict[str, Any]) -> None:
     if not isinstance(manager, str) or manager not in SERVICE_MANAGER_VALUES:
         values = ", ".join(sorted(SERVICE_MANAGER_VALUES))
         raise ValueError(f"service.manager must be one of: {values}")
+    if "shared_source" in service and type(service["shared_source"]) is not bool:
+        raise ValueError("service.shared_source must be a boolean")
+    if "hermes_home" in service:
+        home = service["hermes_home"]
+        if not isinstance(home, str) or not home.strip() or not Path(home).is_absolute():
+            raise ValueError("service.hermes_home must be an absolute Hermes HOME")
     if "python_executable" in service:
         selected = service["python_executable"]
         if (not isinstance(selected, str) or not selected.strip()
@@ -562,6 +568,9 @@ def _apply_env_mapping_overrides(
             values["HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"],
             "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
         )
+
+    if "HERMES_FEISHU_CARD_HERMES_HOME" in values:
+        config.setdefault("service", {})["hermes_home"] = values["HERMES_FEISHU_CARD_HERMES_HOME"]
 
     if "HERMES_FEISHU_CARD_SERVICE_MANAGER" in values:
         config.setdefault("service", {})["manager"] = values[

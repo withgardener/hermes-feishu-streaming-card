@@ -1122,27 +1122,9 @@ def gateway_external_drain_active() -> bool:
 
 
 def gateway_drain_home_verified() -> bool:
-    module = sys.modules.get("gateway.run")
-    source = getattr(module, "__file__", None)
-    if not isinstance(source, str) or not source:
-        return False
-    try:
-        gateway_source = Path(source).resolve(strict=True)
-        if gateway_source.parent.name != "gateway":
-            return False
-        hermes_root = gateway_source.parent.parent
-        constants = importlib.import_module("hermes_constants")
-        resolver = getattr(constants, "get_process_hermes_home", None)
-        if not callable(resolver):
-            resolver = getattr(constants, "get_hermes_home", None)
-        if not callable(resolver):
-            return False
-        gateway_home = Path(resolver()).expanduser().resolve(strict=False)
-    except Exception:
-        return False
-    return os.path.normcase(str(gateway_home)) == os.path.normcase(
-        str(hermes_root.parent.resolve(strict=False))
-    )
+    from .instance_binding import gateway_process_binding
+    # Sidecar admission additionally matches the authenticated source/HOME hash.
+    return gateway_process_binding() is not None
 
 
 async def maintenance_admission_from_hermes_locals(

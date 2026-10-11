@@ -1105,7 +1105,7 @@ def test_module_doctor_json_redacts_paths_inside_error_and_recommendation_text(t
     monkeypatch.setattr(
         cli_module,
         "load_config",
-        lambda _path: (_ for _ in ()).throw(ValueError(f"invalid config {config_path}")),
+        lambda _path, **_kwargs: (_ for _ in ()).throw(ValueError(f"invalid config {config_path}")),
     )
 
     exit_code = main(["doctor", "--config", str(config_path), "--skip-hermes", "--json"])
@@ -1160,7 +1160,7 @@ def test_doctor_json_config_load_failure_redacts_common_absolute_paths(
     monkeypatch.setattr(
         cli_module,
         "load_config",
-        lambda _path: (_ for _ in ()).throw(ValueError(f"invalid config {sensitive_path}")),
+        lambda _path, **_kwargs: (_ for _ in ()).throw(ValueError(f"invalid config {sensitive_path}")),
     )
 
     assert main(["doctor", "--config", str(config_path), "--skip-hermes", "--json"]) == 1
@@ -2298,3 +2298,59 @@ def test_chats_multi_profile_requires_explicit_existing_profile_without_id_leak(
     assert raw_chat_id not in success.out + success.err
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert data["profiles"]["work"]["bindings"]["native_chats"] == [raw_chat_id]
+
+
+def test_lifecycle_v3_check_reuses_home_saved_in_selected_env(tmp_path, monkeypatch):
+    root=tmp_path/'hermes'; root.mkdir()
+    (root/cli_module.MANIFEST_NAME).write_text('{"manifest_version":3}')
+    home=tmp_path/'profile'; home.mkdir(); (home/'config.yaml').write_text('{}')
+    config=tmp_path/'hfc.yaml'; config.write_text('{}')
+    env=tmp_path/'selected.env'; env.write_text('HERMES_FEISHU_CARD_HERMES_HOME='+str(home)+'\n')
+    monkeypatch.setattr(cli_module,'detect_hermes',lambda _:SimpleNamespace(supported=True,root=root))
+    monkeypatch.setattr(cli_module,'_verified_explicit_hermes_root',lambda *a,**k:root)
+    seen=[]
+    monkeypatch.setattr(cli_module,'resolve_runtime_binding',lambda **kw:seen.append(kw) or object())
+    monkeypatch.setattr(cli_module,'probe_plugin_entrypoint',lambda *a,**k:object())
+    monkeypatch.setattr(cli_module,'inspect_fixed_tag_hybrid_install',lambda **k:object())
+    result=cli_module._lifecycle_hook_check(SimpleNamespace(hermes_dir=str(root),config=str(config),
+        env_file=str(env),hermes_home=None,profile_id='profile'))
+    assert result['status']=='installed' and seen[0]['hermes_home']==home
+
+
+@pytest.mark.parametrize('selection', ['argument', 'environment', 'home_argument'])
+def test_doctor_loads_selected_env_home_before_diagnostics(tmp_path, monkeypatch, capsys, selection):
+    config = tmp_path / 'sidecar.yaml'
+    config.write_text('{}')
+    home = tmp_path / 'profile-a'
+    home.mkdir()
+    (home / 'config.yaml').write_text('{}')
+    env_file = tmp_path / 'selected.env'
+    env_file.write_text('HERMES_FEISHU_CARD_HERMES_HOME=' + str(home) + '\n')
+    seen = []
+    def report(path, values, args):
+        seen.append(values.get('service', {}).get('hermes_home'))
+        return {'ok': True}
+    monkeypatch.setattr(cli_module, '_build_doctor_report', report)
+    args = ['doctor', '--config', str(config), '--hermes-dir', str(FIXTURE), '--json']
+    if selection == 'argument':
+        args += ['--env-file', str(env_file)]
+    elif selection == 'environment':
+        monkeypatch.setenv('HFC_ENV_FILE', str(env_file))
+    else:
+        args += ['--hermes-home', str(home)]
+    assert main(args) == 0
+    assert seen == [str(home)]
+    assert config.read_text() == '{}'
+
+
+def test_doctor_explicit_home_rejects_conflict_before_probes(tmp_path, monkeypatch, capsys):
+    home, other = tmp_path / 'home-a', tmp_path / 'home-b'
+    for path in (home, other):
+        path.mkdir()
+        (path / 'config.yaml').write_text('{}')
+    config = tmp_path / 'sidecar.yaml'
+    config.write_text(yaml.safe_dump({'service': {'hermes_home': str(home)}}))
+    monkeypatch.setattr(cli_module, '_build_doctor_report', lambda *a: pytest.fail('conflicting HOME must not probe'))
+    assert main(['doctor', '--config', str(config), '--hermes-dir', str(FIXTURE),
+                 '--hermes-home', str(other), '--json']) == 1
+    assert 'conflicts' in capsys.readouterr().out

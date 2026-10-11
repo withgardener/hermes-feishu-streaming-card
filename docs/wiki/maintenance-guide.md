@@ -318,4 +318,6 @@ Orphaned integrity fences can be explicitly rebound with `integrity acknowledge-
 
 私聊命令卡的准入证明来自原请求的 task-local context，并复制到 pending state；回调只能由同一聊天和同一用户消费。不得信任 action.value 的 chat_type，不得把「不是 group」当成私聊证据。表单/运维按钮只有真实平台缓存 raw_type=p2p 才进入原生私聊准入，sidecar 继续验证 token/权限。未知聊天沿用保守路径；群聊规则不放宽。
 
-#384 的目录分离尚未受完整维护支持：`gateway_drain_home_verified()` 与 `resolve_hermes_command_binding()` 当前共同要求源码父目录为进程 HOME。不能只把健康检查改成 true，或从全局环境猜 HOME，导致更新写错 drain marker。后续支持必须让安装证明、Gateway 心跳与维护子进程共享同一个可复核 HOME 绑定。正常卡片投递不等于维护身份通过。
+#384 使用 `instance_binding.py` 统一显式 source/HOME 绑定。setup 将 `--hermes-home` 保存为专用 HFC env 值；runner、PM 探测、认证 runtime target 和维护任务使用同一 HOME。默认 source-parent 身份保持 v1，分离 HOME 用 v2 哈希；禁止只放宽 drain 布尔值却继续比较 source-only 身份。split 只接受 Hermes 进程级 HOME API，不接受 task-local fallback。
+
+维护任务保存 HOME，重读配置发现漂移时在任何 Gateway 命令前拒绝；排空、停止、重启、失败清理均使用所保存的绑定。旧任务无字段时保留原语义。分离 HOME 与 `service.shared_source=true` 的卡片升级保持拒绝：此项目没有跨实例排空权，共享源码的所有 sidecar（包括默认 HOME）均须声明共享。不要把支持 readiness 写成自动协调所有实例。身份原因保留在 integrity 脱敏白名单；现存 fence 不自动清除。

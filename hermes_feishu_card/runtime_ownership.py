@@ -10,9 +10,14 @@ from typing import Any
 from .process_identity import LocalProcessMonitor
 
 
-def runtime_target_identity(root: str | Path) -> str:
-    canonical = os.path.normcase(str(Path(root).expanduser().resolve()))
-    return hashlib.sha256(b'hfc-runtime-target-v1\0' + os.fsencode(canonical)).hexdigest()
+def runtime_target_identity(root: str | Path, *, home: str | Path | None = None) -> str:
+    source = Path(root).expanduser().resolve()
+    canonical = os.path.normcase(str(source))
+    if home is None or Path(home).expanduser().resolve() == source.parent:
+        return hashlib.sha256(b'hfc-runtime-target-v1\0' + os.fsencode(canonical)).hexdigest()
+    selected_home = os.path.normcase(str(Path(home).expanduser().resolve()))
+    return hashlib.sha256(b'hfc-runtime-target-v2\0' + os.fsencode(canonical)
+                          + b'\0' + os.fsencode(selected_home)).hexdigest()
 
 
 @dataclass

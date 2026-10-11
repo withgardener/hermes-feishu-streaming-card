@@ -1026,3 +1026,26 @@ def test_stop_failure_recovery_does_not_start_unverified_runtime(maintenance_fix
     assert ("gateway-restart" in base.mutations) is (failure == "restart_failed")
     assert "hfc-restore" not in base.mutations
     assert "hermes-update" not in base.mutations
+
+
+@pytest.mark.parametrize('case,expected',[
+    ('split','split_home_requires_manual_update'),
+    ('changed','hermes_home_binding_changed'),
+    ('shared','shared_source_requires_manual_update'),
+    ('legacy_changed','hermes_home_binding_changed'),
+    ('legacy_shared','shared_source_requires_manual_update'),
+])
+def test_home_binding_refusal_runs_no_gateway_or_source_commands(maintenance_fixture, case, expected):
+    fixture=maintenance_fixture
+    payload=json.loads(fixture.job.path.read_text())
+    home=fixture.root.parent
+    if not case.startswith('legacy_'):
+        payload['hermes_home']=str(home/'profile-a' if case=='split' else home)
+    fixture.job.path.write_text(json.dumps(payload))
+    if case in {'changed', 'legacy_changed'}:
+        other=home/'other'; other.mkdir(); (other/'config.yaml').write_text('{}')
+        fixture.config.write_text('service:\n  hermes_home: '+str(other)+'\n')
+    elif case in {'shared', 'legacy_shared'}:
+        fixture.config.write_text('service:\n  shared_source: true\n')
+    result=run_job(fixture.job.path,run=lambda *a,**k:pytest.fail('refused binding must not invoke any command'))
+    assert result.phase=='failed' and result.result['error_code']==expected

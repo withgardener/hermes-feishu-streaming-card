@@ -495,3 +495,14 @@ def test_default_maintenance_paths_secure_shared_state_root(
     assert shared_state.is_dir()
     if os.name != "nt":
         assert stat.S_IMODE(shared_state.stat().st_mode) == 0o700
+
+
+def test_job_keeps_home_binding_across_reload_and_transition(tmp_path, verified_artifact):
+    home=tmp_path/'profile-a'
+    job=_create_job(tmp_path,verified_artifact,hermes_home=home)
+    assert load_job(job.path).hermes_home==home
+    moved=transition_job(job.path,expected_phase='locking',phase='draining',now=lambda:101.0)
+    assert moved.hermes_home==home and load_job(job.path).hermes_home==home
+    payload=json.loads(job.path.read_text()); payload['hermes_home']='relative'
+    job.path.write_text(json.dumps(payload))
+    with pytest.raises(MaintenanceRefused):load_job(job.path)

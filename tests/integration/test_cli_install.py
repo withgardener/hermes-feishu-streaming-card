@@ -49,6 +49,14 @@ def copy_hermes(tmp_path):
     return hermes_dir
 
 
+def test_install_explicit_legacy_home_before_hermes_config_exists(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+    result = run_cli('install', '--hermes-dir', str(hermes_dir),
+                     '--hermes-home', str(tmp_path), '--yes')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (hermes_dir / MANIFEST_NAME).is_file()
+
+
 def test_runtime_feishu_sdk_probe_allows_windows_cold_start(monkeypatch):
     observed = {}
 
@@ -4824,3 +4832,28 @@ def test_restore_uninstalled_fixture_is_idempotent(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "restore ok" in result.stdout.lower()
     assert run_py(hermes_dir).read_text(encoding="utf-8") == original
+
+
+def test_setup_explicit_home_is_saved_for_restart_and_runtime_selection(tmp_path, monkeypatch, capsys):
+    hermes_dir=copy_hermes(tmp_path)
+    home=tmp_path/'profile a'; home.mkdir(); (home/'config.yaml').write_text('{}')
+    config_path=tmp_path/'sidecar/config.yaml'; env_path=tmp_path/'selected.env'
+    monkeypatch.setenv('FEISHU_APP_ID','fixture-app')
+    monkeypatch.setenv('FEISHU_APP_SECRET','fixture-secret')
+    selected=[]
+    def select_runtime(root,**kwargs):
+        selected.append(kwargs['hermes_home'])
+        return hermes_dir/'.venv/bin/python','python-sha256:'+'1'*64
+    monkeypatch.setattr(cli,'_resolve_start_runtime_identity',select_runtime)
+    monkeypatch.setattr(cli,'_provision_setup_maintenance',lambda *a:pytest.fail('split source must not provision updater'))
+    code=cli.main(['setup','--hermes-dir',str(hermes_dir),'--hermes-home',str(home),
+        '--config',str(config_path),'--env-file',str(env_path),'--skip-start','--yes'])
+    assert code==0,capsys.readouterr().err
+    assert selected==[home]
+    assert cli.load_config(config_path,env_file=env_path)['service']['hermes_home']==str(home)
+    assert 'HERMES_FEISHU_CARD_HERMES_HOME=' in env_path.read_text()
+    before=env_path.read_bytes()
+    other=tmp_path/'other'; other.mkdir(); (other/'config.yaml').write_text('{}')
+    code=cli.main(['setup','--hermes-dir',str(hermes_dir),'--hermes-home',str(other),
+        '--config',str(config_path),'--env-file',str(env_path),'--skip-start','--yes'])
+    assert code==1 and env_path.read_bytes()==before

@@ -1,4 +1,4 @@
-# Hermes Feishu Streaming Card V4.7.5 sidecar configuration
+# Hermes Feishu Streaming Card V4.7.6 sidecar configuration
 # Copy to a local path and fill credentials from your environment or secret store.
 # Default config path: ~/.hermes_feishu_card/config.yaml
 
@@ -20,6 +20,12 @@ integrity:
 # otherwise detached. It never enters system systemd or invokes sudo.
 service:
   manager: auto
+  # Optional exact Gateway process HOME (not an HFC chat-routing profile).
+  # setup --hermes-home persists this via HERMES_FEISHU_CARD_HERMES_HOME.
+  # hermes_home: /absolute/path/to/hermes-data
+  # Set true on ALL sidecars sharing source code, including the default HOME.
+  # Shared source updates require coordinated terminal maintenance.
+  # shared_source: true
   # Optional stable HFC venv, outside Hermes PM environments. Must contain the
   # same HFC release as an ordinary install. Hooks still use Hermes Python.
   # python_executable: /absolute/path/to/hfc-venv/bin/python

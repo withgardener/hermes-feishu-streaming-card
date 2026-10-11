@@ -110,6 +110,9 @@ def test_emitter_reports_role_transition_and_authenticated_goodbye(monkeypatch, 
         package_version='test',runtime_snapshot_provider=lambda:values[0],poster=post,secret_reader=lambda:b'x'*32)
     assert e.emit_once('runtime.hello')
     assert rows[-1]['runtime_role']=='observer' and rows[-1]['active_work_count_complete']
+    (tmp_path/'gateway').mkdir()
+    (tmp_path/'gateway/run.py').touch()
+    monkeypatch.setitem(sys.modules, 'hermes_constants', SimpleNamespace(get_process_hermes_home=lambda: tmp_path.parent))
     monkeypatch.setitem(sys.modules,'gateway.run',SimpleNamespace(__file__=str(tmp_path/'gateway/run.py')))
     values[0]=(0,True,False,True,True,True)
     assert e.emit_once('runtime.heartbeat')

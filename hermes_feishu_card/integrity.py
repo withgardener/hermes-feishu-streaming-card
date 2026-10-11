@@ -31,6 +31,9 @@ _OPERATOR_INTEGRITY_REASONS = frozenset(
     {
         "integrity_disabled",
         "runtime_ready",
+        "runtime_owner_unverified",
+        "runtime_owner_conflict",
+        "runtime_owner_capacity_exceeded",
         "control_auth_unavailable",
         "gateway_restart_required",
         "manual_review_required",

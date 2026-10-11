@@ -697,9 +697,10 @@ class RuntimeControlEmitter:
                     role = "observer" if not gateway_present and own_complete else "unknown"
                     target = ""
                     if gateway_present and drain_home_verified:
-                        source = getattr(sys.modules.get("gateway.run"), "__file__", None)
-                        if source:
-                            target = runtime_target_identity(Path(source).resolve().parent.parent)
+                        from .instance_binding import gateway_process_binding
+                        binding = gateway_process_binding()
+                        if binding is not None:
+                            target = runtime_target_identity(binding[0], home=binding[1])
                             role = "gateway"
                     if role != "gateway":
                         drain_home_verified = False

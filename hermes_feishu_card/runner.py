@@ -12,6 +12,7 @@ from aiohttp import web
 from . import __version__
 from .bots import BotRegistry, FeishuClientFactory, RoutingContext
 from .bots import resolve_card_config as _resolve_card_config
+from .instance_binding import configured_hermes_home
 from .config import load_config, resolve_operations_hermes_root
 from .delivery_policy import ReloadingDeliveryPolicyProvider
 from .event_auth import is_loopback_host
@@ -300,6 +301,10 @@ def main(argv: list[str] | None = None) -> int:
             "config or env source."
         )
         boundary = FeishuBoundary(client=NoopFeishuClient(), router=None)
+    hermes_root = resolve_operations_hermes_root(
+        args.hermes_dir, config_path=args.config, env_file=args.env_file,
+    )
+    hermes_home = configured_hermes_home(hermes_root, config)
     web.run_app(
         create_app(
             boundary.client,
@@ -312,11 +317,9 @@ def main(argv: list[str] | None = None) -> int:
             noop_mode=noop_mode,
             operations_config_path=args.config,
             operations_env_file=args.env_file,
-            operations_hermes_root=resolve_operations_hermes_root(
-                args.hermes_dir,
-                config_path=args.config,
-                env_file=args.env_file,
-            ),
+            operations_hermes_root=hermes_root,
+            operations_shared_source=(config.get("service") or {}).get("shared_source", False),
+            **({"operations_hermes_home": hermes_home} if (config.get("service") or {}).get("hermes_home") is not None else {}),
             operations_transport_root_secret=operations_transport_root_secret,
             event_auth_required=event_auth_required,
             integrity_mode=str(

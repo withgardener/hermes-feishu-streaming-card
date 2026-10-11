@@ -577,21 +577,21 @@ High-frequency streaming knobs usually do not need manual tuning:
 
 ## Docker Containers
 
-Examples pin `v4.7.5`; the default `latest` resolves the published stable release. See [release notes](release-notes-v4.7.1.en.md) for validation boundaries.
+Examples pin `v4.7.6`; the default `latest` resolves the published stable release. See [release notes](release-notes-v4.7.1.en.md) for validation boundaries.
 
 Use `install-docker.sh` inside an existing Hermes container. It defaults to
 `/opt/hermes` for Hermes and `/opt/data/config.yaml` for sidecar config. The
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.7.5`.
+The Compose example defaults `HFC_VERSION` to `v4.7.6`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.7.5
+export HFC_VERSION=v4.7.6
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -1052,4 +1052,20 @@ Hermes PM dependencies usually live outside the checkout. Use the environment se
 
 ### Separate program directory and HERMES_HOME
 
-Full Gateway maintenance ownership currently requires the source directory's parent to equal the process HOME (for example `~/.hermes/hermes-agent` and `~/.hermes`). System source installations such as `/usr/local/lib/hermes-agent` with `HERMES_HOME=/root/.hermes` may deliver cards while readiness remains `runtime_owner_unverified`. This is a maintenance-binding limitation (#384), not a Feishu credential failure. Use terminal maintenance through the existing service owner; do not clear integrity fences or hand-edit hooks to make health green. Complete split-layout support is not implemented yet.
+Separate source and process HOME layouts use an explicit binding. Pass `--hermes-home /root/.hermes` to the existing installer/setup entry point, or set HFC configuration:
+
+```yaml
+service:
+  hermes_home: /root/.hermes
+  shared_source: true  # ALL sidecars sharing the checkout, including the default HOME
+```
+
+Independent Gateways need separate HFC configs, explicit env files, private state directories and listener ports; do not accidentally share the adjacent `.env`.
+
+The HOME must be absolute and contain Hermes `config.yaml`. It is a process data directory, not an HFC routing `profile_id`. Setup persists `HERMES_FEISHU_CARD_HERMES_HOME` in its selected HFC `.env`. The existing YAML < adjacent `.env` < explicit env file < process environment precedence applies; ordinary ambient `HERMES_HOME` is never guessed as the sidecar binding. Conflicting setup and existing bindings are rejected. Restart the sidecar after either setting changes, and restart Gateway after updating HFC.
+
+Authenticated heartbeats bind both source and process HOME. Another HOME/profile, legacy source-only identity and replay cannot take ownership of a split target. Paths stay out of health responses. Split layouts require Hermes' process-scoped `get_process_hermes_home()` API; a task-local fallback is insufficient. Unconfigured installations retain the source-parent default. Doctor distinguishes configuration from live proof; verify `ready`, `generation_match=true` and `drain_home_verified=true` after restarting.
+
+Card-driven `/update` refuses split HOME or explicitly shared-source instances before confirmation. Coordinate terminal maintenance through the original service owners, draining every Gateway using shared code first. Declare `shared_source: true` on the default instance too. HFC does not orchestrate cross-instance source upgrades. Delivery and readiness remain supported. Do not clear unrelated integrity fences or edit hooks manually. Sanitized `integrity.last_reason` now retains owner failures. Old maintenance jobs keep their original default HOME; new jobs persist HOME and are rejected by older readers, so finish maintenance before downgrading.
+
+For a separate env file, also pass `doctor --env-file /original/HFC.env` (or set `HFC_ENV_FILE`). `--hermes-home` can select a read-only diagnosis, but refuses conflicts with the saved binding and does not rewrite configuration.

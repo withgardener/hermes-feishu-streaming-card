@@ -258,3 +258,52 @@ async def test_signed_observer_preserves_gateway_owner_and_restart_fence(tmp_pat
         final = (await (await client.get('/health')).json())['readiness']
         assert final['runtime_id_hash'] == before['runtime_id_hash']
         assert final['observer_count'] == 1
+
+
+async def test_shared_source_separate_homes_require_exact_authenticated_owner(tmp_path):
+    from hermes_feishu_card.runtime_ownership import runtime_target_identity
+    root=tmp_path/'source'; root.mkdir()
+    homes=[tmp_path/'profile-a',tmp_path/'profile-b']
+    for home in homes:
+        home.mkdir(); (home/'config.yaml').write_text('{}')
+    # Reusing a secret deliberately: routing alone must not confer HOME ownership.
+    for own_home in homes:
+        for restart in range(2):
+            app=create_app(NeverCalledFeishuClient(),operations_hermes_root=root,
+                operations_hermes_home=own_home,operations_transport_root_secret=ROOT_SECRET,
+                expected_runtime_package_version='4.1.0')
+            client=TestClient(TestServer(app)); await client.start_server()
+            try:
+                other=next(h for h in homes if h!=own_home)
+                for bad_target in [runtime_target_identity(root,home=other),runtime_target_identity(root)]:
+                    body,headers=_signed_body(_payload(target_identity=bad_target))
+                    result=await (await client.post('/runtime/events',data=body,headers=headers)).json()
+                    assert result=={'ok':True,'accepted':False}
+                    health=await (await client.get('/health')).json()
+                    assert health['readiness']['status']!='ready'
+                body,headers=_signed_body(_payload(target_identity=runtime_target_identity(root,home=own_home)))
+                result=await (await client.post('/runtime/events',data=body,headers=headers)).json()
+                assert result['accepted']
+                health=await (await client.get('/health')).json()
+                assert health['readiness']['status']=='ready'
+                assert health['readiness']['drain_home_verified'] is True
+                assert str(own_home) not in json.dumps(health)
+                replay=await client.post('/runtime/events',data=body,headers=headers)
+                assert replay.status==401
+            finally:
+                await client.close()
+
+
+async def test_owner_diagnostic_is_preserved_in_health_integrity():
+    app=create_app(NeverCalledFeishuClient(),operations_transport_root_secret=ROOT_SECRET)
+    client=TestClient(TestServer(app)); await client.start_server()
+    try:
+        body,headers=_signed_body(_payload(runtime_role='unknown',target_identity='',drain_home_verified=False))
+        response=await client.post('/runtime/events',data=body,headers=headers)
+        assert (await response.json())['accepted']
+        app[sidecar_server.RUNTIME_INTEGRITY_COORDINATOR_KEY].check_once()
+        health=await (await client.get('/health')).json()
+        assert health['readiness']['reason']=='runtime_owner_unverified'
+        assert health['integrity']['last_reason']=='runtime_owner_unverified'
+    finally:
+        await client.close()

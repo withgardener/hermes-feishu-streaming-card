@@ -588,7 +588,7 @@ def test_doctor_uses_v3_inspector_without_legacy_recovery_diagnostics(
     assert binding_calls == [
         {
             "checkout_root": detection.root,
-            "hermes_home": str(binding.hermes_home),
+            "hermes_home": binding.hermes_home,
             "profile_id": None,
         }
     ]

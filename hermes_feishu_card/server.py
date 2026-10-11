@@ -231,6 +231,8 @@ BASE_CARD_CONFIG_KEY = web.AppKey("base_card_config", dict)
 OPERATIONS_STORE_KEY = web.AppKey("operations_store", OperationStore)
 OPERATIONS_CONFIG_PATH_KEY = web.AppKey("operations_config_path", Path)
 OPERATIONS_ENV_FILE_KEY = web.AppKey("operations_env_file", Any)
+OPERATIONS_SHARED_SOURCE_KEY = web.AppKey("operations_shared_source", bool)
+OPERATIONS_HERMES_HOME_KEY = web.AppKey("operations_hermes_home", Path)
 OPERATIONS_HERMES_ROOT_KEY = web.AppKey("operations_hermes_root", Path)
 OPERATIONS_DELIVERIES_KEY = web.AppKey("operations_deliveries", dict)
 OPERATIONS_COMMAND_AUTH_KEY = web.AppKey(
@@ -514,6 +516,8 @@ def create_app(
     operations_config_path: str | Path | None = None,
     operations_env_file: str | Path | None = None,
     operations_hermes_root: str | Path | None = None,
+    operations_hermes_home: str | Path | None = None,
+    operations_shared_source: bool = False,
     operations_transport_root_secret: bytes | None = None,
     event_auth_required: bool = False,
     noop_mode: bool = False,
@@ -525,6 +529,13 @@ def create_app(
     shutdown_callback: Callable[[], None] | None = None,
     session_store_directory: str | Path | None = None,
 ) -> web.Application:
+    if operations_hermes_home is not None:
+        from .instance_binding import configured_hermes_home
+        if operations_hermes_root is None:
+            raise ValueError("Hermes HOME binding requires an explicit source root")
+        operations_hermes_home = configured_hermes_home(
+            Path(operations_hermes_root), {"service": {"hermes_home": str(operations_hermes_home)}},
+        )
     valid_transport_root = (
         isinstance(operations_transport_root_secret, bytes)
         and len(operations_transport_root_secret) == 32
@@ -567,7 +578,7 @@ def create_app(
         expected_hook_generation=RUNTIME_HOOK_GENERATION,
         expected_package_version=expected_runtime_package_version,
         state_directory=runtime_integrity_state_directory,
-        expected_target_identity=(runtime_target_identity(operations_hermes_root) if operations_hermes_root is not None else None),
+        expected_target_identity=(runtime_target_identity(operations_hermes_root, home=operations_hermes_home) if operations_hermes_root is not None else None),
     )
     app[RUNTIME_INTEGRITY_SUPERVISOR_KEY] = runtime_supervisor
     if valid_transport_root:
@@ -643,6 +654,13 @@ def create_app(
     )
     app[OPERATIONS_HERMES_ROOT_KEY] = resolve_operations_hermes_root(
         operations_hermes_root, config_path=operations_config
+    )
+    if type(operations_shared_source) is not bool:
+        raise ValueError("shared-source binding must be boolean")
+    app[OPERATIONS_SHARED_SOURCE_KEY] = operations_shared_source
+    app[OPERATIONS_HERMES_HOME_KEY] = (
+        Path(operations_hermes_home).resolve() if operations_hermes_home is not None
+        else app[OPERATIONS_HERMES_ROOT_KEY].resolve().parent
     )
     app[RUNTIME_INTEGRITY_COORDINATOR_KEY] = RuntimeIntegrityCoordinator(
         mode=integrity_mode,
@@ -1864,6 +1882,7 @@ def _reserve_update_job_for_operation(
     job = create_job(
         paths,
         hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+        hermes_home=app[OPERATIONS_HERMES_HOME_KEY],
         config_path=app[OPERATIONS_CONFIG_PATH_KEY],
         env_file=app[OPERATIONS_ENV_FILE_KEY],
         profile_id=operation.profile_id,
@@ -1893,6 +1912,7 @@ def _reserve_update_job_for_operation(
         reserve_drain_lease(paths, owner_id=owner_id)
         if not set_gateway_external_drain(
             app[OPERATIONS_HERMES_ROOT_KEY],
+            hermes_home=app[OPERATIONS_HERMES_HOME_KEY],
             active=True,
             proxy_environment=proxy_environment,
         ):
@@ -1906,6 +1926,7 @@ def _reserve_update_job_for_operation(
         try:
             set_gateway_external_drain(
                 app[OPERATIONS_HERMES_ROOT_KEY],
+                hermes_home=app[OPERATIONS_HERMES_HOME_KEY],
                 active=False,
                 proxy_environment=proxy_environment,
             )
@@ -2258,7 +2279,9 @@ async def _inspect_update_for_app(app: web.Application) -> UpdateInspection:
     inspection = await _run_operations_mutation(
         app,
         inspect_update,
+        shared_source=app[OPERATIONS_SHARED_SOURCE_KEY],
         hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+        hermes_home=app[OPERATIONS_HERMES_HOME_KEY],
         artifact=artifact,
         installed_hfc_version=app[PACKAGE_VERSION_KEY],
         active_sessions=active_sessions,
@@ -2505,6 +2528,7 @@ def _release_update_reservation(
     try:
         set_gateway_external_drain(
             app[OPERATIONS_HERMES_ROOT_KEY],
+            hermes_home=app[OPERATIONS_HERMES_HOME_KEY],
             active=False,
         )
     except Exception:

@@ -109,6 +109,9 @@ _FINDING_COPY = {
     "v3_manifest_invalid": ("V3 安装记录不可用", "请勿使用旧版自动修复；请按官方 V3 流程处理。"),
     "v3_manifest_recovery_required": ("V3 安装事务需要恢复", "请使用官方 V3 恢复流程完成事务。"),
     "v3_patch_invalid": ("V3 补丁归属不一致", "请人工确认后使用官方 V3 恢复或重新安装。"),
+    "hermes_home_binding_changed": ("Hermes HOME 绑定已变化", "请重新诊断并确认目标实例后再维护。"),
+    "shared_source_requires_manual_update": ("共享源码需要统一维护", "请先排空使用该源码的所有实例，再通过原服务管理器升级。"),
+    "split_home_requires_manual_update": ("独立 HOME 需要终端维护", "请通过原服务管理器维护；共享源码升级前应统一排空所有实例。"),
     "v3_runtime_binding_changed": ("V3 运行环境已变化", "请确认 Hermes 环境后重新执行 V3 安装。"),
     "v3_target_changed": ("V3 受管文件已变化", "请确认本地改动后使用官方 V3 恢复流程。"),
 }

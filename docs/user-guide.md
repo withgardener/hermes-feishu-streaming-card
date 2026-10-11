@@ -607,7 +607,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 
 ## Docker 容器内安装 / 更新
 
-以下示例固定 `v4.7.5`；默认 `latest` 解析已发布稳定版。本版的桌面验收范围及未验证项见[发行说明](release-notes-v4.7.1.md)。
+以下示例固定 `v4.7.6`；默认 `latest` 解析已发布稳定版。本版的桌面验收范围及未验证项见[发行说明](release-notes-v4.7.1.md)。
 
 如果 Hermes 运行在已有 Docker 容器里，优先使用 `install-docker.sh`。它默认读取：
 
@@ -616,7 +616,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.7.5`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.7.6`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -624,7 +624,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.7.5
+export HFC_VERSION=v4.7.6
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -1129,4 +1129,20 @@ Hermes 的 PM 托管依赖通常在 checkout 外。应以 `committed_venv()` 选
 
 ### 程序目录与 HERMES_HOME 分离
 
-目前完整的 Gateway 维护身份验证要求源码父目录与进程 HOME 一致（例如 `~/.hermes/hermes-agent` 与 `~/.hermes`）。源码位于 `/usr/local/lib/hermes-agent`、`HERMES_HOME=/root/.hermes` 等分离布局可能正常发送卡片，但 readiness 仍显示 `runtime_owner_unverified`。这是现有维护绑定的限制（#384），不是飞书凭据错误。请通过原服务管理器在终端维护，不要清除完整性围栏或手改 hook 来让健康状态变绿。完整分离布局支持尚未实现。
+分离布局可通过显式绑定验证 Gateway 身份，例如源码 `/usr/local/lib/hermes-agent` 与进程 HOME `/root/.hermes`。在原安装入口传入 `--hermes-home /root/.hermes`；`setup` 会把 `HERMES_FEISHU_CARD_HERMES_HOME` 写入选定的 HFC `.env`，重启后仍使用该绑定。也可在 HFC 配置中设置：
+
+```yaml
+service:
+  hermes_home: /root/.hermes
+  shared_source: true  # 多个 Gateway 共用源码时，每个 sidecar 都设置，包括默认 HOME
+```
+
+多个独立 Gateway 应各用自己的 HFC 配置、显式 env file、私有 state 目录和监听端口，避免共用配置父目录下的同一 `.env`。
+
+`hermes_home` 是进程数据目录，须为包含 Hermes `config.yaml` 的绝对路径；不是 HFC 的聊天路由 `profile_id`。专用 `.env` 值按既有优先级覆盖 YAML，进程中的专用 HFC 环境变量优先级最高；普通 `HERMES_HOME` 不会被侧车猜作安装绑定。`--hermes-home` 与现有绑定冲突时 setup 拒绝，须先核对并修改所选配置。两项设置均需重启 sidecar；更新 HFC 后也需按原服务管理方式重启 Gateway。
+
+认证心跳校验源码与进程 HOME 的共同身份，不匹配的 HOME、共享源码下的另一个 profile、重复心跳均不能接管；健康响应只暴露摘要。Hermes 必须提供进程级 `get_process_hermes_home()`；旧的 task-local HOME API 不足以证明分离布局，保持拒绝。未配置 HOME 时沿用源码父目录，普通布局无需迁移。doctor 会区分已配置绑定和实际运行证明；最终仍需看到 `readiness=ready`、`generation_match=true`、`drain_home_verified=true`。
+
+分离 HOME 或声明 `shared_source: true` 的实例，卡片 `/update` 在确认前拒绝，并引导终端维护。HFC 不负责跨实例排空：共享源码升级前先停止接纳并排空所有使用者，再通过原服务管理器维护。默认 HOME 的 sidecar 也必须声明共享源码，不能只设置独立 profile。此限制不影响正常发卡和 readiness。不要清除其他完整性围栏或手改 hook；`integrity.last_reason` 现在保留脱敏的 owner 原因，便于与 readiness 对照。旧维护任务缺少 HOME 字段时保持原目录语义；新任务携带 HOME，旧版读取时会拒绝，降级前应结束维护任务。
+
+使用独立 env file 时，诊断也传入 `doctor --env-file /原/HFC.env`（或设置 `HFC_ENV_FILE`）；`--hermes-home` 可用于只读诊断，但与已保存绑定冲突时拒绝，不写回配置。

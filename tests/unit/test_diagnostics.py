@@ -809,3 +809,14 @@ def test_build_report_finds_missing_credentials_for_legacy_single_profile(tmp_pa
     )
 
     assert "profile_credentials_missing" in {finding.code for finding in report.findings}
+
+
+def test_diagnosis_explains_explicit_split_home_without_claiming_runtime_proof(tmp_path):
+    home=tmp_path/'profile-a'; home.mkdir(); (home/'config.yaml').write_text('{}')
+    report=build_diagnostic_report(tmp_path/'hfc.yaml',{'service':{'hermes_home':str(home)}},
+        _detection(tmp_path),_recovery_plan(tmp_path))
+    payload=report.to_dict()
+    assert payload['runtime']['maintenance_binding']=={'selection':'explicit','split_home':True,
+        'runtime_verified':False,'card_update':'terminal_only'}
+    assert any(f.code=='split_home_requires_manual_update' for f in report.findings)
+    assert str(home) not in json.dumps(payload)
