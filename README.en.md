@@ -21,7 +21,7 @@ Use it when connecting [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 [Install](#quick-install) · [Configure](#configuration) · [Recent releases](#recent-releases) · [User guide](docs/user-guide.en.md) · [Contributors](#contributors)
 
-**Release version: [v4.7.4](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.4).** Independent sidecar runtime, separate Gateway/Desktop ownership and verified process-exit cleanup. See [release notes](docs/release-notes-v4.7.4.en.md).
+**Release version: [v4.7.5](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.5).** Fix committed PM runtime selection and DM command buttons rejected by group policy. See [release notes](docs/release-notes-v4.7.5.en.md).
 
 ## Why HFC
 
@@ -86,7 +86,7 @@ Start or restart Hermes Gateway as directed by setup, then message the bot and c
 - **Docker:** inside an existing Hermes container, run the repository's installer:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.4
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.5
 bash install-docker.sh
 ```
 
@@ -209,6 +209,7 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 
 | Version | Highlights |
 |---|---|
+| [v4.7.5](docs/release-notes-v4.7.5.en.md) | PM runtime binding, DM card admission and layout limitations |
 | [v4.7.4](docs/release-notes-v4.7.4.en.md) | Independent sidecar runtime, heartbeat ownership and exit cleanup |
 | [v4.7.3](docs/release-notes-v4.7.3.en.md) | Bounded heartbeat scans, responsive health snapshots and recovery guidance |
 | [v4.7.2](docs/release-notes-v4.7.2.en.md) | Update shutdown protection, SDK callbacks, integrity recovery and configuration map |
@@ -218,11 +219,12 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 | [v4.6.12](docs/release-notes-v4.6.12.en.md) | Optional card width and Hermes reply-clock compatibility |
 | [v4.6.11](docs/release-notes-v4.6.11.en.md) | Bounded live thinking, observed background-task context and CodeQL update |
 | [v4.6.10](docs/release-notes-v4.6.10.en.md) | Hermes 0.21.5 compatibility, PM runtime installation and independent follow-up cards |
-| [v4.6.9](docs/release-notes-v4.6.9.en.md) | Independent concurrent group cards, compact single-select choices and clearer onboarding |
 
 See [release history](docs/release-history.en.md) for earlier versions, and [CHANGELOG](CHANGELOG.md) or [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases) for the full record.
 
 ## Contributors
+
+- [yulong-ge](https://github.com/yulong-ge) supplied PM-managed runtime installation reproduction and diagnostics in [#382](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/382).
 
 - V4.7.3: [lanx214](https://github.com/lanx214) (#378), performance evidence; [ywarmy](https://github.com/ywarmy) (#372), field verification and recovery-documentation feedback.
 - V4.7.2: [Nevoker](https://github.com/Nevoker) ([PR #373](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/373)); [DaveWang888](https://github.com/DaveWang888) (#375), [ffdxdynotable](https://github.com/ffdxdynotable) (#374), [ywarmy](https://github.com/ywarmy) (#372), [jackwude](https://github.com/jackwude) (#370). Code, failure evidence and configuration-guide proposal; original commit authorship is preserved.

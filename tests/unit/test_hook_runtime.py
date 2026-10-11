@@ -6655,7 +6655,7 @@ def test_resume_picker_group_rejects_different_operator(monkeypatch):
     assert "resume-1" in adapter._hfc_resume_picker_state
 
 
-def test_resume_picker_private_chat_does_not_compare_operator():
+def test_resume_picker_private_chat_rejects_another_operator():
     class DummyFeishuAdapter:
         def __init__(self):
             self._loop = object()
@@ -6692,9 +6692,8 @@ def test_resume_picker_private_chat_does_not_compare_operator():
         },
     )
 
-    assert prepared is not None
-    assert prepared["choice"] == "session-target"
-    assert adapter._hfc_resume_picker_state == {}
+    assert prepared is None
+    assert "resume-dm" in adapter._hfc_resume_picker_state
 
 
 def test_resume_picker_expired_state_is_consumed_without_execution():

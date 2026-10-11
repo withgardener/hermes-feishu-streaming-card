@@ -577,21 +577,21 @@ High-frequency streaming knobs usually do not need manual tuning:
 
 ## Docker Containers
 
-Examples pin `v4.7.4`; the default `latest` resolves the published stable release. See [release notes](release-notes-v4.7.1.en.md) for validation boundaries.
+Examples pin `v4.7.5`; the default `latest` resolves the published stable release. See [release notes](release-notes-v4.7.1.en.md) for validation boundaries.
 
 Use `install-docker.sh` inside an existing Hermes container. It defaults to
 `/opt/hermes` for Hermes and `/opt/data/config.yaml` for sidecar config. The
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.7.4`.
+The Compose example defaults `HFC_VERSION` to `v4.7.5`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.7.4
+export HFC_VERSION=v4.7.5
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -1043,3 +1043,13 @@ Managed launches pass only `--token-file`; the private state directory contains 
 ## Task layout and offline preview (development branch)
 
 The unreleased `reading_preset: task` and `card-config --preview-dir` provide clearer state/typography and safe configuration previews. See [task cards](task-cards.md#english-quick-reference) for scope, rollback and real-client acceptance boundaries.
+
+### PM environments and missing installation sources
+
+Hermes PM dependencies usually live outside the checkout. Use the environment selected by `committed_venv()`, rather than assuming an existing checkout `.venv` is active. If selection fails or the committed generation is missing, restore Hermes dependencies before retrying; a stale `.venv` is not a recovery path.
+
+`Hermes runtime Python cannot import ... and no install spec is available` means the runtime lacks a usable HFC package and the CLI has no installation source. This happens before hook installation. Launching an installed CLI through `uv run --frozen` does not install its package into the Gateway environment. Use the official installer linked in README, or explicitly set `HFC_INSTALL_SPEC` to a verified same-version wheel when running setup. HFC does not guess package sources or bypass version verification.
+
+### Separate program directory and HERMES_HOME
+
+Full Gateway maintenance ownership currently requires the source directory's parent to equal the process HOME (for example `~/.hermes/hermes-agent` and `~/.hermes`). System source installations such as `/usr/local/lib/hermes-agent` with `HERMES_HOME=/root/.hermes` may deliver cards while readiness remains `runtime_owner_unverified`. This is a maintenance-binding limitation (#384), not a Feishu credential failure. Use terminal maintenance through the existing service owner; do not clear integrity fences or hand-edit hooks to make health green. Complete split-layout support is not implemented yet.

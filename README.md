@@ -15,7 +15,7 @@
 
 [快速安装](#快速安装) · [配置方法](#配置方法) · [近期更新](#近期更新) · [使用手册](docs/user-guide.md) · [贡献者](#贡献者)
 
-**发行版本：[v4.7.4](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.4)。** 支持独立侧车环境，隔离 Gateway/Desktop 心跳，并核验进程退出后回收残留。见[发行说明](docs/release-notes-v4.7.4.md)。
+**发行版本：[v4.7.5](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.5)。** 修复 PM 托管环境选择与私聊命令按钮被群聊规则误拦截。见[发行说明](docs/release-notes-v4.7.5.md)。
 
 ## 为什么使用 HFC
 
@@ -80,7 +80,7 @@ python3 -m hermes_feishu_card.cli doctor --config ~/.hermes/config.yaml --hermes
 - **Docker：** 在已有 Hermes 容器中，使用仓库内的安装脚本：
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.4
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.5
 bash install-docker.sh
 ```
 
@@ -203,6 +203,7 @@ HFC 采用 **sidecar-only** 架构：Hermes 运行任务，安装器管理必要
 
 | 版本 | 重点 |
 |---|---|
+| [v4.7.5](docs/release-notes-v4.7.5.md) | PM 环境绑定、私聊按钮准入修复及目录布局限制说明 |
 | [v4.7.4](docs/release-notes-v4.7.4.md) | 独立侧车环境、心跳归属隔离与退出残留回收 |
 | [v4.7.3](docs/release-notes-v4.7.3.md) | 缺心跳扫描降频、健康接口响应与恢复说明 |
 | [v4.7.2](docs/release-notes-v4.7.2.md) | 更新停机保护、SDK 按钮回调、完整性恢复与配置地图 |
@@ -212,11 +213,12 @@ HFC 采用 **sidecar-only** 架构：Hermes 运行任务，安装器管理必要
 | [v4.6.12](docs/release-notes-v4.6.12.md) | 可选卡片宽度与 Hermes 回复计时契约适配 |
 | [v4.6.11](docs/release-notes-v4.6.11.md) | 可选思考尾部窗口、后台任务观测信息与 CodeQL 更新 |
 | [v4.6.10](docs/release-notes-v4.6.10.md) | Hermes 0.21.5 适配、PM 运行环境安装与跟进卡片隔离 |
-| [v4.6.9](docs/release-notes-v4.6.9.md) | 群聊并发卡片隔离、紧凑单选按钮与新手 README |
 
 更早版本见[历史更新](docs/release-history.md)；完整记录见 [CHANGELOG](CHANGELOG.md) 与 [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases)。
 
 ## 贡献者
+
+- [yulong-ge](https://github.com/yulong-ge) 在 [#382](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/382) 提供 PM 托管环境安装失败的复现与诊断证据。
 
 - V4.7.3: [lanx214](https://github.com/lanx214)（#378）提供性能故障证据；[ywarmy](https://github.com/ywarmy)（#372）提供现场复测和恢复文档建议。
 - V4.7.2: [Nevoker](https://github.com/Nevoker) ([PR #373](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/373)); [DaveWang888](https://github.com/DaveWang888) (#375), [ffdxdynotable](https://github.com/ffdxdynotable) (#374), [ywarmy](https://github.com/ywarmy) (#372), [jackwude](https://github.com/jackwude) (#370). 分别贡献 Python 3.14 修复、故障证据和配置引导建议；保留原提交作者。

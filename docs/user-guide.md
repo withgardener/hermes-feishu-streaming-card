@@ -607,7 +607,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 
 ## Docker 容器内安装 / 更新
 
-以下示例固定 `v4.7.4`；默认 `latest` 解析已发布稳定版。本版的桌面验收范围及未验证项见[发行说明](release-notes-v4.7.1.md)。
+以下示例固定 `v4.7.5`；默认 `latest` 解析已发布稳定版。本版的桌面验收范围及未验证项见[发行说明](release-notes-v4.7.1.md)。
 
 如果 Hermes 运行在已有 Docker 容器里，优先使用 `install-docker.sh`。它默认读取：
 
@@ -616,7 +616,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.7.4`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.7.5`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -624,7 +624,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.7.4
+export HFC_VERSION=v4.7.5
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -1120,3 +1120,13 @@ macOS 的持久服务提示明确 Linux systemd 限制；缺少可验证 pidfile
 ## 任务布局与离线预览（开发分支）
 
 新增可选 `reading_preset: task`，以及 `card-config --preview-dir`。状态、字号、完整审批范围、配置来源与回退方式见[任务卡片说明](task-cards.md)。当前尚未发布；HTML 使用示例数据模拟排版，不代表真实客户端验收。
+
+### PM 环境与安装来源错误
+
+Hermes 的 PM 托管依赖通常在 checkout 外。应以 `committed_venv()` 选择的环境为准，不能凭 checkout 下存在 `.venv` 就向其中安装。若探测失败或已选择的环境丢失，先恢复 Hermes 的依赖环境；不要用旧 `.venv` 绕过检查。
+
+`Hermes runtime Python cannot import ... and no install spec is available` 表示运行环境缺少可用的 HFC 包，而且当前 CLI 没有可验证的安装来源；它发生在 hook 安装之前。通过 `uv run --frozen` 启动一个已安装的 CLI，并不等于 Gateway 的环境已安装同一包。请使用 README 的官方安装入口，或将 `HFC_INSTALL_SPEC` 显式指向已核验的同版本 wheel 后运行 setup。HFC 不会根据错误信息猜测包来源或跳过版本校验。
+
+### 程序目录与 HERMES_HOME 分离
+
+目前完整的 Gateway 维护身份验证要求源码父目录与进程 HOME 一致（例如 `~/.hermes/hermes-agent` 与 `~/.hermes`）。源码位于 `/usr/local/lib/hermes-agent`、`HERMES_HOME=/root/.hermes` 等分离布局可能正常发送卡片，但 readiness 仍显示 `runtime_owner_unverified`。这是现有维护绑定的限制（#384），不是飞书凭据错误。请通过原服务管理器在终端维护，不要清除完整性围栏或手改 hook 来让健康状态变绿。完整分离布局支持尚未实现。

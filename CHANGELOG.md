@@ -1,5 +1,9 @@
 # Changelog
 
+## v4.7.5 — 2026-10-11
+
+Resolve the committed Hermes PM environment consistently in CLI and plugin binding (#382). Preserve the admitted DM actor/chat for command-card callbacks instead of applying the group-only gate (#374). Document the remaining separated source/HERMES_HOME maintenance restriction (#384). See [release notes](docs/release-notes-v4.7.5.md).
+
 ## v4.7.4 — 2026-10-09
 
 Keep the sidecar independent of replaceable Hermes environments; bind readiness and maintenance proofs to the Gateway owner; retain Desktop activity without overwriting Gateway identity. Notify before Gateway hard exit and reclaim authenticated local observations only after verified process exit. See [release notes](docs/release-notes-v4.7.4.md) (PR #381).

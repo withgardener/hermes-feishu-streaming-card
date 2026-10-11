@@ -139,6 +139,7 @@
 - Hermes 升级可能替换 `gateway/run.py` 而保留 HFC backup/manifest；CLI `status` / `start` 必须只读识别 verified `stale_unpatched`，仅对可执行的 `accept_hermes_upgrade` plan 给出显式恢复命令。用户改动、损坏或证据不足必须 fail-closed，不得自动重写 Hermes 或自动重启 Gateway。
 - runner 必须真正读取 `setup` / `start` 显式传入的 `--env-file`。配置优先级保持 YAML < 同目录 `.env` < 显式 env file < process env；禁止为了修复 systemd 环境而隐式读取全局 `~/.hermes/.env`。
 - 升级迁移只能停止 PID/token/health 三者一致的旧进程，未知进程保持 fail-closed。
+- CLI 与插件 binding 共用 `install/runtime_python.py` 的隔离 PM 探测。存在 committed venv 时优先选择它并保留 venv launcher 路径；探测失败、相对路径或已删除的 generation 必须拒绝，不能落回旧 `.venv`。只有没有 PM 模块或 PM 明确返回无选择时保留 legacy 行为；插件仍验证 prefix/site-packages/可执行目标，显式 Hermes home 传给 PM 探测。
 - Hermes PM 重建会删除旧环境；独立 sidecar 不能假定长驻解释器路径永远存在。可用 `service.python_executable` 绑定独立 HFC venv；setup/start/enable 均遵守此选择，先验证 Hermes hook，再验证侧车的版本与普通 site-packages 来源。配置缺省保持原行为；指定环境失效必须拒绝启动，不静默切回 PM。
 - 旧侧车仍响应 health 不代表运行文件可用。升级后的恢复顺序是检查当前 PM 与进程来源，备份并停止侧车，通过官方 install 修复已验证的升级状态；仅 installed 且侧车停止时 acknowledge-review，再启动侧车与 Gateway。不得清除未知围栏或手工改 hook。
 - `auto` 不得探测 system bus、调用 sudo/pkexec、写 `/etc` 或静默 fallback 到 system manager；`systemd-system` 只能显式使用 transient unit。
@@ -312,3 +313,9 @@ Orphaned integrity fences can be explicitly rebound with `integrity acknowledge-
 完整性监视仍每轮等待 15 秒。只有完整检测得到 `installed` 且 readiness 仅为心跳等待、缺失或过期时，才延后下一次完整源码检测至本轮结束后 300 秒；期间仍检查最新 readiness，不将缺心跳改成 ready。源码变化最多延迟到下一次完整检查（另加检测时间）；离开这三种心跳状态或重启 sidecar 会清除该观察结果。检查失败及可执行修复计划不缓存，任何修复仍使用本轮新证据和原执行器校验。
 
 `/health` 和状态查询读取最后一次已完成检查的原子快照，不等待后台检测/修复锁。快照中的诊断和计数可能落后于正在运行的检查，不能作为新的安装证明或修复授权。单次源码扫描的 CPU 成本未改变；此处减少重复扫描并解除健康接口的锁等待。
+
+## V4.7.5 私聊按钮与目录边界
+
+私聊命令卡的准入证明来自原请求的 task-local context，并复制到 pending state；回调只能由同一聊天和同一用户消费。不得信任 action.value 的 chat_type，不得把「不是 group」当成私聊证据。表单/运维按钮只有真实平台缓存 raw_type=p2p 才进入原生私聊准入，sidecar 继续验证 token/权限。未知聊天沿用保守路径；群聊规则不放宽。
+
+#384 的目录分离尚未受完整维护支持：`gateway_drain_home_verified()` 与 `resolve_hermes_command_binding()` 当前共同要求源码父目录为进程 HOME。不能只把健康检查改成 true，或从全局环境猜 HOME，导致更新写错 drain marker。后续支持必须让安装证明、Gateway 心跳与维护子进程共享同一个可复核 HOME 绑定。正常卡片投递不等于维护身份通过。

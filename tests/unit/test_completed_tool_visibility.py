@@ -1,4 +1,8 @@
+from types import SimpleNamespace
+
 import pytest
+
+from hermes_feishu_card import render
 
 from hermes_feishu_card.config import DEFAULT_CONFIG
 from hermes_feishu_card.events import SidecarEvent
@@ -52,8 +56,11 @@ def test_terminal_tool_visibility_changes_only_content_tool_rows(status, reasoni
     assert 'fixture-tool' in session.tools
 
 
-def test_switch_preserves_live_progress_and_default():
+def test_switch_preserves_live_progress_and_default(monkeypatch):
+    # Compare the setting at one instant, not two different animation frames.
+    monkeypatch.setattr(render, "_time", SimpleNamespace(time=lambda: 10.0))
     session = session_with_tool()
+    session.created_at = 5.0
     assert DEFAULT_CONFIG['card']['hide_completed_tool_activity'] is False
     assert render_card(session) == render_card(session, hide_completed_tool_activity=True)
     assert tool_rows(render_card(session))

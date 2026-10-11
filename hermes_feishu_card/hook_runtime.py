@@ -6951,6 +6951,7 @@ async def _hfc_send_native_slash_confirm(
         state = {}
         setattr(self, "_hfc_slash_confirm_state", state)
     state[str(confirm_id)] = {
+        **_hfc_pending_command_identity(str(chat_id or "")),
         "session_key": str(session_key or ""),
         "chat_id": str(chat_id or ""),
         "message_id": message_id,
@@ -7032,6 +7033,7 @@ async def _hfc_send_native_model_picker(
         state = {}
         setattr(self, "_hfc_model_picker_state", state)
     state[picker_id] = {
+        **_hfc_pending_command_identity(str(chat_id or "")),
         "chat_id": str(chat_id or ""),
         "session_key": str(session_key or ""),
         "message_id": message_id,
@@ -7234,18 +7236,64 @@ def _hfc_action_open_id(data: Any) -> str:
     return str(getattr(operator, "open_id", "") or "")
 
 
-def _hfc_card_operator_allowed(adapter: Any, data: Any, chat_id: str) -> bool:
+def _hfc_pending_command_identity(chat_id: str) -> dict[str, str]:
+    """Snapshot the admitted command, never the callback's claimed chat type."""
+    context = _HFC_FEISHU_COMMAND_RESULT_CONTEXT.get()
+    if not isinstance(context, dict) or context.get("chat_id") != chat_id:
+        return {}
+    try:
+        if float(context.get("expires_at") or 0) <= time.monotonic():
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {
+        "chat_type": str(context.get("chat_type") or "").strip().lower(),
+        "operator_open_id": str(context.get("operator_open_id") or "").strip(),
+    }
+
+
+def _hfc_card_operator_allowed(
+    adapter: Any, data: Any, chat_id: str, *, pending: dict[str, Any] | None = None,
+) -> bool:
     open_id = _hfc_action_open_id(data)
     if not open_id:
         return False
+    if isinstance(pending, dict):
+        chat_type = str(pending.get("chat_type") or "").strip().lower()
+        if chat_type in {"dm", "p2p", "private"}:
+            # This command already passed Hermes admission. Reuse only its
+            # exact actor/chat; being in a DM is not itself authorization.
+            return bool(
+                pending.get("operator_open_id") == open_id
+                and chat_id and _hfc_action_chat_id(data) == chat_id
+                and pending.get("chat_id") == chat_id
+            )
+    sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(getattr(getattr(data, "event", None), "operator", None), "user_id", "") or ""))
+    # Token-backed forms/operations have no local pending command. Only real
+    # platform metadata may select DM admission; get_chat_info's DM fallback
+    # and callback-supplied chat_type are not evidence. The sidecar still
+    # validates the token, actor, route, expiry and original permission handle.
+    cache = getattr(adapter, "_chat_info_cache", None)
+    info = cache.get(chat_id) if isinstance(cache, dict) else None
+    if pending is None and isinstance(info, dict) and info.get("raw_type") == "p2p":
+        admit = getattr(adapter, "_admit", None)
+        if not callable(admit) or _hfc_action_chat_id(data) != chat_id:
+            return False
+        try:
+            return admit(
+                SimpleNamespace(sender_id=sender_id, sender_type="user"),
+                SimpleNamespace(chat_id=chat_id, chat_type="p2p", mentions=[]),
+            ) is None
+        except Exception:
+            return False
     allow_group_message = getattr(adapter, "_allow_group_message", None)
     if not callable(allow_group_message):
         return True
-    sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(getattr(getattr(data, "event", None), "operator", None), "user_id", "") or ""))
     try:
-        return bool(allow_group_message(sender_id, chat_id, is_bot=False))
-    except TypeError:
-        return bool(allow_group_message(sender_id, chat_id))
+        try:
+            return bool(allow_group_message(sender_id, chat_id, is_bot=False))
+        except TypeError:
+            return bool(allow_group_message(sender_id, chat_id))
     except Exception:
         return False
 
@@ -7278,7 +7326,7 @@ def _hfc_prepare_native_slash_action(
     expected_chat_id = str(item.get("chat_id") or "")
     if expected_chat_id and chat_id and expected_chat_id != chat_id:
         return None
-    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id):
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
         return None
     if claim:
         claimed_item = state.pop(confirm_id, None)
@@ -7339,7 +7387,7 @@ def _hfc_prepare_native_model_action(
     expected_chat_id = str(item.get("chat_id") or "")
     if expected_chat_id and chat_id and expected_chat_id != chat_id:
         return None
-    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id):
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
         return None
     return {
         "loop": loop,
@@ -7379,7 +7427,7 @@ def _hfc_prepare_native_resume_action(
     expected_chat_id = str(item.get("chat_id") or "")
     if expected_chat_id and chat_id and expected_chat_id != chat_id:
         return None
-    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id):
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
         return None
     chat_type = str(item.get("chat_type") or "").strip().lower()
     initiating_operator = str(item.get("operator_open_id") or "").strip()
@@ -7442,7 +7490,7 @@ def _hfc_prepare_command_center_action(
     expected_chat_id = str(item.get("chat_id") or "")
     if expected_chat_id and chat_id and expected_chat_id != chat_id:
         return None
-    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id):
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
         return None
     chat_type = str(item.get("chat_type") or "").strip().lower()
     initiating_operator = str(item.get("operator_open_id") or "").strip()
@@ -7661,7 +7709,7 @@ def _hfc_on_feishu_card_action_trigger(self: Any, data: Any) -> Any:
         if form_payload is not None:
             chat_id = _hfc_action_chat_id(data)
             if not chat_id or not _hfc_card_operator_allowed(self, data, chat_id):
-                _hfc_info("form submit rejected by Hermes admission")
+                _hfc_warn("card_action_admission_rejected: form submit")
                 return _hfc_empty_feishu_callback_response(self)
             return _hfc_forward_form_submit_action(self, data, form_payload)
 
@@ -7778,7 +7826,7 @@ def _hfc_handle_operations_select_action(
         _hfc_info("operations.select ignored: missing action/token/chat")
         return _hfc_empty_feishu_callback_response(adapter)
     if not _hfc_card_operator_allowed(adapter, data, chat_id):
-        _hfc_info("operations.select rejected by Hermes admission")
+        _hfc_warn("card_action_admission_rejected: operations.select")
         return _hfc_empty_feishu_callback_response(adapter)
 
     open_id = _hfc_action_open_id(data)
@@ -8286,7 +8334,7 @@ def _hfc_handle_native_slash_action(
         claim=True,
     )
     if prepared is None:
-        _hfc_info("inline slash_confirm ignored: unresolved")
+        _hfc_warn("card_action_unresolved: slash_confirm (missing, expired or unauthorized)")
         return _hfc_empty_feishu_callback_response(adapter)
 
     loop = getattr(adapter, "_loop", None)
