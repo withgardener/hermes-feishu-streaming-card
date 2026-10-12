@@ -7396,9 +7396,12 @@ async def test_completed_first_new_generation_rechecks_card_policy(tmp_path):
     assert store.get(identity).generation == "2" * 32
 
 
-async def test_existing_card_terminal_oversize_hands_off_once_and_duplicate_is_applied(client):
+@pytest.mark.parametrize("table_header", [False, True])
+async def test_existing_card_terminal_oversize_hands_off_once_and_duplicate_is_applied(client, table_header):
     test_client, feishu_client = client
     sensitive = "SENSITIVE-TERMINAL-" + ("密" * 40_000)
+    if table_header:
+        sensitive = f"| key | {sensitive}TAIL_MUST_SURVIVE |\n| --- | --- |\n| item | data |\n"
 
     await test_client.post("/events", json=event_payload("message.started", 0))
     completed = await test_client.post(
@@ -7427,6 +7430,7 @@ async def test_existing_card_terminal_oversize_hands_off_once_and_duplicate_is_a
     assert await duplicate.json() == {"ok": True, "applied": True}
     assert len(feishu_client.updated) == update_count
     session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.answer_text == sensitive.rstrip("\n")
     assert session.terminal_disposition == "native"
     assert session.terminal_limit_reason == "json_bytes"
     metrics = (await (await test_client.get("/health")).json())["metrics"]

@@ -1,4 +1,4 @@
-# Hermes Feishu Streaming Card V4.7.6 sidecar configuration
+# Hermes Feishu Streaming Card V4.7.7 sidecar configuration
 # Copy to a local path and fill credentials from your environment or secret store.
 # Default config path: ~/.hermes_feishu_card/config.yaml
 
@@ -84,6 +84,15 @@ card:
   # compact preserves rows from table 6 onward as readable field lists.
   # truncate keeps the legacy five-table behavior when explicitly selected.
   table_overflow_mode: compact
+  # Opt-in native card tables for body Markdown tables (default false keeps
+  # Markdown). The Markdown rich-text component cannot set a column width
+  # ("表格的富文本语法不支持设置列宽等"), so a long value column is squeezed into
+  # mid-word breaks. The native table element can set per-column widths, and
+  # row_height: auto grows the row to fit wrapped content instead of clipping
+  # the cell. Tables without data rows or with more than 50 columns, and any
+  # card that then exceeds the safe budget, fall back to the Markdown layout.
+  # row_height: auto requires Feishu client V7.33+ (data_type markdown: V7.14+).
+  native_tables: false
   # Opt-in: after the final card update succeeds, send one new text reply that
   # @mentions the initiating Feishu user. Card edits themselves do not notify.
   completion_notify:

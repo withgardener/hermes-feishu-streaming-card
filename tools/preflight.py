@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DEFAULT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
 GROUPS = {
     "runtime": ["tests/unit/test_hook_runtime.py", "tests/integration/test_server.py"],
-    "render": ["tests/unit/test_render.py", "tests/unit/test_session.py"],
+    "render": ["tests/unit/test_render.py", "tests/unit/test_session.py",
+               "tests/unit/test_native_tables.py"],
     "config": ["tests/unit/test_config.py", "tests/unit/test_package_metadata.py"],
     "install": ["tests/unit/test_patcher.py", "tests/integration/test_cli_install.py"],
     "process": ["tests/unit/test_process.py", "tests/integration/test_cli_process.py"],
@@ -156,7 +157,8 @@ def select_targets(paths, modules):
             groups.add("install")
         elif name in {"hermes_feishu_card/hook_runtime.py", "hermes_feishu_card/server.py"}:
             groups.add("runtime")
-        elif name in {"hermes_feishu_card/render.py", "hermes_feishu_card/text.py"}:
+        elif name in {"hermes_feishu_card/render.py", "hermes_feishu_card/text.py",
+                      "hermes_feishu_card/native_tables.py"}:
             groups.add("render")
         elif name in {"hermes_feishu_card/process.py", "hermes_feishu_card/persistent_service.py"}:
             groups.add("process")

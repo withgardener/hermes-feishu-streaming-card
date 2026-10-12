@@ -321,3 +321,8 @@ Orphaned integrity fences can be explicitly rebound with `integrity acknowledge-
 #384 使用 `instance_binding.py` 统一显式 source/HOME 绑定。setup 将 `--hermes-home` 保存为专用 HFC env 值；runner、PM 探测、认证 runtime target 和维护任务使用同一 HOME。默认 source-parent 身份保持 v1，分离 HOME 用 v2 哈希；禁止只放宽 drain 布尔值却继续比较 source-only 身份。split 只接受 Hermes 进程级 HOME API，不接受 task-local fallback。
 
 维护任务保存 HOME，重读配置发现漂移时在任何 Gateway 命令前拒绝；排空、停止、重启、失败清理均使用所保存的绑定。旧任务无字段时保留原语义。分离 HOME 与 `service.shared_source=true` 的卡片升级保持拒绝：此项目没有跨实例排空权，共享源码的所有 sidecar（包括默认 HOME）均须声明共享。不要把支持 readiness 写成自动协调所有实例。身份原因保留在 integrity 脱敏白名单；现存 fence 不自动清除。
+
+
+## V4.7.7 表格内容保留
+
+原生表格的 1,200 字符限制只决定是否转换，不能截断最终答案；任一表头或单元格超限时整表回退原 Markdown。Markdown 分段若无法安全拆开表头或行，保留整表交给最终 serializer/容量门禁，禁止以折叠提示替代原文。测试必须验证实际正文、task 展示、混合顺序和超限完整交接；session 中保留原文不能替代投递内容完整性。

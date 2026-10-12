@@ -54,6 +54,7 @@ def card_render_options(config: Mapping[str, Any]) -> dict[str, Any]:
         status_config=StatusConfig.from_mapping(config.get("status")),
         text_sizes=config.get("text_sizes") if isinstance(config.get("text_sizes"), dict) else None,
         table_overflow_mode=mode if mode in {"compact", "truncate"} else "compact",
+        native_tables=_boolean(config.get("native_tables"), False),
         width_mode=config.get("width_mode", "default"),
         presentation=config.get("_presentation_mode", "classic"),
     )

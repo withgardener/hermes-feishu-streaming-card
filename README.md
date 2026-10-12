@@ -15,7 +15,7 @@
 
 [快速安装](#快速安装) · [配置方法](#配置方法) · [近期更新](#近期更新) · [使用手册](docs/user-guide.md) · [贡献者](#贡献者)
 
-**发行版本：[v4.7.6](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.6)。** 支持源码与 HERMES_HOME 分离，修复共享源码多实例的身份验证与诊断。见[发行说明](docs/release-notes-v4.7.6.md)。
+**发行版本：[v4.7.7](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.7)。** 可选原生表格；长单元格完整回退 Markdown，超长表头不再丢失。见[发行说明](docs/release-notes-v4.7.7.md)。
 
 ## 为什么使用 HFC
 
@@ -80,7 +80,7 @@ python3 -m hermes_feishu_card.cli doctor --config ~/.hermes/config.yaml --hermes
 - **Docker：** 在已有 Hermes 容器中，使用仓库内的安装脚本：
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.6
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.7
 bash install-docker.sh
 ```
 
@@ -119,6 +119,7 @@ card:
   title: Hermes Agent
   width_mode: default  # default | compact | fill
   table_overflow_mode: compact
+  native_tables: false
   footer_fields: [duration, model, input_tokens, output_tokens, context]
 bindings:
   native_chats: []
@@ -129,6 +130,8 @@ service:
 ```
 
 `card.width_mode` 支持 `default`、`compact`、`fill`（自适应聊天窗口宽度），仅作用于 JSON 2.0 卡片；默认保持原布局，支持 profile/bot 覆盖，显式 `default` 可重置继承值。JSON 1.0 审批卡不变，最终尺寸仍由客户端决定。详见[卡片宽度配置](docs/user-guide.md#卡片宽度)。
+
+`card.native_tables`（默认 `false`）把正文 Markdown 表格渲染成飞书卡片原生 `table` 组件：列宽按内容计算，`row_height: auto` 让长内容换行而不是被单元格末尾省略。无法用原生组件表示的表格、以及因此超出卡片预算的整卡，都会回退到 Markdown 布局。详见[正文表格](docs/user-guide.md#正文表格)。
 
 配置同目录的 `.env`：
 
@@ -203,6 +206,7 @@ HFC 采用 **sidecar-only** 架构：Hermes 运行任务，安装器管理必要
 
 | 版本 | 重点 |
 |---|---|
+| [v4.7.7](docs/release-notes-v4.7.7.md) | 可选原生表格；保留长单元格和无法拆分的 Markdown 表格 |
 | [v4.7.6](docs/release-notes-v4.7.6.md) | 分离 HOME 绑定、多实例身份校验与诊断修复 |
 | [v4.7.5](docs/release-notes-v4.7.5.md) | PM 环境绑定、私聊按钮准入修复及目录布局限制说明 |
 | [v4.7.4](docs/release-notes-v4.7.4.md) | 独立侧车环境、心跳归属隔离与退出残留回收 |
@@ -212,7 +216,6 @@ HFC 采用 **sidecar-only** 架构：Hermes 运行任务，安装器管理必要
 | [v4.7.0](docs/release-notes-v4.7.0.md) | 任务布局、离线预览、额度归属与交互状态修复 |
 | [v4.6.13](docs/release-notes-v4.6.13.md) | 控制凭据移出命令行与最新 Hermes 源码验证 |
 | [v4.6.12](docs/release-notes-v4.6.12.md) | 可选卡片宽度与 Hermes 回复计时契约适配 |
-| [v4.6.11](docs/release-notes-v4.6.11.md) | 可选思考尾部窗口、后台任务观测信息与 CodeQL 更新 |
 
 更早版本见[历史更新](docs/release-history.md)；完整记录见 [CHANGELOG](CHANGELOG.md) 与 [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases)。
 
@@ -222,6 +225,7 @@ HFC 采用 **sidecar-only** 架构：Hermes 运行任务，安装器管理必要
 
 - [yulong-ge](https://github.com/yulong-ge) 在 [#382](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/382) 提供 PM 托管环境安装失败的复现与诊断证据。
 
+- V4.7.7: [ywarmy](https://github.com/ywarmy)（[PR #391](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/391)）贡献原生表格实现与 API 验收证据，保留原始提交作者。
 - V4.7.3: [lanx214](https://github.com/lanx214)（#378）提供性能故障证据；[ywarmy](https://github.com/ywarmy)（#372）提供现场复测和恢复文档建议。
 - V4.7.2: [Nevoker](https://github.com/Nevoker) ([PR #373](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/373)); [DaveWang888](https://github.com/DaveWang888) (#375), [ffdxdynotable](https://github.com/ffdxdynotable) (#374), [ywarmy](https://github.com/ywarmy) (#372), [jackwude](https://github.com/jackwude) (#370). 分别贡献 Python 3.14 修复、故障证据和配置引导建议；保留原提交作者。
 

@@ -21,7 +21,7 @@ Use it when connecting [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 [Install](#quick-install) · [Configure](#configuration) · [Recent releases](#recent-releases) · [User guide](docs/user-guide.en.md) · [Contributors](#contributors)
 
-**Release version: [v4.7.6](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.6).** Support separate source/HERMES_HOME layouts with explicit instance binding and clear ownership diagnostics. See [release notes](docs/release-notes-v4.7.6.en.md).
+**Release version: [v4.7.7](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.7).** Opt-in native tables with lossless Markdown fallback for long cells and headers. See [release notes](docs/release-notes-v4.7.7.en.md).
 
 ## Why HFC
 
@@ -86,7 +86,7 @@ Start or restart Hermes Gateway as directed by setup, then message the bot and c
 - **Docker:** inside an existing Hermes container, run the repository's installer:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.6
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.7
 bash install-docker.sh
 ```
 
@@ -125,6 +125,7 @@ card:
   title: Hermes Agent
   width_mode: default  # default | compact | fill
   table_overflow_mode: compact
+  native_tables: false
   footer_fields: [duration, model, input_tokens, output_tokens, context]
 bindings:
   native_chats: []
@@ -135,6 +136,8 @@ service:
 ```
 
 `card.width_mode` supports `default`, `compact`, and `fill` (adaptive chat-window width) for JSON 2.0 cards. The default preserves existing layout; profile/bot overrides are supported, and explicit `default` resets an inherited mode. JSON 1.0 approval cards are unchanged; clients control final dimensions. See [card width configuration](docs/user-guide.en.md#card-width).
+
+`card.native_tables` (default `false`) renders body Markdown tables as the card's native `table` element, so column widths follow the content and `row_height: auto` wraps a long cell instead of clipping it. Tables that cannot be represented natively, and cards that would exceed the safe budget because of the richer payload, fall back to the Markdown layout. See [body tables](docs/user-guide.en.md#body-tables).
 
 Place `.env` beside the config:
 
@@ -209,6 +212,7 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 
 | Version | Highlights |
 |---|---|
+| [v4.7.7](docs/release-notes-v4.7.7.en.md) | Opt-in native tables; preserve long cells and indivisible Markdown tables |
 | [v4.7.6](docs/release-notes-v4.7.6.en.md) | Split HOME binding, multi-instance ownership and diagnostics |
 | [v4.7.5](docs/release-notes-v4.7.5.en.md) | PM runtime binding, DM card admission and layout limitations |
 | [v4.7.4](docs/release-notes-v4.7.4.en.md) | Independent sidecar runtime, heartbeat ownership and exit cleanup |
@@ -218,7 +222,6 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 | [v4.7.0](docs/release-notes-v4.7.0.en.md) | Task layout, offline previews, attributed quota and interaction-state repairs |
 | [v4.6.13](docs/release-notes-v4.6.13.en.md) | Private control-token transport and current Hermes source verification |
 | [v4.6.12](docs/release-notes-v4.6.12.en.md) | Optional card width and Hermes reply-clock compatibility |
-| [v4.6.11](docs/release-notes-v4.6.11.en.md) | Bounded live thinking, observed background-task context and CodeQL update |
 
 See [release history](docs/release-history.en.md) for earlier versions, and [CHANGELOG](CHANGELOG.md) or [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases) for the full record.
 
@@ -228,6 +231,7 @@ See [release history](docs/release-history.en.md) for earlier versions, and [CHA
 
 - [yulong-ge](https://github.com/yulong-ge) supplied PM-managed runtime installation reproduction and diagnostics in [#382](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/382).
 
+- V4.7.7: [ywarmy](https://github.com/ywarmy) ([PR #391](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/391)), native-table implementation and API acceptance evidence; original commit authorship is preserved.
 - V4.7.3: [lanx214](https://github.com/lanx214) (#378), performance evidence; [ywarmy](https://github.com/ywarmy) (#372), field verification and recovery-documentation feedback.
 - V4.7.2: [Nevoker](https://github.com/Nevoker) ([PR #373](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/373)); [DaveWang888](https://github.com/DaveWang888) (#375), [ffdxdynotable](https://github.com/ffdxdynotable) (#374), [ywarmy](https://github.com/ywarmy) (#372), [jackwude](https://github.com/jackwude) (#370). Code, failure evidence and configuration-guide proposal; original commit authorship is preserved.
 

@@ -299,7 +299,7 @@ def test_split_markdown_blocks_handles_oversized_table_row_without_plain_fragmen
             assert all(line.startswith("|") and line.endswith("|") for line in lines[2:])
 
 
-def test_split_markdown_blocks_folds_table_row_when_structure_cannot_fit():
+def test_split_markdown_blocks_preserves_table_when_row_structure_cannot_fit():
     headers = [f"H{index}" for index in range(10)]
     header = "| " + " | ".join(headers) + " |\n"
     separator = "| " + " | ".join("---" for _ in headers) + " |\n"
@@ -308,23 +308,12 @@ def test_split_markdown_blocks_folds_table_row_when_structure_cannot_fit():
 
     chunks = split_markdown_blocks(table, 130)
 
-    assert all(len(chunk) <= 130 for chunk in chunks)
-    assert any("超长行无法安全拆分" in chunk for chunk in chunks)
-    assert "VALUE" * 30 not in "".join(chunks)
-    for chunk in chunks:
-        if separator not in chunk:
-            continue
-        lines = [line for line in chunk.splitlines() if line.strip()]
-        assert lines[:2] == [header.rstrip(), separator.rstrip()]
-        assert all(line.startswith("|") and line.endswith("|") for line in lines[2:])
+    assert chunks == [table]
 
 
-def test_split_markdown_blocks_folds_oversized_table_header():
+def test_split_markdown_blocks_preserves_oversized_table_header():
     table = f"| {'H' * 300} |\n| --- |\n"
 
     chunks = split_markdown_blocks(table, 120)
 
-    assert all(len(chunk) <= 120 for chunk in chunks)
-    assert "表格标题过宽，无法安全拆分" in "".join(chunks)
-    assert "H" * 300 not in "".join(chunks)
-    assert count_markdown_tables("".join(chunks)) == 0
+    assert chunks == [table]

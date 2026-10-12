@@ -53,6 +53,7 @@ READING_FIELDS = (
     "hide_completed_tool_activity", "reasoning_format", "timeline_expanded",
     "max_timeline_items", "max_reasoning_chars", "max_tool_result_chars",
     "table_overflow_mode",
+    "native_tables",
     "timeline_order", "timeline_tools_per_reasoning", "thinking_body_tail_chars",
     "width_mode", "text_sizes", "footer_fields", "interaction_mode", "streaming_mode",
 )
@@ -209,7 +210,8 @@ def explain_reading_config(
     # Reuse the runtime's handling of accepted legacy booleans and limits.
     options = card_render_options(resolved)
     for key in ("show_reasoning", "stream_thinking_to_body", "hide_completed_tool_activity",
-                "timeline_expanded", "max_timeline_items", "max_reasoning_chars", "max_tool_result_chars"):
+                "timeline_expanded", "max_timeline_items", "max_reasoning_chars", "max_tool_result_chars",
+                "native_tables"):
         resolved[key] = options[key]
     terminal_policy = (
         "unsuccessful_only" if resolved["hide_completed_tool_activity"] else

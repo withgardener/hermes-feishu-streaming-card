@@ -51,6 +51,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
+        "native_tables": False,
         "completion_notify": {"enabled": False},
         # Per-kind @ mention switches in interaction cards (clarify /
         # approval). The default is UNSET (None): the resolving helpers fall
@@ -473,6 +474,10 @@ def _normalize_card_config(value: object, *, path: str) -> None:
     if "table_overflow_mode" in value:
         value["table_overflow_mode"] = normalize_table_overflow_mode(
             value["table_overflow_mode"], path=f"{path}.table_overflow_mode"
+        )
+    if "native_tables" in value:
+        value["native_tables"] = _normalize_boolean(
+            value["native_tables"], f"{path}.native_tables"
         )
     if "streaming_mode" in value:
         value["streaming_mode"] = _normalize_boolean(

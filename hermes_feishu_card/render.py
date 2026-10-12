@@ -27,6 +27,7 @@ from .presentation import (
     apply_task_presentation, task_presentation, task_interaction_prompt,
     task_button_label, task_answer_code_projection, TASK_TEXT_SIZE_DEFAULTS,
 )
+from .native_tables import build_main_content_elements
 from .text import (
     TableOverflowResult,
     normalize_stream_text,
@@ -137,6 +138,7 @@ def render_card(
     thinking_body_tail_chars: int = 0,
     width_mode: str = "default",
     presentation: str = "classic",
+    native_tables: bool = False,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -163,6 +165,7 @@ def render_card(
         thinking_body_tail_chars=thinking_body_tail_chars,
         width_mode=width_mode,
         presentation=presentation,
+        native_tables=native_tables,
     ).card
 
 
@@ -191,6 +194,7 @@ def render_card_result(
     thinking_body_tail_chars: int = 0,
     width_mode: str = "default",
     presentation: str = "classic",
+    native_tables: bool = False,
 ) -> CardRenderResult:
     if presentation == "task" and session.status == "failed" and session.terminal_reasoning_notice:
         # This source marker comes from the terminal event, never a text match.
@@ -235,6 +239,7 @@ def render_card_result(
         thinking_body_tail_chars=thinking_body_tail_chars,
         width_mode=width_mode,
         presentation=presentation,
+        native_tables=native_tables,
     )
     card = _render_card_unchecked(session, **render_options)
     inspection = inspect_card_limits(card)
@@ -265,6 +270,15 @@ def render_card_result(
                 presentation=presentation,
             )
             table_overflow = transform_table_overflow(primary_text, mode=table_overflow_mode)
+    if not inspection.safe and native_tables:
+        # Native table elements cost more JSON bytes than the Markdown they
+        # replace. Fall back to the Markdown layout before the limit-handoff
+        # card, so a rich table can never make the whole answer undeliverable.
+        markdown_options = dict(render_options, native_tables=False)
+        markdown_card = _render_card_unchecked(session, **markdown_options)
+        markdown_inspection = inspect_card_limits(markdown_card)
+        if markdown_inspection.safe:
+            card, inspection = markdown_card, markdown_inspection
     if inspection.safe:
         return CardRenderResult(
             card=card,
@@ -316,6 +330,7 @@ def _render_card_unchecked(
     thinking_body_tail_chars: int = 0,
     width_mode: str = "default",
     presentation: str = "classic",
+    native_tables: bool = False,
 ) -> Dict[str, Any]:
     if presentation == "task":
         text_sizes = {**TASK_TEXT_SIZE_DEFAULTS, **dict(text_sizes or {})}
@@ -395,6 +410,7 @@ def _render_card_unchecked(
         elements = _render_main_content_elements(
             primary_text,
             table_overflow_mode=table_overflow_mode,
+            native_tables=native_tables,
             text_size=_role_text_size(
                 text_sizes,
                 main_role,
@@ -1250,11 +1266,26 @@ def _render_main_content_elements(
     *,
     text_size: str | None = None,
     table_overflow_mode: str = "compact",
+    native_tables: bool = False,
 ) -> list[Dict[str, Any]]:
+    """Render the body, optionally as native card tables plus Markdown.
+
+    ``native_tables`` swaps body Markdown tables for the card's native ``table``
+    element (see :mod:`hermes_feishu_card.native_tables`); when no table can be
+    converted the Markdown layout below is used unchanged.
+    """
     main_text = transform_table_overflow(
         main_text,
         mode=table_overflow_mode,
     ).text
+    if native_tables:
+        native_elements = build_main_content_elements(
+            main_text,
+            chunk_chars=MAIN_CONTENT_CHUNK_CHARS,
+            text_size=text_size,
+        )
+        if native_elements is not None:
+            return native_elements
     chunks = split_markdown_blocks(main_text, MAIN_CONTENT_CHUNK_CHARS)
     elements = []
     for index, chunk in enumerate(chunks):
