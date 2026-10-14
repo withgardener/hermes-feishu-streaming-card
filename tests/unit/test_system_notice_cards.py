@@ -109,3 +109,37 @@ def test_restart_completion_send_posts_card_not_text(monkeypatch):
 
 def test_working_heartbeat_is_not_timer_recalled_as_text():
     assert hook_runtime._transient_notice_recall_seconds("⏳ Working — 2 min") is None
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("text,title,level", [
+    ("✅ 后台任务已完成 — `cd /root/.hermes/scripts && ZMD_DRY_RUN=1 …` (10s)", "后台任务已完成", "success"),
+    ("✅ 后台任务已完成", "后台任务已完成", "success"),
+    ("✅ Background task finished — `printf ok` (6s)", "后台任务已完成", "success"),
+    ("✅ Background task finished (1h 2m)", "后台任务已完成", "success"),
+    ("❌ 后台任务失败 — `pytest -q` (12s, 退出码 1)。最后输出：\n```\nFAILED x\n```\n可以让我重新运行它，或显示完整日志。",
+     "后台任务失败", "error"),
+    ("❌ Background task failed — `cmd` (exit 1). Last output:\n```\nboom\n```\nAsk me to rerun it or show the full log.",
+     "后台任务失败", "error"),
+])
+def test_concise_background_process_notice_is_a_card(text, title, level):
+    # LOCAL PATCH (PATCH-024): the gateway's concise watcher line (zh or en locale) becomes a card.
+    notice = hook_runtime._hfc_classify_system_notice(text)
+    assert notice is not None, text
+    assert notice["title"] == title and notice["level"] == level
+    assert notice["notice_kind"] == "background-process" and notice["notice_terminal"] is True
+    assert hook_runtime._hfc_notice_plain_text(notice) is None
+
+
+@pytest.mark.parametrize("text", [
+    "✅ 后台任务已完成，但需要注意",            # free text after the template
+    "✅ Background task finished but needs attention",
+    "✅ 后台任务已完成 — `unclosed",
+    "> ✅ 后台任务已完成 — `x` (1s)",           # a quote inside an answer
+    "解释一下：✅ 后台任务已完成",
+])
+def test_lookalike_answers_are_not_background_cards(text):
+    notice = hook_runtime._hfc_classify_system_notice(text)
+    assert notice is None or notice.get("notice_kind") != "background-process", text

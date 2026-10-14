@@ -158,22 +158,29 @@ async def test_restart_requester_uses_card_path_and_owned_route(wired, monkeypat
     assert len(posts) == 2 and registered == []
 
 
-@pytest.mark.parametrize('text,disposable',[
+@pytest.mark.parametrize('text,card',[
     ('✅ Background task finished',True),
     ('✅ Background task finished — `printf ok` (6s)',True),
     ('✅ Background task finished — `echo hi` (1h 2m)',True),
     ('✅ Background task finished\nFinal output:\nvaluable result',False),
-    ('❌ Background task failed — `cmd` (exit 1)',False),
+    ('❌ Background task failed — `cmd` (exit 1)',True),
     ('✅ Background task finished but needs attention',False),
     ('✅ Background task finished — `unclosed',False),
 ])
-async def test_background_only_known_success_one_liner_gets_timer(wired,text,disposable):
+async def test_background_concise_lines_are_cards_and_never_recall_registered(wired,monkeypatch,text,card):
+    # LOCAL PATCH (PATCH-024): the concise watcher line is a card; nothing goes to the text-recall path.
     runner,registered,sent=wired
+    posts=[]
+    async def allowed(*_a,**_k):return True
+    async def post(url,payload,timeout):
+        posts.append(payload)
+        return {"ok":True,"applied":True,"delivery":{"outcome":"delivered"}}
+    monkeypatch.setattr(runtime,"_hfc_direct_card_allowed_async",allowed)
+    monkeypatch.setattr(runtime,"_post_json_ordered_response",post)
     assert (await runner._send_watcher_message('feishu','oc_test','omt_test',text,{})).success
-    assert bool(registered)==disposable
-    if disposable:assert registered[0][1]['notice_family']==''
-    await runner.adapter.send('oc_test',text,metadata={'thread_id':'omt_test'})
-    assert len(registered)==int(disposable)
+    assert registered==[]
+    assert bool(posts)==card and (sent==[])==card
+    if card:assert posts[0]['data']['notice_kind']=='background-process'
 
 
 async def test_expired_approval_correction_is_retained_even_from_its_real_producer(wired):

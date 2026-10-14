@@ -61,6 +61,10 @@ def notice_for_send(adapter, chat, text, metadata):
     # warnings keep the upstream plain-text + record-only recall behaviour.
     if text in {RESTARTED, RESTARTED.replace('♻', '♻️'), ONLINE}:
         return None
+    # LOCAL PATCH (PATCH-024): the watcher's concise "Background task finished" line is a card too
+    # (hook_runtime BACKGROUND_CONCISE_FINISHED_RE), not plain text with a recall timer.
+    if isinstance(text, str) and _BACKGROUND_SUCCESS.fullmatch(text) is not None:
+        return None
     context = _CONTEXT.get()
     if context is None and isinstance(_DELIVERY.get(), dict):
         context = _DELIVERY.get().get('notice')

@@ -167,6 +167,20 @@ BACKGROUND_TASK_FAILED_RE = re.compile(
     r"(?P<task_id>bg_\d{6}_[0-9a-f]{6}) "
     r"failed:(?:[ \t\r\n][\s\S]*)?\Z"
 )
+# LOCAL PATCH (PATCH-024): the gateway's concise background-process completion line
+# (gateway.run._format_concise_process_notification, zh/en locales), e.g.
+#   ✅ 后台任务已完成 — `cmd …` (10s)
+#   ❌ Background task failed — `cmd` (exit 1). Last output:\n```…```\nAsk me to rerun it…
+# Anchored to the exact template so a quoted or extended answer never matches.
+_BG_CONCISE_DETAIL = r"(?: — `[^`\r\n]+`)?(?: \([^()\r\n]{1,40}\))?"
+BACKGROUND_CONCISE_FINISHED_RE = re.compile(
+    r"\A✅ (?:后台任务已完成|Background task finished)" + _BG_CONCISE_DETAIL + r"\Z"
+)
+BACKGROUND_CONCISE_FAILED_RE = re.compile(
+    r"\A❌ (?:后台任务失败|Background task failed)" + _BG_CONCISE_DETAIL
+    + r"(?:(?:。最后输出：|\. Last output:)\n```\n[\s\S]*?\n```)?"
+    + r"(?:\n(?:可以让我重新运行它，或显示完整日志。|Ask me to rerun it or show the full log\.))?\Z"
+)
 ATTACHMENT_TRAILING_PUNCTUATION = ",.;:)]}，。；：）】}"
 NATIVE_DELIVERY_MARKERS = ("[[as_document]]", "[[audio_as_voice]]")
 NATIVE_DELIVERY_ATTACHMENT_FIELDS = (
@@ -5143,6 +5157,24 @@ def _hfc_classify_background_notice(text: str) -> dict[str, Any] | None:
             "notice_id": f"background-task:{task_id}",
             "notice_terminal": True,
         }
+    # LOCAL PATCH (PATCH-024): concise background-process completion → card.
+    for pattern, title, level in (
+        (BACKGROUND_CONCISE_FINISHED_RE, "后台任务已完成", "success"),
+        (BACKGROUND_CONCISE_FAILED_RE, "后台任务失败", "error"),
+    ):
+        if pattern.fullmatch(text) is not None:
+            # body = what follows the fixed phrase: "`cmd` (10s)" plus, on failure, the output tail
+            detail = re.sub(r"\A[✅❌] (?:后台任务已完成|Background task finished|后台任务失败|Background task failed)", "", text)
+            detail = detail.removeprefix(" — ").strip() or title
+            return {
+                "title": title,
+                "level": level,
+                "notice_kind": "background-process",
+                # each completion is its own card (two runs of the same command must not merge)
+                "notice_id": "background-process:" + secrets.token_hex(6),
+                "notice_terminal": True,
+                "content": detail,
+            }
     return None
 
 
