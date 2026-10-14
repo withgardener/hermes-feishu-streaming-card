@@ -1945,27 +1945,11 @@ def handle_status_from_hermes_locals(
             event_type == "lifecycle" and isinstance(message, str) and len(message) <= 1000
             and re.fullmatch(r"❌ (?:API failed|Rate limited) after [1-9][0-9]{0,2} retries — [^\r\n]+", message)
         )
-        # LOCAL PATCH (PATCH-016): user asked for the "🗜️ Compacting context —
-        # summarizing earlier conversation..." card notice to be fully suppressed
-        # (compression should stay silent background work, no screen space).
-        # Originally (v4.6.0) this function's ONLY job was emitting that one
-        # notice, so an unconditional `return False` at the top was correct.
-        # v4.6.5 extended the SAME function with an unrelated new feature
-        # (provider-failure notices, `provider_failure` branch below) — a
-        # blanket short-circuit now also silently killed that new feature,
-        # which the user never asked to suppress. Narrow the patch to only
-        # the compaction-notice branch so the new provider-failure branch
-        # keeps upstream's native behavior.
+        # PATCH-016 (compaction card suppressed) was retired on 2026-10-14 at the
+        # user's request (「都改成卡片比较美观」): the compaction status is a card again,
+        # shown as the turn card's 正在压缩上下文 phase instead of an English text line.
         is_compaction = bool(_CONTEXT_COMPACTION_STATUS_RE.search(str(message or "")))
         if not provider_failure and not is_compaction:
-            return False
-        if not provider_failure and is_compaction:
-            # PATCH-016: user asked for the "🗜️ Compacting context —
-            # summarizing earlier conversation..." card notice to be fully
-            # suppressed (compression should stay silent background work).
-            # Everything else below this point builds a system.notice for
-            # either the compaction case or the (unaffected) provider_failure
-            # case, so only the compaction branch is short-circuited here.
             return False
         run_guard = local_vars.get("_run_still_current")
         if callable(run_guard) and not run_guard():
@@ -5021,22 +5005,18 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
                        "重启耗时取决于正在收尾的任务和启动过程；收到重启完成通知后，请重新发送请求。",
         }
     if text in {"♻ Gateway restarted successfully. Your session continues.",
-                "♻️ Gateway restarted successfully. Your session continues."}:
-        # Maintainer note (contract change): this notice is delivered as PLAIN TEXT, not a card.
-        #
-        # It used to render as a card titled "Gateway 重启完成" — a duplicate of the home-channel
-        # line in different words, arriving with a status pill and a metrics row it never had
-        # ("已完成 · 0s · Unknown · ↑0 · ↓0 · ctx 0/0 0%"). The user asked for the two surfaces to
-        # read the same and for the card to go: "可以改成不发卡片。发♻️ Gateway online — Hermes is
-        # back and ready." `_hfc_send_system_notice_card` honours `plain_text` by sending exactly
-        # this line through the adapter's own text send; `title`/`level`/`content` stay for the
-        # classification contract and any caller that still renders one.
+                "♻️ Gateway restarted successfully. Your session continues.",
+                _HFC_GATEWAY_ONLINE_TEXT}:
+        # LOCAL PATCH (PATCH-024, 2026-10-14): restart completion is a green card again.
+        # The earlier plain-text contract (「可以改成不发卡片」) was reversed by the user
+        # (「都改成卡片比较美观」). The home-channel online line uses the same card so both
+        # surfaces still read the same. Independent terminal notices render without the
+        # metrics footer, so the old "0s · Unknown · ↑0" row does not come back.
         return {
             "title": "Gateway 重启完成", "level": "success",
             "notice_kind": "gateway-restart", "notice_id": "gateway-restart-ready",
             "notice_terminal": True,
-            "content": "Gateway 已重启完成，会话已保留。现在可以发送新任务。",
-            "plain_text": _HFC_GATEWAY_ONLINE_TEXT,
+            "content": "Hermes 已重新上线，会话已保留，可以继续发送任务。",
         }
     if text.startswith("📬 No home channel is set for Feishu."):
         return {
@@ -5050,21 +5030,18 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
             "notice_id": _hfc_content_notice_id("compression", text),
         }
     if text.startswith("⏳") or lowered.startswith("working ") or "working —" in lowered:
-        # Maintainer note (contract change): the ⏳ status line is NEVER a card.
-        #
-        # These lines used to become notice cards titled「运行中」. They are transient process state
-        # ("compressing", "waiting for approval", "loading the model", the long-running heartbeat,
-        # "tool timed out, retrying", …): the turn's OWN card already carries the live progress, so
-        # the extra card restated it and then appeared/vanished every ~180s. The user asked for the
-        # whole class to be plain text (「⏳ Working — … 之类的，我觉得不应该发卡片」/「都改为纯文本。
-        # 体验效果感觉会好一点」).
-        #
-        # Returning None preserves the adapter's plain-text path. The egress helper
-        # recalls only known transient templates, never arbitrary hourglass text.
-        # Queue/error acknowledgements and answer content remain visible. The edit
-        # path also still works: `_hfc_edit_message_with_system_notice_card` falls back to the
-        # original edit once classification returns None, so a refreshing status updates ONE line.
-        return None
+        # LOCAL PATCH (PATCH-024, 2026-10-14): the user reversed the earlier plain-text
+        # contract (「都改成卡片比较美观」). The whole ⏳ family is one 「运行中」 notice card
+        # per turn again (upstream v3.8.8 shape): heartbeat id is stable per anchor, so
+        # core's in-place edits update that one card, and the sidecar's heartbeat recall
+        # withdraws it once it stops being refreshed.
+        return {
+            "title": "运行中",
+            "level": "info",
+            "notice_kind": "heartbeat",
+            "notice_id": "heartbeat",
+            "notice_terminal": False,
+        }
     if "caps context" in lowered and "auto-compaction" in lowered:
         return {
             "title": "上下文窗口提示",

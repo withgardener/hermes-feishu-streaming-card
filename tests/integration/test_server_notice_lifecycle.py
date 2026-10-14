@@ -412,12 +412,22 @@ async def test_notice_delivery_does_not_claim_the_gateway_has_resumed():
 
 @pytest.mark.asyncio
 async def test_hook_registration_and_event_delivery_share_the_single_client_profile(monkeypatch):
+    # LOCAL PATCH (PATCH-024): validate the system.notice route for successful restart cards.
     fake = Client()
     app = server.create_app(fake, card_config={"flush_interval_ms": 0})
     async with TestClient(TestServer(app)) as http:
         monkeypatch.setattr(runtime, "load_runtime_config", lambda: SimpleNamespace(
             enabled=True, event_url=str(http.make_url("/events")), timeout_seconds=2,
         ))
+        async def allowed(*_args, **_kwargs):
+            return True
+        monkeypatch.setattr(runtime, "_hfc_direct_card_allowed_async", allowed)
+        async def post_card(url, payload, timeout):
+            result = await http.post("/events", json=payload)
+            body = await result.json()
+            body.setdefault("delivery", {"outcome": "delivered"})
+            return body
+        monkeypatch.setattr(runtime, "_post_json_ordered_response", post_card)
         token = runtime._HFC_FEISHU_DELIVERY_CONTEXT.set({
             "chat_id": "oc_fixture", "profile_id": "work", "thread_id": "omt_target",
         })
@@ -430,9 +440,12 @@ async def test_hook_registration_and_event_delivery_share_the_single_client_prof
                 content="♻ Gateway restarted successfully. Your session continues.",
             )
             assert result.success is True
+            assert result.message_id.startswith("notice_")
         finally:
             runtime._HFC_FEISHU_DELIVERY_CONTEXT.reset(token)
+        assert len(fake.sent) == 1
         assert fake.deleted == []
+        assert fake.sent[0][1]["header"]["title"]["content"] == "Gateway 重启完成"
         event = {
             "schema_version": "1", "event": "message.started", "platform": "feishu",
             "conversation_id": "omt_target", "message_id": "om_user", "chat_id": "oc_fixture",
@@ -441,17 +454,16 @@ async def test_hook_registration_and_event_delivery_share_the_single_client_prof
         }
         assert (await http.post("/events", json=event)).status == 200
         await drain()
-        assert len(fake.sent) == 1
-        assert fake.deleted == ["om_online"]
-        # Subsequent notices are retired by actual updates to that message's owner.
-        assert (await register(http, "om_online_again", profile="work", thread="omt_target")).status == 200
+        assert fake.deleted == []
         event.update(event="message.completed", sequence=2)
         event["data"]["answer"] = "完整结果保留"
         assert (await http.post("/events", json=event)).status == 200
         await drain()
-        assert fake.deleted == ["om_online", "om_online_again"]
+        assert fake.deleted == []
         assert app[server.SESSIONS_KEY]["work:om_user"].answer_text == "完整结果保留"
-        assert len(fake.sent) == 1
+        assert len(fake.sent) == 2
+        assert fake.sent[1][1]["header"]["title"]["content"] == "⏳ 执行中 · Hermes Agent"
+        assert fake.updated
 
 
 @pytest.mark.asyncio

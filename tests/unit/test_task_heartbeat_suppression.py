@@ -225,7 +225,11 @@ def test_recognized_heartbeat_producer_drift_is_refused(before, after):
 def test_unrelated_senders_and_older_unknown_layout_remain_untouched():
     other = SOURCE.replace("_run_agent_notify_long_running", "_send_answer")
     assert patcher._apply_task_heartbeat_patch(other) == other
-    assert hook_runtime._hfc_classify_system_notice("⏳ Working — 3 min") is None
+    # LOCAL PATCH (PATCH-024): known ⏳ heartbeat classification remains covered with unrelated senders.
+    heartbeat = hook_runtime._hfc_classify_system_notice("⏳ Working — 3 min")
+    assert heartbeat is not None
+    assert heartbeat["notice_kind"] == "heartbeat"
+    assert heartbeat["notice_id"] == "heartbeat"
 
 
 def test_known_pre_generic_heartbeat_template_stays_supported():

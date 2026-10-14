@@ -114,25 +114,29 @@ async def test_working_heartbeat_has_no_timer_but_one_shot_status_does(runtime_r
 
 
 async def test_ordinary_adapter_answer_equal_to_template_is_not_disposable(runtime_route, monkeypatch):
+    # LOCAL PATCH (PATCH-024): an ordinary send matching the online notice now posts a card.
     sent = []
     class Adapter:
         async def _hfc_original_send(self, chat_id, content, **kwargs):
             sent.append(content)
             return SimpleNamespace(success=True, message_id="om_answer")
-    async def allowed(chat_id):
+    async def allowed(*_args, **_kwargs):
         return True
+    async def post(url, payload, timeout):
+        runtime_route.append((url, payload))
+        return {"ok": True, "applied": True, "delivery": {"outcome": "delivered"}}
     monkeypatch.setattr(runtime, "_hfc_direct_card_allowed_async", allowed)
-    monkeypatch.setattr(runtime, "_hfc_take_feishu_command_result_context", lambda **kwargs: None)
-    token = runtime._HFC_NATIVE_HANDOFF_CONTEXT.set(None)
-    try:
-        result = await runtime._hfc_send_with_native_command_result_card(
-            Adapter(), "oc_fixture", runtime._HFC_GATEWAY_ONLINE_TEXT,
-        )
-    finally:
-        runtime._HFC_NATIVE_HANDOFF_CONTEXT.reset(token)
+    monkeypatch.setattr(runtime, "_post_json_ordered_response", post)
+    result = await runtime._hfc_send_with_native_command_result_card(
+        Adapter(), "oc_fixture", runtime._HFC_GATEWAY_ONLINE_TEXT,
+    )
     assert result.success is True
-    assert sent == [runtime._HFC_GATEWAY_ONLINE_TEXT]
-    assert runtime_route == []
+    assert sent == []
+    assert len(runtime_route) == 1
+    assert runtime_route[0][1]["event"] == "system.notice"
+    assert runtime_route[0][1]["data"]["title"] == "Gateway 重启完成"
+    assert runtime_route[0][1]["data"]["notice_scope"] == "independent"
+    assert runtime_route[0][1]["data"]["notice_terminal"] is True
 
 
 def test_old_generation_cannot_discard_a_reregistered_message():

@@ -68,19 +68,30 @@ def wired(monkeypatch):
     return runner, registered, sent
 
 
-async def test_native_home_notice_retains_exact_topic_profile_and_bot_proof(wired):
+async def test_online_home_notice_uses_card_path_without_restart_recall_registration(wired, monkeypatch):
+    # LOCAL PATCH (PATCH-024): the home-online notice goes through system.notice, not text recall.
     runner, registered, sent = wired
     transport = SimpleNamespace(adapter=runner.adapter, is_relay=False)
+    posts = []
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def post(url, payload, timeout):
+        posts.append(payload)
+        return {"ok": True, "applied": True, "delivery": {"outcome": "delivered"}}
+
+    monkeypatch.setattr(runtime, "_hfc_direct_card_allowed_async", allowed)
+    monkeypatch.setattr(runtime, "_post_json_ordered_response", post)
     assert await runner._send_home_channel_message("feishu", SimpleNamespace(chat_id="oc_test",thread_id="omt_test"), transport, ONLINE, "failure")
-    assert len(sent) == len(registered) == 1
-    assert registered[0][1] == {
-        "notice_family":"restart",
-        "route":{"profile_id":"work", "chat_id":"oc_test", "conversation_id":"omt_test",
-                 "app_id_hash":sha256(b"cli_fixture").hexdigest()},
-    }
-    # An ordinary answer quoting the identical wording never inherits the producer.
+    assert sent == []
+    assert registered == []
+    assert len(posts) == 1
+    assert posts[0]["data"]["title"] == "Gateway 重启完成"
+    assert posts[0]["conversation_id"] == "omt_test"
+    # An ordinary send with identical wording is still a card, never restart-recall registration.
     assert (await runner.adapter.send("oc_test", ONLINE, metadata={"thread_id":"omt_test"})).success
-    assert len(sent) == 2 and len(registered) == 1
+    assert len(posts) == 2 and registered == []
 
 
 @pytest.mark.parametrize("text", [RESTART, SHUTDOWN])
@@ -120,15 +131,31 @@ def test_unknown_signature_is_not_wrapped():
     assert Runner._send_home_channel_message is original
 
 
-async def test_restart_requester_uses_colored_emoji_and_owned_route(wired):
-    runner,registered,sent=wired
+async def test_restart_requester_uses_card_path_and_owned_route(wired, monkeypatch):
+    # LOCAL PATCH (PATCH-024): restart requests resume via the green HFC card contract.
+    runner, registered, sent = wired
+    posts = []
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def post(url, payload, timeout):
+        posts.append(payload)
+        return {"ok": True, "applied": True, "delivery": {"outcome": "delivered"}}
+
+    monkeypatch.setattr(runtime, "_hfc_direct_card_allowed_async", allowed)
+    monkeypatch.setattr(runtime, "_post_json_ordered_response", post)
     assert (await runner._send_restart_notification()).success
-    assert sent[0][1]=='♻️ Gateway restarted successfully. Your session continues.'
-    assert registered[0][1]['notice_family']=='restart'
-    assert registered[0][1]['route']['conversation_id']=='omt_test'
+    assert sent == []
+    assert registered == []
+    assert len(posts) == 1
+    assert posts[0]["data"]["title"] == "Gateway 重启完成"
+    assert posts[0]["data"]["level"] == "success"
+    assert posts[0]["conversation_id"] == "omt_test"
+
     from hermes_feishu_card.notice_producers import RESTARTED
-    await runner.adapter.send('oc_test',RESTARTED)
-    assert sent[-1][1]==RESTARTED and len(registered)==1
+    assert (await runner.adapter.send("oc_test", RESTARTED)).success
+    assert len(posts) == 2 and registered == []
 
 
 @pytest.mark.parametrize('text,disposable',[

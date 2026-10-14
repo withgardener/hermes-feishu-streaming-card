@@ -55,6 +55,12 @@ def _context(runner, adapter, chat, thread, text):
 
 
 def notice_for_send(adapter, chat, text, metadata):
+    # LOCAL PATCH (PATCH-024, 2026-10-14): restart-completion lines (♻ restarted / ♻️ online)
+    # are cards now, so they must not take the plain-text producer path; returning None lets
+    # the send wrapper classify them into the green 「Gateway 重启完成」 card. Drain/shutdown
+    # warnings keep the upstream plain-text + record-only recall behaviour.
+    if text in {RESTARTED, RESTARTED.replace('♻', '♻️'), ONLINE}:
+        return None
     context = _CONTEXT.get()
     if context is None and isinstance(_DELIVERY.get(), dict):
         context = _DELIVERY.get().get('notice')

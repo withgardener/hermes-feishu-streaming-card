@@ -89,16 +89,22 @@ async def test_busy_ack_uses_the_event_profile_without_adapter_context(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_restart_send_failure_keeps_native_fallback():
+async def test_restart_send_failure_keeps_native_fallback(monkeypatch):
     class Adapter:
         async def _hfc_original_send(self, *args, **kwargs):
             return SimpleNamespace(success=False, error="temporary transport failure")
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(runtime, "_hfc_direct_card_allowed_async", allowed)
     result = await runtime._hfc_send_system_notice_card(
         Adapter(), chat_id="chat_fixture",
         content="♻️ Gateway restarted successfully. Your session continues.",
     )
     assert result.success is False
-    assert result.error == "delivery_disposition=native"
+    # LOCAL PATCH (PATCH-024): a card refusal uses the not_sent disposition, not plain-text routing.
+    assert result.error == "delivery_outcome=not_sent"
 
 
 @pytest.mark.parametrize("body", [
