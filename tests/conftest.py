@@ -56,12 +56,16 @@ INTENTIONAL_LOCAL_BEHAVIOUR = {
     "tests/unit/test_task_clarify_summary.py::test_task_keeps_argument_fallback_without_complete_current_process_detail": _PATCH_012,
     "tests/unit/test_task_clarify_summary.py::test_unknown_or_invalid_question_shape_uses_existing_fallback": _PATCH_012,
     "tests/unit/test_task_terminal_presentation.py::test_task_approval_stop_merges_only_event_notice": _PATCH_012,
+    # v5.0.0 (2026-10-15): the legacy_hide=False case asserts the content-area tool_activity_
+    # row is rendered; PATCH-012 hides it in every state. Passes on pristine v5.0.0.
+    "tests/unit/test_card_preview.py::test_expanded_completed_history_keeps_successful_tools_without_default_body_duplicates[False]": _PATCH_012,
 }
 
 
 def pytest_collection_modifyitems(config, items):
     for item in items:
         base = item.nodeid.split("[", 1)[0]
-        reason = INTENTIONAL_LOCAL_BEHAVIOUR.get(base)
+        # Exact parametrized ids win, so a patch can skip only the one case it changes.
+        reason = INTENTIONAL_LOCAL_BEHAVIOUR.get(item.nodeid) or INTENTIONAL_LOCAL_BEHAVIOUR.get(base)
         if reason:
             item.add_marker(pytest.mark.skip(reason=reason))
