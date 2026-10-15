@@ -3,10 +3,25 @@ from __future__ import annotations
 import pytest
 
 from hermes_feishu_card.events import SidecarEvent
-from hermes_feishu_card.lifecycle import CleanupPolicy, cleanup_runtime_state, session_cleanup_reason
-from hermes_feishu_card import server
+from hermes_feishu_card.lifecycle import (CleanupPolicy, CleanupState, cleanup_runtime_state,
+    cleanup_closed_controller, cleanup_orphan_message_lock, session_cleanup_reason)
+from hermes_feishu_card.metrics import SidecarMetrics
+from hermes_feishu_card.event_rules import active_session_key
+from dataclasses import FrozenInstanceError, fields, replace
+from types import SimpleNamespace
 from hermes_feishu_card import session as session_module
 from hermes_feishu_card.session import CardSession, InteractionState, ToolState
+
+
+def _state(_aliases=None, **overrides):
+    values = dict(sessions={}, aliases={}, message_locks={}, lock_users={},
+                  controllers={}, message_ids={}, bot_ids={}, card_configs={},
+                  summary_owners={}, summaries={}, interaction_owners={},
+                  interaction_results={}, metrics=SidecarMetrics(), diagnostics={})
+    values.update(overrides)
+    if _aliases is not None:
+        values["aliases"] = _aliases
+    return CleanupState(**values)
 
 
 def _session(*, status: str = "thinking", updated_at: float = 100.0) -> CardSession:
@@ -169,7 +184,7 @@ def test_card_session_timestamps_only_advance_for_accepted_events(monkeypatch):
 
 
 def test_cleanup_preserves_alias_reassigned_to_new_active_session():
-    app = server.create_app(object())
+    app = _state()
     old_key = "om_old"
     new_key = "om_new"
     old = _session(status="completed")
@@ -177,8 +192,8 @@ def test_cleanup_preserves_alias_reassigned_to_new_active_session():
     new = _session()
     new.updated_at = 3700.0
     new.answer_text = "active"
-    app[server.SESSIONS_KEY][old_key] = old
-    app[server.SESSIONS_KEY][new_key] = new
+    app.sessions[old_key] = old
+    app.sessions[new_key] = new
     class ReassignedAliases(dict):
         def __init__(self):
             super().__init__({"om_reply": new_key})
@@ -190,29 +205,167 @@ def test_cleanup_preserves_alias_reassigned_to_new_active_session():
                 return (("om_reply", old_key),)
             return super().items()
 
-    app[server.SESSION_ALIASES_KEY] = ReassignedAliases()
-    assert app[server.SESSION_ALIASES_KEY]["om_reply"] == new_key
+    app = replace(app, aliases=ReassignedAliases())
+    assert app.aliases["om_reply"] == new_key
 
     cleanup_runtime_state(app, now=3700.0)
 
-    assert old_key not in app[server.SESSIONS_KEY]
-    assert app[server.SESSION_ALIASES_KEY]["om_reply"] == new_key
+    assert old_key not in app.sessions
+    assert app.aliases["om_reply"] == new_key
 
 
 def test_cleanup_keeps_old_canonical_key_when_it_has_been_reassigned_as_alias():
-    app = server.create_app(object())
+    app = _state()
     old_key = "om_old"
     new_key = "om_new"
     old = _session(status="completed")
     old.updated_at = 100.0
     new = _session()
     new.answer_text = "active"
-    app[server.SESSIONS_KEY][old_key] = old
-    app[server.SESSIONS_KEY][new_key] = new
-    app[server.SESSION_ALIASES_KEY][old_key] = new_key
+    app.sessions[old_key] = old
+    app.sessions[new_key] = new
+    app.aliases[old_key] = new_key
 
     cleanup_runtime_state(app, now=3700.0)
 
-    assert old_key not in app[server.SESSIONS_KEY]
-    assert app[server.SESSION_ALIASES_KEY][old_key] == new_key
-    assert server._active_session_key(app, old_key) == new_key
+    assert old_key not in app.sessions
+    assert app.aliases[old_key] == new_key
+    assert active_session_key(app.sessions, app.aliases, old_key) == new_key
+
+
+def test_cleanup_view_borrows_references_and_freezes_only_the_binding():
+    state = _state()
+    other = _state(**{field.name: getattr(state, field.name) for field in fields(state)})
+    for field in fields(state):
+        assert getattr(other, field.name) is getattr(state, field.name)
+    state.sessions["key"] = _session()
+    assert other.sessions["key"] is state.sessions["key"]
+    with pytest.raises(FrozenInstanceError):
+        state.sessions = {}
+
+
+def test_cleanup_session_replaced_during_observation_is_preserved():
+    state = _state()
+    old, replacement = _session(status="completed"), _session()
+    state.sessions["key"] = old
+
+    def snapshot():
+        state.sessions["key"] = replacement
+        return {"closed": True, "task_active": False}
+
+    state.controllers["key"] = SimpleNamespace(snapshot=snapshot, close=lambda: None)
+    result = cleanup_runtime_state(state, 3700)
+    assert result.session_keys == ()
+    assert state.sessions["key"] is replacement
+    assert state.metrics.sessions_collected == 0
+
+
+def test_cleanup_runtime_preserves_controller_replaced_during_observation():
+    state = _state()
+    state.sessions["key"] = _session(status="completed")
+    replacement = SimpleNamespace(snapshot=lambda: {"closed": False, "task_active": False})
+    closed = []
+
+    def snapshot():
+        state.controllers["key"] = replacement
+        return {"closed": True, "task_active": False}
+
+    old = SimpleNamespace(snapshot=snapshot, close=lambda: closed.append("old"))
+    state.controllers["key"] = old
+    result = cleanup_runtime_state(state, 3700)
+    assert result.session_keys == ("key",)
+    assert result.controllers_collected == 0
+    assert state.controllers["key"] is replacement
+    assert closed == []
+
+
+def test_orphan_lock_replaced_during_locked_check_is_preserved():
+    state = _state()
+    replacement = SimpleNamespace(locked=lambda: False)
+
+    def locked():
+        state.message_locks["key"] = replacement
+        return False
+
+    old = SimpleNamespace(locked=locked)
+    state.message_locks["key"] = old
+    assert not cleanup_orphan_message_lock(state, "key", old)
+    assert state.message_locks["key"] is replacement
+
+
+@pytest.mark.parametrize("blocker", ["canonical_lock", "alias_lock", "canonical_user", "alias_user", "controller_active"])
+def test_cleanup_retains_terminal_owner_for_each_inflight_view(blocker):
+    state = _state()
+    state.sessions["key"] = _session(status="completed")
+    state.aliases["alias"] = "key"
+    if blocker.endswith("lock"):
+        key = "alias" if blocker.startswith("alias") else "key"
+        state.message_locks[key] = SimpleNamespace(locked=lambda: True)
+    elif blocker.endswith("user"):
+        state.lock_users["alias" if blocker.startswith("alias") else "key"] = 1
+    else:
+        state.controllers["key"] = SimpleNamespace(snapshot=lambda: {"closed": True, "task_active": True})
+    assert cleanup_runtime_state(state, 3700).session_keys == ()
+    assert "key" in state.sessions
+    assert state.aliases["alias"] == "key"
+    assert state.metrics.sessions_collected == 0
+
+
+def test_cleanup_order_and_history_preserve_unrelated_owners():
+    trace = []
+
+    class Traced(dict):
+        def __init__(self, label, values):
+            super().__init__(values)
+            self.label = label
+
+        def pop(self, key, default=None):
+            trace.append((self.label, key))
+            return super().pop(key, default)
+
+    state = _state(
+        sessions=Traced("sessions", {"key": _session(status="completed")}),
+        aliases=Traced("aliases", {"alias": "key"}),
+        message_locks=Traced("locks", {"key": SimpleNamespace(locked=lambda: False)}),
+        lock_users=Traced("users", {}),
+        summaries=Traced("summaries", {"card": "old", "newcard": "new"}),
+        summary_owners=Traced("summary_owners", {"card": "key", "newcard": "other"}),
+        interaction_results=Traced("receipts", {"approval": "old", "newapproval": "new"}),
+        interaction_owners=Traced("receipt_owners", {"approval": "key", "newapproval": "other"}),
+        message_ids=Traced("message_ids", {"key": "card"}),
+        bot_ids=Traced("bot_ids", {"key": "bot"}),
+        card_configs=Traced("configs", {"key": {}}),
+    )
+    def close():
+        trace.append(("close", "key"))
+        assert state.sessions == {}
+        assert state.summaries == {"newcard": "new"}
+        assert state.interaction_results == {"newapproval": "new"}
+        assert state.message_ids == state.bot_ids == state.card_configs == {}
+        assert state.metrics.sessions_collected == 0
+
+    state.controllers["key"] = SimpleNamespace(
+        snapshot=lambda: {"closed": True, "task_active": False}, close=close)
+    result = cleanup_runtime_state(state, 3700)
+    assert result.controllers_collected == 1
+    assert trace.index(("sessions", "key")) < trace.index(("aliases", "alias"))
+    assert trace.index(("summaries", "card")) < trace.index(("summary_owners", "card"))
+    assert trace.index(("receipts", "approval")) < trace.index(("receipt_owners", "approval"))
+    assert trace.index(("summary_owners", "card")) < trace.index(("receipt_owners", "approval")) < trace.index(("close", "key"))
+    assert state.metrics.sessions_collected == state.metrics.flush_controllers_collected == 1
+    for index in range(60):
+        state.sessions[f"private-{index}"] = _session(status="failed")
+    cleanup_runtime_state(state, 3700)
+    history = state.diagnostics["cleanup_history"]
+    assert len(history) == 50
+    assert all(set(row) == {"session_key_hash", "reason", "recorded_at"} for row in history)
+    assert "private-" not in str(history)
+
+
+def test_closed_controller_changed_before_cleanup_is_not_collected():
+    state = _state()
+    old = SimpleNamespace(snapshot=lambda: {"closed": True, "task_active": False})
+    replacement = SimpleNamespace(snapshot=lambda: {"closed": False, "task_active": False})
+    state.controllers["key"] = replacement
+    assert not cleanup_closed_controller(state, "key", old, now=100)
+    assert state.controllers["key"] is replacement

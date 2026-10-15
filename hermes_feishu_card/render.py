@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import copy
 from dataclasses import dataclass
 import html
@@ -11,10 +10,13 @@ import time as _time
 from collections.abc import Mapping
 from typing import Any, Dict, Literal, Optional
 
+from .display_redaction import (
+    KEY_VALUE_SECRET_RE, SECRET_FLAG_RE, URL_SECRET_RE, redact_tool_detail,
+)
 from .card_limits import CardLimitInspection, inspect_card_limits
 from .card_timeline import TERMINAL_TOOL_STATUSES
 from .approval_receipts import has_confirmed_approval_receipt
-from .config import card_width_config
+from .config_rules import card_width_config
 from .session import (
     CardSession,
     ToolState,
@@ -23,11 +25,12 @@ from .session import (
 )
 from .status import StatusConfig, resolve_display_status
 from .subscription_usage import uses_codex_subscription
+from .card_view import TASK_TEXT_SIZE_DEFAULTS, task_presentation
 from .presentation import (
-    apply_task_presentation, task_presentation, task_interaction_prompt,
-    task_button_label, task_answer_code_projection, TASK_TEXT_SIZE_DEFAULTS,
+    apply_task_presentation, task_interaction_prompt,
+    task_button_label, task_answer_code_projection,
 )
-from .native_tables import build_main_content_elements
+from .content_plan import plan_main_content, render_content_plan
 from .text import (
     TableOverflowResult,
     normalize_stream_text,
@@ -58,39 +61,7 @@ MODEL_COLOR_PREFIXES = (
 )
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-_REDACTABLE_TOOL_DETAIL_KEYS = (
-    "tenant_access_token",
-    "app_secret",
-    "chat_id",
-    "open_id",
-    "message_id",
-    "password",
-    "token",
-    "secret",
-)
-_TOOL_DETAIL_KEY_PATTERN = (
-    r"[A-Za-z0-9_]*(?:"
-    + "|".join(re.escape(key) for key in _REDACTABLE_TOOL_DETAIL_KEYS)
-    + r")[A-Za-z0-9_]*"
-)
-_TOOL_DETAIL_REDACTION_RE = re.compile(
-    r"(?i)([\"']?"
-    + _TOOL_DETAIL_KEY_PATTERN
-    + r"[\"']?\s*[:=]\s*)([^\s,;&}\]]+)"
-)
-_TOOL_DETAIL_QUOTED_REDACTION_RE = re.compile(
-    r"(?is)([\"']?"
-    + _TOOL_DETAIL_KEY_PATTERN
-    + r"[\"']?\s*[:=]\s*)([\"'])(.*?)(\2)"
-)
-_TOOL_DETAIL_REDACTED = "[REDACTED]"
 _RUNTIME_FENCE_RE = re.compile(r"```[A-Za-z0-9_-]*")
-_RUNTIME_SECRET_FLAG_RE = re.compile(
-    r"(?i)(--(?:token|password|secret|api-key|app-secret)(?:=|\s+))([^\s]+)"
-)
-_RUNTIME_URL_SECRET_RE = re.compile(
-    r"(?i)([?&](?:token|password|secret|api_key|api-key|app_secret)=)([^&#\s]+)"
-)
 _TOOL_DURATION_LINE_RE = re.compile(r"^耗时:\s*(.+?)\s*$")
 
 
@@ -1238,9 +1209,9 @@ def _sanitize_runtime_header(
     normalized = normalize_stream_text(str(text or ""))
     normalized = _RUNTIME_FENCE_RE.sub("", normalized)
     normalized = " ".join(normalized.split())
-    normalized = _redact_tool_detail(normalized)
-    normalized = _RUNTIME_SECRET_FLAG_RE.sub(r"\1[REDACTED]", normalized)
-    normalized = _RUNTIME_URL_SECRET_RE.sub(r"\1[REDACTED]", normalized)
+    normalized = redact_tool_detail(normalized)
+    normalized = SECRET_FLAG_RE.sub(r"\1[REDACTED]", normalized)
+    normalized = URL_SECRET_RE.sub(r"\1[REDACTED]", normalized)
     if max_chars <= 0 or len(normalized) <= max_chars:
         return normalized
     return normalized[: max_chars - 1].rstrip() + "…"
@@ -1268,32 +1239,12 @@ def _render_main_content_elements(
     table_overflow_mode: str = "compact",
     native_tables: bool = False,
 ) -> list[Dict[str, Any]]:
-    """Render the body, optionally as native card tables plus Markdown.
-
-    ``native_tables`` swaps body Markdown tables for the card's native ``table``
-    element (see :mod:`hermes_feishu_card.native_tables`); when no table can be
-    converted the Markdown layout below is used unchanged.
-    """
-    main_text = transform_table_overflow(
-        main_text,
-        mode=table_overflow_mode,
-    ).text
-    if native_tables:
-        native_elements = build_main_content_elements(
-            main_text,
-            chunk_chars=MAIN_CONTENT_CHUNK_CHARS,
-            text_size=text_size,
-        )
-        if native_elements is not None:
-            return native_elements
-    chunks = split_markdown_blocks(main_text, MAIN_CONTENT_CHUNK_CHARS)
-    elements = []
-    for index, chunk in enumerate(chunks):
-        element_id = "main_content" if index == 0 else f"main_content_{index}"
-        element = {"tag": "markdown", "element_id": element_id, "content": chunk}
-        _set_text_size(element, text_size)
-        elements.append(element)
-    return elements
+    """Render a complete body projection; final admission is whole-card based."""
+    plan = plan_main_content(
+        main_text, table_overflow_mode=table_overflow_mode,
+        native_tables=native_tables, chunk_chars=MAIN_CONTENT_CHUNK_CHARS,
+    )
+    return render_content_plan(plan, text_size=text_size)
 
 
 def _interaction_mention_content(
@@ -1533,13 +1484,13 @@ def mask_approval_scope(text: str) -> str:
     """
     if not text:
         return text
-    masked = _RUNTIME_SECRET_FLAG_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", str(text))
-    masked = _RUNTIME_URL_SECRET_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
+    masked = SECRET_FLAG_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", str(text))
+    masked = URL_SECRET_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
     masked = _APPROVAL_SCOPE_ASSIGNMENT_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
     masked = _APPROVAL_SCOPE_BEARER_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
     masked = _APPROVAL_SCOPE_URL_USERINFO_RE.sub(rf"\1\2:{_APPROVAL_SCOPE_REDACTED}@", masked)
     masked = _APPROVAL_SCOPE_TOKEN_LITERAL_RE.sub(_APPROVAL_SCOPE_REDACTED, masked)
-    return _TOOL_DETAIL_REDACTION_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
+    return KEY_VALUE_SECRET_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
 
 
 def _interaction_review_elements(interaction: Any, *, presentation: str = "classic") -> list[Dict[str, Any]]:
@@ -2163,6 +2114,9 @@ def _tool_terminal_pill(tool: ToolState) -> tuple[str, str]:
     status = str(tool.status or "").strip().lower()
     if status in {"display_handoff", "display_receipt"}:
         return ("已转入续答" if status == "display_handoff" else "已记录"), "neutral"
+    if status in {"blocked", "timeout", "unverified"}:
+        return {"blocked": ("已拒绝", "orange"), "timeout": ("已超时", "orange"),
+                "unverified": ("结果待核对", "neutral")}[status]
     if status in {"failed", "error", "cancelled", "canceled"}:
         return _FAILED_TOOL_PILL
     if status == "interrupted":
@@ -2291,7 +2245,7 @@ def _render_timeline_elements(
             )
         elif item.kind == "tool":
             full_detail, duration = _split_tool_timeline_detail(
-                _redact_tool_detail(item.detail)
+                redact_tool_detail(item.detail)
             )
             detail = _limit_text(
                 full_detail,
@@ -2307,7 +2261,7 @@ def _render_timeline_elements(
                     and detail == full_detail):
                 tool = session.tools.get(item.tool_id)
                 current_detail = _split_tool_timeline_detail(
-                    _redact_tool_detail(tool.detail)
+                    redact_tool_detail(tool.detail)
                 )[0] if tool is not None else None
                 if current_detail == full_detail:
                     rendered_tool_ids.add(item.tool_id)
@@ -2409,7 +2363,7 @@ def _render_timeline_elements(
     return reasoning_elements
 
 
-_TIMELINE_PANEL_TITLE = "▸ 思考过程（点开查看）"
+_TIMELINE_PANEL_TITLE = "思考过程（点按展开/收起）"
 
 
 def _timeline_panel(
@@ -2418,15 +2372,12 @@ def _timeline_panel(
     *,
     expanded: bool,
 ) -> Dict[str, Any]:
-    """The collapsible 思考过程 panel. Its header must LOOK tappable.
+    """Keep the toggle discoverable without claiming a stale client state.
 
-    Maintainer note (contract change): the header used to read just "思考过程" — plain prose with
-    no affordance at all, so the user reported they could not tell the panel opens
-    ("思考过程这几个字目前看不出来 可以点开折叠"). The title now carries a leading triangle and an
-    explicit hint. Deliberately text-only: Feishu rejects a standalone text_tag element
-    (230099/200621) and no collapsible_panel header in this codebase has ever sent an `icon`, so a
-    new element type would be unverified against the live API — a plain_string hint cannot break
-    the card.
+    Feishu toggles the panel locally without rewriting this plain-text header.
+    A fixed directional triangle or open-only hint becomes incorrect after a
+    toggle, including when the task preset starts expanded. Preserve a neutral
+    hint in both states and the existing supported text-only header schema.
     """
     return {
         "tag": "collapsible_panel",
@@ -2517,6 +2468,10 @@ def _render_tool_timeline_row(
     }:
         color = "green"
         headline = f"✓ **{safe_title}**{meta_suffix}"
+    elif normalized_status in {"blocked", "timeout", "unverified"}:
+        color = "grey" if normalized_status == "unverified" else "orange"
+        label = {"blocked": "已拒绝", "timeout": "已超时", "unverified": "结果待核对"}[normalized_status]
+        headline = f"⊘ **{safe_title}**{meta_suffix} · {label}"
     elif normalized_status in {"failed", "error", "失败", "已失败", "错误"}:
         color = "red"
         headline = f"✕ **{safe_title}**{meta_suffix} · 失败"
@@ -2867,16 +2822,17 @@ def _render_footer(
     #     # (it used to be appended last, after ctx); it carries a hash, per the user's request.
     #     selected.append(f"工具 #{session.tool_count}")
     fields = DEFAULT_FOOTER_FIELDS if footer_fields is None else footer_fields
-    if compact:
-        available = {
-            "duration": duration > 0, "model": model != "Unknown",
-            "input_tokens": "input_tokens" in tokens,
-            "output_tokens": "output_tokens" in tokens,
-            "context": max_context > 0, "subscription_usage": bool(subscription_usage),
-            # LOCAL PATCH (PATCH-007): the task preset renders compact; keep cache_rate visible.
-            "cache_rate": bool(cache_rate),
-        }
-        fields = [field for field in fields if available.get(field, False)]
+    available = {
+        "duration": duration > 0, "model": model != "Unknown",
+        "input_tokens": "input_tokens" in tokens,
+        "output_tokens": "output_tokens" in tokens,
+        "context": max_context > 0 and "used_tokens" in context,
+        "subscription_usage": bool(subscription_usage),
+        # LOCAL PATCH (PATCH-007): upstream v5 filters every footer (not only the
+        # compact task preset) by availability; keep the rolling cache_rate visible.
+        "cache_rate": bool(cache_rate),
+    }
+    fields = [field for field in fields if available.get(field, False)]
     for field in fields:
         value = values.get(field)
         if value:
@@ -2941,60 +2897,3 @@ def _limit_text(text: str, limit: int, *, overflow_label: str = "内容已折叠
         return text
     suffix = f"\n> {overflow_label}"
     return text[: max(0, limit - len(suffix))].rstrip() + suffix
-
-
-def _redact_tool_detail(text: str) -> str:
-    if not text:
-        return text
-    structured = _parse_tool_detail(text)
-    if structured is not None:
-        return _dump_redacted_tool_detail(structured)
-    redacted = _TOOL_DETAIL_QUOTED_REDACTION_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}{_TOOL_DETAIL_REDACTED}{match.group(4)}",
-        text,
-    )
-    redacted = _TOOL_DETAIL_REDACTION_RE.sub(r"\1[REDACTED]", redacted)
-    # CLI-flag and query-string shapes (--password secret, ?token=abc) slip past the
-    # key/value scanners above. The header sanitizer already sweeps them; tool detail is
-    # rendered in the timeline and in the tool-activity rows too, so sweep here as well.
-    redacted = _RUNTIME_SECRET_FLAG_RE.sub(r"\1[REDACTED]", redacted)
-    return _RUNTIME_URL_SECRET_RE.sub(r"\1[REDACTED]", redacted)
-
-
-def _parse_tool_detail(text: str) -> tuple[str, Any] | None:
-    try:
-        return ("json", _redact_tool_detail_value(json.loads(text)))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
-    try:
-        return ("python", _redact_tool_detail_value(ast.literal_eval(text)))
-    except (SyntaxError, ValueError):
-        return None
-
-
-def _redact_tool_detail_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[Any, Any] = {}
-        for key, item in value.items():
-            if _is_sensitive_tool_detail_key(str(key)):
-                redacted[key] = _TOOL_DETAIL_REDACTED
-            else:
-                redacted[key] = _redact_tool_detail_value(item)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_tool_detail_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_tool_detail_value(item) for item in value)
-    return value
-
-
-def _dump_redacted_tool_detail(parsed: tuple[str, Any]) -> str:
-    format_name, value = parsed
-    if format_name == "json":
-        return json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
-    return repr(value)
-
-
-def _is_sensitive_tool_detail_key(key: str) -> bool:
-    lowered = key.lower()
-    return any(part in lowered for part in _REDACTABLE_TOOL_DETAIL_KEYS)

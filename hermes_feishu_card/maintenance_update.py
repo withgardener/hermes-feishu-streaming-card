@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .runtime_ownership import python_executable_identity as _python_executable_identity
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
@@ -12,6 +14,10 @@ import sys
 import time
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
+from .maintenance_evidence import (
+    DrainEvidence, DrainProof,
+    active_maintenance_sessions as _active_maintenance_sessions,
+)
 from .persistent_service import persistent_sidecar_active
 from .install.detect import detect_hermes
 from .install.runtime_python import PMRuntimeRefused, pm_managed_runtime_python
@@ -1567,19 +1573,6 @@ def _safe_health(fetch: HealthFetcher) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def _active_maintenance_sessions(health: dict[str, object]) -> int:
-    values = (
-        health.get("maintenance_active_sessions", 0),
-        health.get("gateway_active_sessions", 0),
-    )
-    counts = [
-        value
-        for value in values
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
-    ]
-    return max(counts, default=0)
-
-
 def _wait_for_drain(
     fetch: HealthFetcher,
     *,
@@ -1588,48 +1581,11 @@ def _wait_for_drain(
     monotonic: Callable[[], float],
 ) -> bool:
     deadline = monotonic() + max(0.0, timeout_seconds)
-    zero_sequence: int | None = None
-    zero_owner: str | None = None
+    proof = DrainProof()
     while True:
         health = _safe_health(fetch)
-        readiness = health.get("readiness")
-        drain = health.get("maintenance_drain")
-        sequence = readiness.get("last_sequence") if isinstance(readiness, dict) else None
-        heartbeat_age = (
-            readiness.get("last_seen_age_seconds")
-            if isinstance(readiness, dict)
-            else None
-        )
-        owner = readiness.get("runtime_id_hash") if isinstance(readiness, dict) else None
-        gateway_active = health.get("gateway_active_sessions")
-        evidence_ready = (
-            isinstance(drain, dict)
-            and drain.get("active") is True
-            and drain.get("valid") is True
-            and isinstance(readiness, dict)
-            and readiness.get("status") == "ready"
-            and isinstance(owner, str) and bool(owner)
-            and isinstance(sequence, int)
-            and not isinstance(sequence, bool)
-            and sequence >= 1
-            and isinstance(heartbeat_age, int)
-            and not isinstance(heartbeat_age, bool)
-            and 0 <= heartbeat_age <= 30
-            and isinstance(gateway_active, int)
-            and not isinstance(gateway_active, bool)
-            and gateway_active >= 0
-            and readiness.get("admission_draining") is True
-            and readiness.get("active_work_count_complete") is True
-            and readiness.get("drain_home_verified") is True
-        )
-        if evidence_ready and _active_maintenance_sessions(health) == 0:
-            if zero_sequence is not None and owner == zero_owner and sequence > zero_sequence:
-                return True
-            zero_sequence = sequence
-            zero_owner = owner
-        else:
-            zero_sequence = None
-            zero_owner = None
+        if proof.observe(DrainEvidence.from_health(health)):
+            return True
         if monotonic() >= deadline:
             return False
         sleep(min(1.0, max(0.0, deadline - monotonic())))
@@ -1690,17 +1646,6 @@ def _wait_for_ready_health(
         sleep(min(1.0, max(0.0, deadline - monotonic())))
 
 
-def _python_executable_identity(executable: Path) -> str:
-    path = Path(executable).expanduser()
-    try:
-        canonical_parent = path.parent.resolve(strict=False)
-    except (OSError, RuntimeError):
-        canonical_parent = path.parent.absolute()
-    canonical = os.path.normcase(str(canonical_parent / path.name))
-    material = b"hermes-feishu-streaming-card:python-executable:v1\0" + os.fsencode(
-        canonical
-    )
-    return f"python-sha256:{hashlib.sha256(material).hexdigest()}"
 
 
 def _cli_command(

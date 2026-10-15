@@ -59,7 +59,7 @@ async def test_focused_http_keeps_failed_activity_and_legacy_overrides(terminal,
         assert inspect_card_limits(live).safe
         assert "LIVE_THINKING" not in "\n".join(e.get("content", "") for e in live["body"]["elements"])
         panel = next(e for e in live["body"]["elements"] if e.get("element_id") == "auxiliary_timeline")
-        assert panel["expanded"] is False
+        assert panel["expanded"] is (preset == "task")
         assert (await http.post("/events", json=event("tool.updated", 2, {
             "tool_id": "terminal-1", "name": "terminal", "status": "running", "detail": "verify latest result",
         }))).status == 200

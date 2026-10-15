@@ -1,5 +1,16 @@
 # Changelog
 
+## v5.0.0 — 2026-10-15
+
+- Add opt-in task reading, continuation history folding, and verified continuation navigation. Resolve missing IM positions with one bounded exact-message lookup after confirmed delivery.
+- Preserve native interaction authority while displaying matched approval denials and natural clarify timeouts, including Hermes' specialized clarify executor. Keep confirmed clarification cards from duplicating native questions.
+- Restore observed per-turn model/provider, elapsed time, token and context footer data through the actual Gateway delivery chain.
+- Separate event, display, configuration, lifecycle and installer responsibilities while retaining identity checks, atomic ownership, fail-open boundaries and exact restore.
+- Expose loaded versus next-load reading configuration, minimal YAML and offline preview. Keep native tables opt-in with complete Markdown fallback.
+
+See [Chinese release notes](docs/release-notes-v5.0.0.md) and [English release notes](docs/release-notes-v5.0.0.en.md) for compatibility and verification boundaries.
+
+
 ## v4.7.7 — 2026-10-12
 
 Add opt-in native body tables (PR #391, @ywarmy). Preserve oversized headers and cells by falling back to the complete Markdown table before native conversion. Preserve indivisible Markdown tables instead of replacing them with fold notices; final payload limits still trigger the existing full-content handoff. See [release notes](docs/release-notes-v4.7.7.md).

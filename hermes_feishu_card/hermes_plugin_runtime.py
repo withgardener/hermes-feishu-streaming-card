@@ -9,9 +9,9 @@ from hashlib import sha256
 import hmac
 from math import isfinite
 import atexit
+import asyncio
 import json
 import os
-import queue
 import re
 import secrets
 import threading
@@ -21,16 +21,20 @@ from typing import Any
 from urllib import parse, request
 
 from . import __version__
-from .event_auth import sign_event_request
+from .turn_metrics import TurnMetrics, metric_label
+from .event_auth import sign_event_request, sign_sidecar_request
+from .interaction_rules import runtime_admission_fingerprint
 from .events import completion_turn_outcome
 from .operations_transport import read_transport_root_secret
 from .profile_sources import TRUSTED_PROFILE_SOURCES
 from .runtime_control import RuntimeControlLease, acquire_runtime_control
 from .runtime_interaction_transport import RuntimeInteractionListener
+# Existing import paths remain available; sequencing has one implementation.
+from .turn_events import ObserverEvent, TurnEventCoordinator
 
 
 OFFICIAL_HOOKS = (
-    "pre_llm_call", "post_llm_call", "on_session_end",
+    "pre_llm_call", "post_llm_call", "post_api_request", "on_session_end",
     "on_session_reset", "on_session_finalize", "pre_tool_call",
     "post_tool_call", "pre_approval_request", "post_approval_response",
     "subagent_start", "subagent_stop",
@@ -38,6 +42,7 @@ OFFICIAL_HOOKS = (
 
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 DEFAULT_EVENT_TIMEOUT_SECONDS = 0.8
+DEFAULT_TERMINAL_TIMEOUT_SECONDS = 10.0
 MAX_EVENT_REQUEST_BYTES = 256 * 1024
 MAX_EVENT_RESPONSE_BYTES = 64 * 1024
 MAX_EVENT_JSON_DEPTH = 16
@@ -106,7 +111,23 @@ class SignedEventTransport:
             requested_timeout = float(timeout_seconds)
             if not isfinite(requested_timeout) or requested_timeout <= 0:
                 return None
-            timeout = min(requested_timeout, self._timeout_seconds)
+            # Admission waits for delivered UI, just as final delivery waits
+            # for PATCH. Truncating either ACK to the observer budget can send
+            # native text after a card has already reached the user.
+            data = payload.get("data")
+            admission = data.get("_hfc_runtime_admission") if type(data) is dict else None
+            waits_for_admission = (
+                payload.get("event") == "interaction.requested"
+                and payload.get("producer") == "patch"
+                and type(admission) is dict
+                and admission.get("protocol") == "hfc-runtime-interaction-v1"
+            )
+            timeout_cap = (
+                DEFAULT_TERMINAL_TIMEOUT_SECONDS
+                if waits_for_admission or payload.get("event") in ("message.completed", "message.failed")
+                else self._timeout_seconds
+            )
+            timeout = min(requested_timeout, timeout_cap)
             headers = {"Content-Type": "application/json"}
             headers.update(sign_event_request(secret, body))
             req = request.Request(
@@ -136,6 +157,76 @@ class SignedEventTransport:
             return value
         except Exception:
             return None
+
+
+    def confirm_interaction_delivery(self, payload: dict[str, object], timeout_seconds: float) -> bool:
+        """Recover a lost ACK with bounded authenticated reads, never a second POST."""
+        data = payload.get("data")
+        if type(data) is not dict:
+            return False
+        interaction_id = data.get("interaction_id")
+        descriptor = data.get("_hfc_runtime_admission")
+        if type(interaction_id) is not str or not 0 < len(interaction_id) <= 256 or type(descriptor) is not dict:
+            return False
+        fingerprint = runtime_admission_fingerprint(descriptor)
+        if not fingerprint:
+            return False
+        try:
+            budget = float(timeout_seconds)
+            if not isfinite(budget) or budget <= 0:
+                return False
+            # This synchronous admission runs in the original tool callback.
+            # Never nest/block an event loop or leave a detached worker behind.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                return False
+            return asyncio.run(self._confirm_interaction_delivery_async(
+                interaction_id, fingerprint, min(budget, 3.0)
+            ))
+        except Exception:
+            return False
+
+    async def _confirm_interaction_delivery_async(
+        self, interaction_id: str, fingerprint: str, budget: float
+    ) -> bool:
+        import aiohttp
+
+        path = "/interactions/" + parse.quote(interaction_id, safe="") + "/delivery"
+        url = self.event_url.removesuffix("/events") + path
+
+        async def poll() -> bool:
+            async with aiohttp.ClientSession(trust_env=False) as client:
+                while True:
+                    secret = self._secret_reader()
+                    if type(secret) is not bytes or len(secret) != 32:
+                        return False
+                    headers = sign_sidecar_request(secret, "GET", path, b"")
+                    try:
+                        async with client.get(
+                            url, headers=headers, allow_redirects=False,
+                            timeout=aiohttp.ClientTimeout(total=budget),
+                        ) as response:
+                            raw = bytearray()
+                            async for chunk in response.content.iter_chunked(8192):
+                                raw.extend(chunk)
+                                if len(raw) > MAX_EVENT_RESPONSE_BYTES:
+                                    return False
+                            if 200 <= response.status < 300:
+                                value = json.loads(raw.decode("utf-8"))
+                                if (type(value) is dict and value.get("ok") is True
+                                        and value.get("interaction_id") == interaction_id
+                                        and value.get("runtime_admission_fingerprint") == fingerprint):
+                                    return True
+                    except (aiohttp.ClientError, ValueError):
+                        pass
+                    await asyncio.sleep(0.1)
+        try:
+            return await asyncio.wait_for(poll(), timeout=budget)
+        except asyncio.TimeoutError:
+            return False
 
 
 def _is_bounded_ordinary_json_object(value: object) -> bool:
@@ -271,10 +362,24 @@ class IngressBinding:
 
 
 @dataclass
+class _ClarifyToolObservation:
+    tool_call_id: str
+    thread_id: int
+    fingerprint: str
+    active: bool = True
+    ambiguous: bool = False
+
+
+@dataclass
 class TurnBinding:
     ingress: IngressBinding
     turn_id: str
     _state: TurnState = field(default=TurnState.PENDING_START, init=False, repr=False, compare=False)
+    # Display-only outcomes from matched original interaction callbacks, never authority.
+    _approval_tool_outcomes: dict[str, str] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _approval_outcome_overflow: bool = field(default=False, init=False, repr=False, compare=False)
+    _clarify_tool_calls: dict[str, _ClarifyToolObservation] = field(default_factory=dict, init=False, repr=False, compare=False)
+    metrics: TurnMetrics | None = field(default=None, init=False, repr=False, compare=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
 
     @property
@@ -329,142 +434,6 @@ class TurnBinding:
                 return False
             self._state = TurnState.TERMINAL
             return True
-
-
-@dataclass(frozen=True)
-class ObserverEvent:
-    sequence: int
-    producer: str
-    payload: dict[str, object]
-
-
-class TurnEventCoordinator:
-    """Allocate one turn-local sequence and bound asynchronous observer work."""
-
-    _PRODUCERS = frozenset({"plugin", "patch", "legacy-patch"})
-    _WORKER_POLL_SECONDS = 0.05
-    _CLOSE_JOIN_SECONDS = 0.1
-
-    def __init__(
-        self,
-        turn_id: str,
-        *,
-        max_pending: int = 64,
-        deliver: Callable[[ObserverEvent], None] | None = None,
-        start_worker: bool = True,
-    ) -> None:
-        if not self._is_nonblank(turn_id):
-            raise ValueError("turn_id must be nonblank")
-        if not isinstance(max_pending, int) or isinstance(max_pending, bool) or max_pending <= 0:
-            raise ValueError("max_pending must be a positive integer")
-        self.turn_id = turn_id
-        self._next = 0
-        self._barrier: int | None = None
-        self._terminal_sequence: int | None = None
-        self._closed = False
-        self._lock = Lock()
-        self._queue: queue.Queue[ObserverEvent] = queue.Queue(maxsize=max_pending)
-        self._deliver = deliver or (lambda event: None)
-        self._worker: threading.Thread | None = None
-        if start_worker:
-            self._worker = threading.Thread(
-                target=self._deliver_observer_events,
-                name="hfc-turn-observer",
-                daemon=True,
-            )
-            self._worker.start()
-
-    def next_sequence(self, producer: str) -> int:
-        self._validate_producer(producer)
-        with self._lock:
-            value, self._next = self._next, self._next + 1
-            return value
-
-    def close_terminal_barrier(self) -> int:
-        with self._lock:
-            if self._barrier is None:
-                self._barrier = self._next - 1
-            return self._barrier
-
-    def next_terminal_sequence(self) -> int:
-        with self._lock:
-            if self._barrier is None:
-                raise ValueError("terminal barrier is not closed")
-            if self._terminal_sequence is not None:
-                return self._terminal_sequence
-            value, self._next = self._next, self._next + 1
-            self._terminal_sequence = value
-            self._closed = True
-            return value
-
-    def event_id(self, kind: str, *, item_id: str = "", phase: str = "") -> str:
-        if kind in {"started", "completed", "failed"}:
-            return f"turn:{self.turn_id}:{kind}"
-        if kind not in {"tool", "approval", "subagent"} or not self._is_nonblank(item_id):
-            raise ValueError("invalid event identity")
-        if phase not in {"started", "terminal"}:
-            raise ValueError("invalid event phase")
-        return f"{kind}:{self.turn_id}:{item_id}:{phase}"
-
-    def submit_observer(
-        self,
-        payload: dict[str, object],
-        *,
-        producer: str,
-        event_id_for_sequence: Callable[[int], str] | None = None,
-    ) -> bool:
-        self._validate_producer(producer)
-        with self._lock:
-            if self._closed or self._barrier is not None:
-                return False
-            sequence, self._next = self._next, self._next + 1
-            event = ObserverEvent(sequence, producer, dict(payload, sequence=sequence))
-            if event_id_for_sequence is not None:
-                event.payload["event_id"] = event_id_for_sequence(sequence)
-            try:
-                self._queue.put_nowait(event)
-            except queue.Full:
-                return False
-            return True
-
-    def drain_before_terminal(self, timeout_seconds: float) -> None:
-        deadline = monotonic() + max(0.0, timeout_seconds)
-        with self._lock:
-            self._closed = True
-        while self._queue.unfinished_tasks and monotonic() < deadline:
-            threading.Event().wait(0.001)
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            worker = self._worker
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=self._CLOSE_JOIN_SECONDS)
-
-    def _deliver_observer_events(self) -> None:
-        while True:
-            try:
-                event = self._queue.get(timeout=self._WORKER_POLL_SECONDS)
-            except queue.Empty:
-                with self._lock:
-                    if self._closed:
-                        return
-                continue
-            try:
-                self._deliver(event)
-            except Exception:
-                pass
-            finally:
-                self._queue.task_done()
-
-    @staticmethod
-    def _is_nonblank(value: object) -> bool:
-        return isinstance(value, str) and bool(value.strip())
-
-    @classmethod
-    def _validate_producer(cls, producer: object) -> None:
-        if producer not in cls._PRODUCERS:
-            raise ValueError("unknown producer")
 
 
 class IngressBindingRegistry:
@@ -674,7 +643,7 @@ class PluginRuntime:
         post: Callable[[dict[str, object], float], object],
         now: Callable[[], float] = time,
         observer_timeout_seconds: float = 0.8,
-        terminal_timeout_seconds: float = 10.0,
+        terminal_timeout_seconds: float = DEFAULT_TERMINAL_TIMEOUT_SECONDS,
         max_pending_observers: int = 64,
     ) -> None:
         if not callable(post) or not callable(now):
@@ -752,6 +721,32 @@ class PluginRuntime:
             turn = self._turns.get(turn_id) if self._exact_nonblank(turn_id) else None
         return turn.state if turn is not None else None
 
+    def progress_owner_live(self) -> bool:
+        with self._lock:
+            return not self._closed
+
+    def owns_native_progress(
+        self, turn_id: object, session_key: object, generation: object,
+        chat_id: object, profile_id: object, thread_id: object,
+    ) -> bool:
+        """Consult the existing accepted turn, never claim another delivery path."""
+        if not all(self._exact_nonblank(value) for value in (
+            turn_id, session_key, generation, chat_id, profile_id,
+        )) or type(thread_id) is not str:
+            return False
+        with self._lock:
+            self._expire_locked(self._now())
+            turn = self._turns.get(turn_id)
+            return bool(
+                turn is not None
+                and turn.state is TurnState.CARD_ACTIVE
+                and turn.ingress.gateway_session_key == session_key
+                and turn.ingress.generation == generation
+                and turn.ingress.chat_id == chat_id
+                and turn.ingress.profile_id == profile_id
+                and turn.ingress.thread_id == thread_id
+            )
+
     def submit_patch_delta(
         self,
         turn_id: object,
@@ -794,8 +789,8 @@ class PluginRuntime:
                     event=event_name,
                     event_id="",
                     producer="patch",
-                    phase="delta",
-                    data={"text": text, "mode": mode},
+                    phase="update",
+                    data=self._bound_event_data(turn, {"text": text, "mode": mode}),
                 )
                 return coordinator.submit_observer(
                     payload,
@@ -837,7 +832,7 @@ class PluginRuntime:
                     event_id="",
                     producer="patch",
                     phase="started",
-                    data={
+                    data=self._bound_event_data(turn, {
                         "notice_kind": "context-compaction",
                         "notice_id": "context-compaction:active",
                         "notice_scope": "session",
@@ -847,7 +842,7 @@ class PluginRuntime:
                         "content": "正在总结较早的对话，完成后会继续当前任务。",
                         "create_session": True,
                         "display_status": "in_progress",
-                    },
+                    }),
                 )
                 return coordinator.submit_observer(
                     payload,
@@ -1119,6 +1114,135 @@ class PluginRuntime:
         except Exception:
             return None
 
+    def _record_clarify_tool_call(self, kwargs: dict[str, object]) -> None:
+        if kwargs.get("tool_name") != "clarify":
+            return
+        args = kwargs.get("args")
+        call = kwargs.get("tool_call_id")
+        if (type(args) is not dict or not self._exact_nonblank(call)
+                or not self._exact_nonblank(kwargs.get("turn_id"))):
+            return
+        question = args.get("question")
+        choices = args.get("choices")
+        multiple = args.get("multi_select", False)
+        # Only the canonical tool's unambiguous string inputs are recognized.
+        # Unsupported choice shapes keep the existing unknown/fail-open display.
+        if (type(question) is not str or not question.strip() or type(multiple) is not bool
+                or (choices is not None and (type(choices) is not list
+                    or any(type(choice) is not str for choice in choices)))):
+            return
+        offered = [choice.strip() for choice in (choices or []) if choice.strip()][:4]
+        fingerprint = sha256((question.strip() + "\0" + repr(offered)
+                              + "\0" + str(multiple)).encode("utf-8")).hexdigest()
+        observation = _ClarifyToolObservation(call, threading.get_ident(), fingerprint)
+        with self._lock:
+            turn = self._turns.get(kwargs.get("turn_id"))
+            if (self._closed or turn is None or not turn.accepts_observer_events
+                    or kwargs.get("session_id") != turn.ingress.session_id
+                    or self._card_active_coordinator_locked(turn.turn_id) is None):
+                return
+            calls = turn._clarify_tool_calls
+            if call in calls:
+                current = calls[call]
+                if (current.thread_id != observation.thread_id
+                        or current.fingerprint != observation.fingerprint):
+                    current.ambiguous = True
+                return
+            if len(calls) >= 128:
+                return
+            # A nested/overlapping call on one execution thread is ambiguous.
+            overlapping = [key for key, value in calls.items()
+                           if value.active and value.thread_id == observation.thread_id]
+            for key in overlapping:
+                calls[key].ambiguous = True
+            observation.ambiguous = bool(overlapping)
+            calls[call] = observation
+
+    def clarify_tool_call_for_wait(
+        self, session_identity, turn_id, interaction_id, fingerprint, pending_handle,
+    ):
+        """Read an exact official pre-tool observation, never choose a recent call."""
+        with self._lock:
+            key = self._patch_interaction_key_locked(
+                "clarify", session_identity, turn_id, interaction_id, fingerprint,
+            )
+            state = self._patch_interactions.get(key)
+            turn = self._turns.get(turn_id)
+            if (self._closed or turn is None or not turn.accepts_observer_events
+                    or turn.ingress.gateway_session_key != session_identity
+                    or type(state) is not _PatchInteraction or not state.hfc_owned
+                    or state.pending_handle is not pending_handle
+                    or state.turn_digest in self._interaction_cleanup_turns
+                    or self._card_active_coordinator_locked(turn_id) is None):
+                return None
+            matches = [value for value in turn._clarify_tool_calls.values()
+                       if value.active and not value.ambiguous
+                       and value.thread_id == threading.get_ident()
+                       and value.fingerprint == fingerprint]
+            return matches[0] if len(matches) == 1 else None
+
+    def clarify_tool_call_is_current(self, session_identity, turn_id, observation):
+        with self._lock:
+            turn = self._turns.get(turn_id)
+            return (
+                not self._closed and turn is not None and turn.accepts_observer_events
+                and turn.ingress.gateway_session_key == session_identity
+                and self._card_active_coordinator_locked(turn_id) is not None
+                and type(observation) is _ClarifyToolObservation
+                and observation.thread_id == threading.get_ident()
+                and observation.active and not observation.ambiguous
+                and turn._clarify_tool_calls.get(observation.tool_call_id) is observation
+            )
+
+    def clarify_timeout_observer(
+        self, session_identity, turn_id, interaction_id, fingerprint,
+        pending_handle, tool_call_id, timeout,
+    ):
+        """Borrow the admitted handle for one wait; never resolve or extend it."""
+        if (not self._exact_nonblank(tool_call_id)
+                or type(timeout) not in (int, float)
+                or not isfinite(timeout) or timeout <= 0):
+            return None
+        with self._lock:
+            key = self._patch_interaction_key_locked(
+                "clarify", session_identity, turn_id, interaction_id, fingerprint,
+            )
+            state = self._patch_interactions.get(key)
+            turn = self._turns.get(turn_id)
+            if (self._closed or type(state) is not _PatchInteraction
+                    or state.pending_handle is not pending_handle or not state.hfc_owned
+                    or turn is None or not turn.accepts_observer_events
+                    or turn.ingress.gateway_session_key != session_identity
+                    or state.turn_digest in self._interaction_cleanup_turns
+                    or self._card_active_coordinator_locked(turn_id) is None
+                    or pending_handle.response is not None
+                    or pending_handle.event.is_set()):
+                return None
+        deadline = monotonic() + timeout
+
+        def observe(response):
+            # The original wait removed its registry entry on completion. Retain
+            # only this local borrowed reference, not a second pending registry.
+            if (response is not None or monotonic() < deadline
+                    or pending_handle.response is not None
+                    or pending_handle.event.is_set()):
+                return
+            with self._lock:
+                if (self._closed or self._turns.get(turn_id) is not turn
+                        or not turn.accepts_observer_events
+                        or self._card_active_coordinator_locked(turn_id) is None
+                        or state.turn_digest in self._interaction_cleanup_turns
+                        or state.selected_value is not None
+                        or state.resolving_value is not None):
+                    return
+                outcomes = turn._approval_tool_outcomes
+                if len(outcomes) < 128 or tool_call_id in outcomes:
+                    outcomes[tool_call_id] = "timeout"
+                else:
+                    turn._approval_outcome_overflow = True
+
+        return observe
+
     def admit_patch_interaction(
         self,
         kind: object,
@@ -1226,7 +1350,7 @@ class PluginRuntime:
                         ),
                         producer="patch",
                         phase="started",
-                        data=data,
+                        data=self._bound_event_data(turn, data),
                     )
                     stored_payload = deepcopy(payload)
                     stored_descriptor = stored_payload["data"][
@@ -1241,15 +1365,15 @@ class PluginRuntime:
                 payload["data"]["_hfc_runtime_admission"]["token"] = (
                     self._runtime_interaction_token(state.interaction_key)
                 )
-            result: object = None
-            for attempt in range(2):
-                try:
-                    result = self._post(deepcopy(payload), self._terminal_timeout_seconds)
-                except Exception:
-                    result = None
-                if result is not None or attempt == 1:
-                    break
-            if not self._is_exact_runtime_interaction_admission_response(result):
+            try:
+                result = self._post(deepcopy(payload), self._terminal_timeout_seconds)
+            except Exception:
+                result = None
+            confirmed = self._is_exact_runtime_interaction_admission_response(result)
+            if result is None:
+                confirm = getattr(self._post, "confirm_interaction_delivery", None)
+                confirmed = callable(confirm) and confirm(deepcopy(payload), 3.0) is True
+            if not confirmed:
                 return False
             with self._lock:
                 checked_at = self._now()
@@ -1261,13 +1385,13 @@ class PluginRuntime:
                     or current.pending_handle is not pending_handle
                     or current.resolver is not resolver
                     or current.turn_digest in self._interaction_cleanup_turns
-                    or current.selected_value is not None
-                    or current.resolving_value is not None
                     or current.admission_payload != stored_payload
                     or current.descriptor_expires_at is None
                     or checked_at >= current.descriptor_expires_at
                 ):
                     return False
+                # A real user may resolve the delivered card before its ACK
+                # reaches this caller. That does not revoke delivery ownership.
                 current.hfc_owned = True
                 return True
         except Exception:
@@ -1519,6 +1643,7 @@ class PluginRuntime:
             if admitted:
                 turn = self._registry.claim_unique_session(session_id, turn_id)
                 if turn is not None:
+                    turn.metrics = TurnMetrics(self._now(), model=metric_label(kwargs.get("model")))
                     self._turns[turn_id] = turn
                     self._coordinators[turn_id] = coordinator
                     self._started_transports[turn_id] = started_transport
@@ -1539,16 +1664,14 @@ class PluginRuntime:
             event="message.started",
             event_id=coordinator.event_id("started"),
             phase="started",
-            data={
-                "profile_id": turn.ingress.profile_id,
-                "profile_source": turn.ingress.profile_source,
+            data=self._bound_event_data(turn, {
                 "reply_to_message_id": turn.ingress.reply_to_message_id,
                 # Gateway admission owns interruption scope. Never send the raw
                 # session key (which may include user/chat identifiers).
                 "execution_scope": sha256(
                     turn.ingress.gateway_session_key.encode("utf-8")
                 ).hexdigest(),
-            },
+            }),
         )
         with started_transport.gate:
             with self._lock:
@@ -1572,6 +1695,19 @@ class PluginRuntime:
                     if self._started_transports.get(turn_id) is started_transport:
                         self._started_transports.pop(turn_id, None)
                 started_transport.completion.set()
+        return None
+
+    def handle_post_api_request(self, **kwargs: object) -> None:
+        turn_id = kwargs.get("turn_id")
+        if not self._exact_nonblank(turn_id) or kwargs.get("platform") != "feishu":
+            return None
+        with self._lock:
+            self._expire_locked(self._now())
+            turn = self._turns.get(turn_id)
+            if (turn is None or not turn.accepts_observer_events or turn.metrics is None
+                    or kwargs.get("session_id") != turn.ingress.session_id):
+                return None
+            turn.metrics.observe_api(kwargs)
         return None
 
     def handle_post_llm_call(self, **kwargs: object) -> None:
@@ -1656,13 +1792,20 @@ class PluginRuntime:
         else:
             sequence = 1
         created_at = self._now()
+        if turn.metrics is not None:
+            try:
+                from .canonical_turn import canonical_turn_context_limit
+                turn.metrics.context_limit = canonical_turn_context_limit(turn_id)
+            except Exception:
+                turn.metrics.context_limit = None
         payload = self._base_payload(turn, sequence=sequence, created_at=created_at)
         payload.update(
             event=f"message.{terminal_kind}",
             event_id=f"turn:{turn_id}:{terminal_kind}",
             phase="terminal",
-            data=(
-                {"answer": answer}
+            data=self._bound_event_data(turn, {
+                **(turn.metrics.payload(created_at) if turn.metrics is not None else {}),
+                **({"answer": answer}
                 if terminal_kind == "completed"
                 else {
                     "error": (
@@ -1672,8 +1815,8 @@ class PluginRuntime:
                     "turn_exit_reason": self._classify_exit_reason(
                         kwargs.get("turn_exit_reason"), interrupted is True
                     ),
-                }
-            ),
+                }),
+            }),
         )
         response = self._post_retry_unknown(
             payload,
@@ -1719,11 +1862,34 @@ class PluginRuntime:
         return None
 
     def handle_pre_tool_call(self, **kwargs: object) -> None:
+        self._record_clarify_tool_call(kwargs)
         self._submit_tool(kwargs, pending=True)
         return None
 
     def handle_post_tool_call(self, **kwargs: object) -> None:
-        self._submit_tool(kwargs, pending=False)
+        if not all(self._exact_nonblank(kwargs.get(key))
+                   for key in ("turn_id", "tool_call_id", "tool_name")):
+            return None
+        with self._lock:
+            turn = self._turns.get(kwargs.get("turn_id"))
+            known = None if turn is None else turn._clarify_tool_calls.get(kwargs.get("tool_call_id"))
+            if (known is not None and (kwargs.get("tool_name") != "clarify"
+                    or kwargs.get("session_id") != turn.ingress.session_id
+                    or known.thread_id != threading.get_ident())):
+                return None
+        try:
+            self._submit_tool(kwargs, pending=False)
+        finally:
+            with self._lock:
+                turn = self._turns.get(kwargs.get("turn_id"))
+                if (turn is not None and kwargs.get("tool_name") == "clarify"
+                        and kwargs.get("session_id") == turn.ingress.session_id
+                        and kwargs.get("tool_call_id") in turn._clarify_tool_calls):
+                    # Keep a bounded tombstone: late/replayed pre-tool hooks must
+                    # not revive a completed observation after thread-id reuse.
+                    observation = turn._clarify_tool_calls[kwargs["tool_call_id"]]
+                    if observation.thread_id == threading.get_ident():
+                        observation.active = False
         return None
 
     def handle_pre_approval_request(self, **kwargs: object) -> None:
@@ -1812,6 +1978,15 @@ class PluginRuntime:
             pending = self._pending_approvals.pop(key, None)
             self._claimed_approvals.discard(key)
             coordinator = self._card_active_coordinator_locked(turn_id)
+            turn = self._turns.get(turn_id)
+            if (pending is not None and coordinator is not None and turn is not None
+                    and turn.ingress.gateway_session_key == session_key
+                    and choice in {"deny", "timeout"}):
+                outcomes = turn._approval_tool_outcomes
+                if len(outcomes) < 128 or tool_call_id in outcomes:
+                    outcomes[tool_call_id] = "blocked" if choice == "deny" else "timeout"
+                else:
+                    turn._approval_outcome_overflow = True
         if pending is None or coordinator is None:
             return None
         if pending.hfc_owned:
@@ -2038,6 +2213,25 @@ class PluginRuntime:
         if coordinator is None:
             return
         status = "pending" if pending else self._tool_status(kwargs.get("status"))
+        if not pending:
+            with self._lock:
+                turn = self._turns.get(turn_id)
+                outcome = None
+                if (turn is not None and (tool_call_id in turn._approval_tool_outcomes
+                        or turn._approval_outcome_overflow)
+                        and kwargs.get("session_id") != turn.ingress.session_id):
+                    # Do not let an unrelated result occupy this call's terminal
+                    # event identity before the matched interaction result arrives.
+                    return
+                if (turn is not None and turn.accepts_observer_events
+                        and kwargs.get("session_id") == turn.ingress.session_id):
+                    outcome = turn._approval_tool_outcomes.get(tool_call_id)
+                    if outcome is None and turn._approval_outcome_overflow:
+                        outcome = "unverified"
+            reported_status = kwargs.get("status")
+            if (outcome is not None and type(reported_status) is str
+                    and reported_status.strip().lower() in {"ok", "error"}):
+                status = outcome
         data: dict[str, object] = {
             "tool_id": tool_call_id,
             "call_id": tool_call_id,
@@ -2094,7 +2288,10 @@ class PluginRuntime:
         if turn is None or not turn.accepts_observer_events:
             return None
         payload = self._base_payload(turn, sequence=0, created_at=self._now())
-        payload.update(event=event, event_id=event_id, phase=phase, data=data)
+        payload.update(
+            event=event, event_id=event_id, phase=phase,
+            data=self._bound_event_data(turn, data),
+        )
         return payload
 
     def _approval_values(
@@ -2347,6 +2544,18 @@ class PluginRuntime:
             )
         except (OverflowError, TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _bound_event_data(
+        turn: TurnBinding, data: dict[str, object]
+    ) -> dict[str, object]:
+        # Session routing must use the authenticated ingress identity on every
+        # event, including patch-produced interactions and terminal messages.
+        return {
+            **data,
+            "profile_id": turn.ingress.profile_id,
+            "profile_source": turn.ingress.profile_source,
+        }
 
     def _base_payload(
         self, turn: TurnBinding, *, sequence: int, created_at: float
@@ -2660,6 +2869,10 @@ def handle_pre_llm_call(**kwargs: Any) -> None:
     return _dispatch("handle_pre_llm_call", **kwargs)
 
 
+def handle_post_api_request(**kwargs: Any) -> None:
+    return _dispatch("handle_post_api_request", **kwargs)
+
+
 def handle_post_llm_call(**kwargs: Any) -> None:
     return _dispatch("handle_post_llm_call", **kwargs)
 
@@ -2703,6 +2916,7 @@ def handle_subagent_stop(**kwargs: Any) -> None:
 HOOK_HANDLERS = {
     "pre_llm_call": "handle_pre_llm_call",
     "post_llm_call": "handle_post_llm_call",
+    "post_api_request": "handle_post_api_request",
     "on_session_end": "handle_on_session_end",
     "on_session_reset": "handle_on_session_reset",
     "on_session_finalize": "handle_on_session_finalize",

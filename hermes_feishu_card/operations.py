@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Callable
 
-from .config import card_width_config
+from .config_rules import card_width_config
 from .diagnostics import DiagnosticReport
 from .maintenance_update import UpdateInspection
 

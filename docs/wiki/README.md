@@ -10,11 +10,15 @@
 
 [开发规则与技术栈](development-rules.md) · [功能准入与体验规则](feature-rules.md) · [卡片视觉体验规范](card-visual-guidelines.md) · [2026-10-03 代码审查](../reviews/2026-10-03-project-review.md) · [V5 功能与体验建议](../roadmap-v5.md)。审查和路线建议不代表功能已经实现；当前发行版本以根目录 README 和 CHANGELOG 为准。
 
+下一阶段的统一执行入口：[完整重构与升级计划](../plans/2026-10-13-refactor-upgrade.md)。总体范围、依赖、验收和回退在此维护，审查与切口文档保留依据。
+
 ## V4.6.4 历史版本资料
 
 [V4.6.4 范围](../release-notes-v4.6.4.md) · [交互续答](interaction-continuation.md) · [阅读预设](reading-presets.md) · [真实验收清单](feishu-acceptance-v4.6.4.md) · [实施状态](../superpowers/plans/2026-09-20-v4.6.x-experience.md)。真实客户端验收与公开发布证据分别记录。
 
 ## 阅读路径
+
+[交互责任与提交顺序](interaction-protocol.md) 说明 runtime admission、callback、到期与回执的唯一责任方，以及锁内核验和锁外投递的顺序。
 
 1. [维护指南](maintenance-guide.md)
    - 适合改代码前阅读，说明 hot files、风险边界和测试矩阵。
@@ -77,3 +81,5 @@ The private Feishu `/update` workflow is documented in
 [`feishu-acceptance.md`](feishu-acceptance.md) checklist.
 
 V4.6.5：[通知归属](notice-ownership.md)、[验收记录](feishu-acceptance-v4.6.5.md)、[发布说明](../release-notes-v4.6.5.md)。
+
+开发分支新增[本地诊断报告](local-support-report.md)、[已加载与精简阅读配置](reading-presets.md)和[观测耗时口径](observed-timing.md)，明确区分 HFC 事件耗时、模型调用与客户端可见时间。[模块边界记录](refactor-boundaries.md)说明实际实现所有者及兼容入口。

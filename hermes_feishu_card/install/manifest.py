@@ -10,6 +10,9 @@ from ..integration import (
     HYBRID_REQUIRED_PATCH_GROUPS,
     KNOWN_PATCH_GROUPS,
 )
+from .source_layout import (
+    BACKUP_SUFFIX, DECOMPOSED_MANIFEST_VERSION, DECOMPOSED_LAYOUT, DECOMPOSED_SOURCE_TARGETS,
+)
 from .patch_descriptors import HYBRID_PATCH_REGISTRY, HYBRID_PATCH_TARGETS
 
 
@@ -77,8 +80,7 @@ def validate_install_manifest_version(manifest: Mapping[str, object]) -> int:
 def validate_install_manifest(manifest: Mapping[str, object]) -> int:
     version = validate_install_manifest_version(manifest)
     if version == 4:
-        from .decomposed import validate_manifest
-        validate_manifest(manifest)
+        validate_decomposed_manifest(manifest)
         return version
     if version == 3:
         _validate_v3_manifest(manifest)
@@ -322,3 +324,23 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_decomposed_manifest(manifest: object) -> None:
+    if (not isinstance(manifest, dict)
+            or type(manifest.get("manifest_version")) is not int
+            or manifest.get("manifest_version") != DECOMPOSED_MANIFEST_VERSION
+            or manifest.get("layout") != DECOMPOSED_LAYOUT
+            or manifest.get("integration_mode") != "legacy-patch"
+            or not isinstance(manifest.get("targets"), dict)
+            or not manifest["targets"]
+            or not set(manifest["targets"]).issubset(DECOMPOSED_SOURCE_TARGETS)
+            or "gateway/run.py" not in manifest["targets"]):
+        raise ManifestStructureError("invalid decomposed ownership manifest")
+    for target, row in manifest["targets"].items():
+        if (not isinstance(row, dict) or set(row) != {"path", "backup", "original_sha256", "patched_sha256"}
+                or row["path"] != target or row["backup"] != target + BACKUP_SUFFIX
+                or any(not isinstance(row[k], str) or len(row[k]) != 64
+                       or any(c not in "0123456789abcdef" for c in row[k])
+                       for k in ("original_sha256", "patched_sha256"))):
+            raise ManifestStructureError("invalid decomposed target ownership")

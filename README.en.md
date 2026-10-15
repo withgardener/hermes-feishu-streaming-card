@@ -11,7 +11,7 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/baileyh8/hermes-feishu-streaming-card?style=for-the-badge&color=64748b"></a>
 </p>
 
-![Hermes Feishu Streaming Card cover](docs/assets/readme-cover.png)
+![Hermes Feishu Streaming Card cover](docs/assets/readme-cover-v5.png)
 
 **See what Hermes is doing, confirm the next step, and read the complete answer—all in Feishu.**
 
@@ -19,9 +19,33 @@ HFC turns Hermes Agent Gateway replies in Feishu/Lark into continuously updated 
 
 Use it when connecting [Hermes Agent](https://github.com/NousResearch/hermes-agent) to Feishu or Lark. Hermes runs the model, tools and tasks; HFC handles card presentation, interaction and delivery.
 
-[Install](#quick-install) · [Configure](#configuration) · [Recent releases](#recent-releases) · [User guide](docs/user-guide.en.md) · [Contributors](#contributors)
+[What’s new in V5](#whats-new-in-v5) · [Upgrade from V4.x](#upgrade-from-v4x-to-v5) · [Install](#quick-install) · [Configure](#configuration) · [Recent releases](#recent-releases) · [User guide](docs/user-guide.en.md) · [Contributors](#contributors)
 
-**Release version: [v4.7.7](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.7.7).** Opt-in native tables with lossless Markdown fallback for long cells and headers. See [release notes](docs/release-notes-v4.7.7.en.md).
+**V5: follow the task, continue the conversation, keep the complete result.** This page describes v5.0.0; installable versions are listed in [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases). See the [release notes](docs/release-notes-v5.0.0.en.md).
+
+## What's new in V5
+
+V5 organizes the journey from a running task through a human decision to the final answer. Ordinary replies stay in one card. Interactions retain a decision receipt, and the earlier segment folds only after a continuation is delivered.
+
+| Change | What you see |
+| --- | --- |
+| **Task sections** | Separate state, answer, process history and metrics; long answers retain their content and process details remain available |
+| **Interaction continuity** | Approvals, single/multiple choices and text input use the original Hermes flow; earlier cards offer “View continuation” when a verified destination is available |
+| **Clear outcomes** | Denied and timed-out tools keep distinct states; expired cards retain the question and choices but remove actionable controls |
+| **Per-turn metrics** | Available model, duration, input/output tokens and context usage appear in the footer; missing values are not invented |
+| **Inspectable configuration** | Compare loaded and next-load values, produce minimal YAML and preview changes offline |
+
+Installation, recovery, event handling and rendering now have separate owners. Hermes still executes models and tools and owns authorization. Confirmed card delivery suppresses redundant native text; attachments and unconfirmed delivery retain necessary fallbacks.
+
+To use the V5 task layout, merge these fields into the existing global `card` section and restart the sidecar. Do not replace the entire configuration. Explicit profile/bot values may still override the global scope.
+
+```yaml
+card:
+  reading_preset: task
+  timeline_expanded: false
+```
+
+This combination starts with the process panel collapsed and keeps it available after completion. The `task` preset itself expands the panel by default; the second line explicitly selects collapse. Upgrading does not switch `classic`, `focused` or `detailed` to `task`.
 
 ## Why HFC
 
@@ -38,22 +62,65 @@ Use it when connecting [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 ## See it in action
 
-| Running: current activity and progress | Waiting: act directly in the card |
+The cover is AI-generated V5 artwork, not a screenshot. The actual flow is: streamed task → your decision → decision receipt → continuation → complete result and per-turn metrics.
+
+V5 desktop acceptance verified the timed-out state, expired choices and an actual continuation-link click. Earlier desktop interactions and phone display were recorded separately. Appearance depends on client, theme and configuration; see the [Feishu acceptance checklist](docs/wiki/feishu-acceptance.md).
+
+| V5: continuation after approval | V5: timeout and expired choices |
 | --- | --- |
-| ![Running](docs/assets/feishu-v4-runtime-running.png) | ![Waiting](docs/assets/feishu-v4-runtime-waiting.png) |
+| [![V5 continuation and turn footer](docs/assets/feishu-v5-continuation-redacted.png)](docs/assets/feishu-v5-continuation-redacted.png) | [![V5 timeout and expired interaction](docs/assets/feishu-v5-expiry-redacted.png)](docs/assets/feishu-v5-expiry-redacted.png) |
+
+**Single-choice, multiple-choice and text-input receipts**
+
+The three cards retain the single answer `A`, multiple answers `A, C` and free text `手机输入验收123`. These are submitted receipts, marked “选择已记录” (selection recorded). Pending interactions use buttons or forms; submission leaves a receipt while subsequent output continues in the reply card.
+
+[![Submitted single-choice, multiple-choice and text-input receipts](docs/assets/feishu-v5-clarify-receipts-redacted.png)](docs/assets/feishu-v5-clarify-receipts-redacted.png)
+
+**Command confirmation buttons**
+
+The `/reload-mcp` confirmation offers “允许一次” (allow once), “始终允许” (always allow) and “取消” (cancel). This image comes from mobile command acceptance on an earlier candidate and shows the buttons before a decision. Model-tool approval options depend on the actual permission scope.
+
+<img src="docs/assets/feishu-command-approval-redacted.png" alt="Mobile command confirmation: allow once, always allow and cancel" width="420">
+
+These interface images derive from real acceptance screenshots, with generative privacy redaction and presentation layout adjustments. Local glyphs and spacing may differ from the originals. Original screenshots remain the acceptance evidence. Click to enlarge. See [image provenance](docs/assets/v5-visuals.md).
 
 <details>
-<summary>Show failure, completion and command examples</summary>
+<summary>View real V4.x interface references (historical versions)</summary>
 
-| Failed: existing content retained | Completed: the final answer |
+| Running | Waiting |
 | --- | --- |
-| ![Failed](docs/assets/feishu-v4-runtime-failed.png) | ![Completed](docs/assets/feishu-v4-runtime-completed.png) |
+| ![V4 running](docs/assets/feishu-v4-runtime-running.png) | ![V4 waiting](docs/assets/feishu-v4-runtime-waiting.png) |
 
-![Commands and tool history](docs/assets/feishu-card-showcase-v385.png)
+| Failed | Completed |
+| --- | --- |
+| ![V4 failed](docs/assets/feishu-v4-runtime-failed.png) | ![V4 completed](docs/assets/feishu-v4-runtime-completed.png) |
+
+![Historical commands and tool history](docs/assets/feishu-card-showcase-v385.png)
+
+These are real historical screenshots, not a claim that every detail matches V5.
 
 </details>
 
-These screenshots come from real Feishu acceptance checks of released versions. Appearance varies by client, version and configuration.
+## Upgrade from V4.x to V5
+
+**Keep your existing bot.** Reuse the actual Hermes directory, configuration, credentials and profile. Example paths are not substitutes for your split-HOME, Docker or multi-instance layout.
+
+1. Record current HFC/Hermes versions and service managers. Back up configuration, `.env` and installer recovery material. After tasks finish, stop Gateway, Desktop and sidecar through their existing managers.
+2. Pin the installer to `v5.0.0` and supply the same configuration and credentials paths. Run it only after that tag is published. The installer checks the provenance and compatibility of the old installation.
+3. If diagnostics require restoring old hooks first, use the official `restore` command they provide, then reinstall. Stop on unknown source drift; never edit installed `gateway/run.py` or delete manifests/backups to bypass checks.
+4. Opt into the task layout with the two fields above if desired. Keep credentials, routing, native-table settings and other reading preferences from your existing configuration.
+5. Restore the original service managers and restart Gateway/Desktop as directed. Check `status`, `doctor --explain` and `card-config --running`, then send a real message to verify the card and footer.
+
+macOS / Linux example—replace these paths with those used by your current installation:
+
+```bash
+export HERMES_DIR="$HOME/.hermes/hermes-agent"
+export HFC_CONFIG="$HOME/.hermes/config.yaml"
+export HFC_ENV_FILE="$HOME/.hermes/.env"
+curl -fsSL https://raw.githubusercontent.com/baileyh8/hermes-feishu-streaming-card/v5.0.0/install.sh | bash -s -- --version v5.0.0 --config "$HFC_CONFIG" --env-file "$HFC_ENV_FILE"
+```
+
+See the **[V4.x → V5 upgrade guide](docs/upgrade-v4-to-v5.en.md)** for Windows, Docker, split HOME, verification and rollback. Updating HFC is separate from updating Hermes; Feishu `/update` is not the plugin-version upgrade command.
 
 ## Quick install
 
@@ -86,7 +153,7 @@ Start or restart Hermes Gateway as directed by setup, then message the bot and c
 - **Docker:** inside an existing Hermes container, run the repository's installer:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.7.7
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v5.0.0
 bash install-docker.sh
 ```
 
@@ -154,7 +221,8 @@ Precedence: YAML < adjacent `.env` < explicit `--env-file` < process environment
 
 ```yaml
 card:
-  reading_preset: focused
+  reading_preset: task
+  timeline_expanded: false
 ```
 
 | Preset | Reading experience |
@@ -162,11 +230,13 @@ card:
 | Omitted / `classic` | Existing behavior with a collapsed process panel |
 | `focused` | Emphasize the answer; reasoning stays in the panel and successful tool rows are reduced after normal completion |
 | `detailed` | Expand reasoning and tools to follow the task |
-| `task` (4.7.0) | Clear state and activity, answer-first reading, folded process details and compact metrics |
+| `task` (since 4.7.0) | Separate state and activity with answer-first reading; V5 expands process details and retains completed history |
 
 4.7.0 adds an optional `task` layout and an offline preview of nine states. See [task cards](docs/task-cards.md#english-quick-reference) for setup, configuration sources and rollback. Subscription quota appears only on GPT turns attributed to `openai-codex`; unrelated or unknown routes omit it.
 
 Explicit fields at the same level override presets. Copying all existing display switches may override your preset; inspect effective values with `hermes-feishu-card card-config --config <config-path>` and restart the sidecar to apply changes. See [reading presets](docs/wiki/reading-presets.md).
+
+In V5, add `--running` to verify loaded defaults, or use `--minimal-yaml` to print a compact reading-field replacement for the selected scope. Preview a redacted local report with [`doctor --support-report`](docs/wiki/local-support-report.md). These commands do not edit configuration or restart services.
 
 | Change | Setting / reference |
 | --- | --- |
@@ -212,6 +282,7 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 
 | Version | Highlights |
 |---|---|
+| [v5.0.0](docs/release-notes-v5.0.0.en.md) | Task sections, interaction continuity, turn metrics and installation boundaries |
 | [v4.7.7](docs/release-notes-v4.7.7.en.md) | Opt-in native tables; preserve long cells and indivisible Markdown tables |
 | [v4.7.6](docs/release-notes-v4.7.6.en.md) | Split HOME binding, multi-instance ownership and diagnostics |
 | [v4.7.5](docs/release-notes-v4.7.5.en.md) | PM runtime binding, DM card admission and layout limitations |
@@ -221,7 +292,6 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 | [v4.7.1](docs/release-notes-v4.7.1.en.md) | Slash-confirm callback repair and visible confirmation results |
 | [v4.7.0](docs/release-notes-v4.7.0.en.md) | Task layout, offline previews, attributed quota and interaction-state repairs |
 | [v4.6.13](docs/release-notes-v4.6.13.en.md) | Private control-token transport and current Hermes source verification |
-| [v4.6.12](docs/release-notes-v4.6.12.en.md) | Optional card width and Hermes reply-clock compatibility |
 
 See [release history](docs/release-history.en.md) for earlier versions, and [CHANGELOG](CHANGELOG.md) or [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases) for the full record.
 

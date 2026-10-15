@@ -9,6 +9,8 @@ import subprocess
 
 import pytest
 
+from hermes_feishu_card.install import posix_transaction as bound_io
+
 from hermes_feishu_card import cli
 import hermes_feishu_card.install.integrity as integrity_module
 from hermes_feishu_card.install.detect import detect_hermes
@@ -433,7 +435,7 @@ def test_integrity_rollback_preserves_concurrent_same_inode_edit_and_continues(
     raced.write_text("raced-before\n", encoding="utf-8")
     owned.write_text("owned-before\n", encoding="utf-8")
     failing.write_text("failing-before\n", encoding="utf-8")
-    original_replace = integrity_module.os.replace
+    original_replace = bound_io.os.replace
     replacements = 0
     raced_post_write_inode = None
 
@@ -446,7 +448,7 @@ def test_integrity_rollback_preserves_concurrent_same_inode_edit_and_continues(
             raise OSError("third target unavailable")
         return original_replace(source, target, *args, **kwargs)
 
-    monkeypatch.setattr(integrity_module.os, "replace", fail_after_concurrent_edit)
+    monkeypatch.setattr(bound_io.os, "replace", fail_after_concurrent_edit)
 
     with pytest.raises(IntegrityRepairRefused, match="manual review required"):
         _atomic_replace_many(
@@ -551,7 +553,7 @@ def test_integrity_commit_replace_uses_bound_target_parent(tmp_path, monkeypatch
     target = parent / "run.py"
     target.write_text("before\n", encoding="utf-8")
     real_parent = root / "gateway-real"
-    original_replace = integrity_module.os.replace
+    original_replace = bound_io.os.replace
     injected = False
 
     def swap_parent_at_replace(source, destination, *args, **kwargs):
@@ -565,7 +567,7 @@ def test_integrity_commit_replace_uses_bound_target_parent(tmp_path, monkeypatch
             injected = True
         return original_replace(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(integrity_module.os, "replace", swap_parent_at_replace)
+    monkeypatch.setattr(bound_io.os, "replace", swap_parent_at_replace)
 
     try:
         _atomic_replace_many(
@@ -586,7 +588,7 @@ def test_integrity_rollback_replace_uses_bound_target_parent(tmp_path, monkeypat
     target = parent / "run.py"
     target.write_text("before\n", encoding="utf-8")
     real_parent = root / "gateway-real"
-    original_replace = integrity_module.os.replace
+    original_replace = bound_io.os.replace
     replacements = 0
 
     def swap_parent_at_rollback(source, destination, *args, **kwargs):
@@ -600,7 +602,7 @@ def test_integrity_rollback_replace_uses_bound_target_parent(tmp_path, monkeypat
             (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
         return original_replace(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(integrity_module.os, "replace", swap_parent_at_rollback)
+    monkeypatch.setattr(bound_io.os, "replace", swap_parent_at_rollback)
 
     with pytest.raises(IntegrityRepairRefused, match="validation failed"):
         _atomic_replace_many(
@@ -622,7 +624,7 @@ def test_integrity_rollback_unlink_uses_bound_target_parent(tmp_path, monkeypatc
     parent.mkdir(parents=True)
     target = parent / "new.py"
     real_parent = root / "gateway-real"
-    original_unlink = integrity_module.os.unlink
+    original_unlink = bound_io.os.unlink
     injected = False
 
     def swap_parent_at_rollback_unlink(path, *args, **kwargs):
@@ -634,7 +636,7 @@ def test_integrity_rollback_unlink_uses_bound_target_parent(tmp_path, monkeypatc
             injected = True
         return original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(integrity_module.os, "unlink", swap_parent_at_rollback_unlink)
+    monkeypatch.setattr(bound_io.os, "unlink", swap_parent_at_rollback_unlink)
 
     with pytest.raises(IntegrityRepairRefused, match="validation failed"):
         _atomic_replace_many(
@@ -683,7 +685,8 @@ def test_gitless_monolithic_install_and_migration_prove_snapshot_only(git_instal
     shutil.rmtree(root / ".git")
     def refuse_git(*_args, **_kwargs):
         raise AssertionError("snapshot verification must not invoke Git")
-    monkeypatch.setattr(integrity_module, "_run_git", refuse_git)
+    from hermes_feishu_card.install import git_evidence
+    monkeypatch.setattr(git_evidence, "_run_git", refuse_git)
     _write_manifest(root, detection, run_source, cron_source)
     manifest_path = root / integrity_module.MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text())

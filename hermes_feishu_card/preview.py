@@ -1,6 +1,7 @@
 """Credential-free, network-free previews using the actual card renderer."""
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import time
@@ -60,6 +61,15 @@ def sample_sessions() -> list[tuple[str, str, CardSession]]:
         # Deliberately stale sample: the renderer must hide another provider's quota.
         subscription_usage="5h 26% · weekly 89%",
     )
+    # A completed result must also exercise access to earlier tool history.
+    # Copy synthetic activity only; the samples never execute these commands.
+    completed.tools = copy.deepcopy(running.tools)
+    completed.timeline = copy.deepcopy(running.timeline)
+    for tool in completed.tools.values():
+        tool.status = "completed"
+    for entry in completed.timeline.snapshot():
+        if entry.kind == "tool":
+            entry.status = "completed"
     stopped = sample("stopped", status="failed", answer_text="已保留前半部分结果。\n\n> 请求未完成，请检查连接后重新发起任务。", duration=32)
     restored = sample("restored", status="failed", presentation_state="reconnecting", answer_text="此前已经收到的内容会继续保留。")
     notice = sample("notice", status="completed", delivery_kind="notice", notice_title="配置检查", answer_text="配置文件可以正常读取。下次启动时加载新设置。")

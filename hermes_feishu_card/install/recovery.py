@@ -9,12 +9,22 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 import threading
 import time
 from typing import Dict, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
+from . import decomposed_ownership
+from .source_layout import (
+    BACKUP_SUFFIX as BACKUP_SUFFIX, MANIFEST_NAME as MANIFEST_NAME,
+    DECOMPOSED_MANIFEST_VERSION, DECOMPOSED_SOURCE_TARGETS,
+)
+from .manifest import validate_decomposed_manifest
+from . import posix_transaction as bound_io
+from .posix_transaction import (
+    BoundStage as _StagedText,
+    BoundTarget as _TargetBinding,
+)
 from .detect import HermesDetection
 from .manifest import (
     ManifestStructureError,
@@ -35,8 +45,6 @@ from .patcher import (
 )
 
 
-BACKUP_SUFFIX = ".hermes_feishu_card.bak"
-MANIFEST_NAME = ".hermes_feishu_card_manifest"
 KNOWN_STATES = {
     "clean",
     "installed",
@@ -61,16 +69,7 @@ _PROCESS_LOCKS: Dict[str, threading.Lock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _OwnedWriteSnapshot = Tuple[int, int, str]
 _DirectoryIdentity = Tuple[int, int]
-_SECURE_DIRFD_TRANSACTIONS_SUPPORTED = (
-    os.name != "nt"
-    and hasattr(os, "O_DIRECTORY")
-    and hasattr(os, "O_NOFOLLOW")
-    and hasattr(os, "fchmod")
-    and all(
-        operation in getattr(os, "supports_dir_fd", set())
-        for operation in (os.open, os.stat, os.unlink, os.rename)
-    )
-)
+_SECURE_DIRFD_TRANSACTIONS_SUPPORTED = bound_io.DIRFD_BINDING_SUPPORTED
 
 
 def _secure_dirfd_transactions_supported() -> bool:
@@ -85,77 +84,10 @@ def _require_secure_dirfd_transactions() -> None:
         )
 
 
-@dataclass
-class _StagedText:
-    path: Path
-    parent_fd: int
-    basename: str
-    identity: Tuple[int, int]
-    target_binding: _TargetBinding | None = None
-
-    def assert_owned(self) -> None:
-        current = os.stat(
-            self.basename,
-            dir_fd=self.parent_fd,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino) != self.identity
-        ):
-            raise RecoveryRefused(
-                "recovery staged file changed before mutation"
-            )
-
-    def release(self) -> None:
-        if self.parent_fd < 0:
-            return
-        os.close(self.parent_fd)
-        self.parent_fd = -1
-
-    def cleanup(self) -> None:
-        if self.parent_fd < 0:
-            return
-        try:
-            current = os.stat(
-                self.basename,
-                dir_fd=self.parent_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        else:
-            if (
-                stat.S_ISREG(current.st_mode)
-                and (current.st_dev, current.st_ino) == self.identity
-            ):
-                os.unlink(self.basename, dir_fd=self.parent_fd)
-        finally:
-            self.release()
 
 
-@dataclass
-class _TargetBinding:
-    path: Path
-    parent_fd: int
-    basename: str
-    parent_identity: _DirectoryIdentity
 
-    def assert_parent(self) -> None:
-        current = os.fstat(self.parent_fd)
-        if (
-            not stat.S_ISDIR(current.st_mode)
-            or (current.st_dev, current.st_ino) != self.parent_identity
-        ):
-            raise RecoveryRefused(
-                "recovery target parent changed before mutation"
-            )
 
-    def release(self) -> None:
-        if self.parent_fd < 0:
-            return
-        os.close(self.parent_fd)
-        self.parent_fd = -1
 
 _ACTION_MESSAGES = {
     "adopt_lenient_upgrade_source": (
@@ -283,14 +215,13 @@ def execute_recovery(
     accept_hermes_upgrade: bool = False,
 ) -> RecoveryResult:
     _require_secure_dirfd_transactions()
-    from . import decomposed
-    if detection.decomposed or decomposed.is_managed(detection.root):
-        fresh = decomposed.plan(detection, accept_hermes_upgrade=accept_hermes_upgrade)
+    if detection.decomposed or decomposed_ownership.is_managed(detection.root):
+        fresh = _plan_decomposed_recovery(detection, accept_hermes_upgrade=accept_hermes_upgrade)
         if expected_fingerprint and fresh.fingerprint != expected_fingerprint:
             raise RecoveryRefused("recovery evidence changed; rerun diagnosis")
         if not fresh.executable:
             raise RecoveryRefused("decomposed recovery is not executable")
-        decomposed.install(detection, expected_fingerprint=fresh.fingerprint,
+        install_decomposed(detection, expected_fingerprint=fresh.fingerprint,
                            accept_hermes_upgrade=accept_hermes_upgrade)
         return RecoveryResult("repaired", fresh, fresh.actions, None, "Owned hooks restored; Gateway restart required.")
     with _root_lock(detection.root):
@@ -838,7 +769,7 @@ def _commit_recovery_changes(
                 target, target_ancestries, directory_snapshots
             )
             if contents is None:
-                os.unlink(binding.basename, dir_fd=binding.parent_fd)
+                bound_io.unlink_bound_target(binding)
                 changed.append(target)
                 post_write_snapshots[target] = None
                 _assert_bound_target_unchanged(binding, None)
@@ -879,10 +810,9 @@ def _commit_recovery_changes(
             ) from exc
         raise
     finally:
-        for temp_path in list(staged.values()) + list(rollback.values()):
-            temp_path.cleanup()
-        for binding in target_bindings.values():
-            binding.release()
+        bound_io.cleanup_transaction_resources(
+            list(staged.values()) + list(rollback.values()), target_bindings.values(),
+        )
 
 
 def _rollback_recovery_changes(
@@ -907,17 +837,10 @@ def _rollback_recovery_changes(
             )
             original = originals[target]
             if original is None:
-                os.unlink(binding.basename, dir_fd=binding.parent_fd)
+                bound_io.unlink_bound_target(binding)
             else:
                 rollback_file = rollback[target]
-                rollback_file.assert_owned()
-                os.replace(
-                    rollback_file.basename,
-                    binding.basename,
-                    src_dir_fd=rollback_file.parent_fd,
-                    dst_dir_fd=binding.parent_fd,
-                )
-                rollback_file.release()
+                bound_io.replace_stage(binding, rollback_file, check_parent=False)
                 rollback.pop(target, None)
             _assert_bound_target_restored(
                 binding, pre_write_snapshots[target]
@@ -929,13 +852,9 @@ def _rollback_recovery_changes(
 
 
 def _bind_target(target: Path) -> _TargetBinding:
-    parent_fd = _open_staging_parent(target.parent)
-    opened = os.fstat(parent_fd)
-    return _TargetBinding(
-        path=target,
-        parent_fd=parent_fd,
-        basename=target.name,
-        parent_identity=(opened.st_dev, opened.st_ino),
+    return bound_io.bind_target(
+        target, RecoveryRefused, staging_refusal="recovery staging parent is unsafe",
+        parent_refusal="recovery target parent changed before mutation", wrap_open_error=True,
     )
 
 
@@ -962,18 +881,11 @@ def _assert_bound_target_unchanged(
 
 
 def _assert_bound_target_restored(
-    binding: _TargetBinding, expected: Optional[_OwnedWriteSnapshot]
+    binding: _TargetBinding, expected: _OwnedWriteSnapshot | None,
 ) -> None:
     binding.assert_parent()
-    current = _read_bound_target_snapshot(
-        binding, "recovery rollback target changed"
-    )
-    if expected is None:
-        matches = current is None
-    else:
-        matches = current is not None and current[2] == expected[2]
-    if not matches:
-        raise RecoveryRefused("recovery rollback target changed")
+    current = _read_bound_target_snapshot(binding, "recovery rollback target changed")
+    bound_io.assert_restored_snapshot(current, expected, RecoveryRefused, "recovery rollback target changed")
 
 
 def _read_bound_target_snapshot(
@@ -984,153 +896,40 @@ def _read_bound_target_snapshot(
 
 
 def _read_bound_target_text(
-    binding: _TargetBinding, refusal: str
-) -> Tuple[Optional[_OwnedWriteSnapshot], Optional[str]]:
-    try:
-        before = os.stat(
-            binding.basename,
-            dir_fd=binding.parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return None, None
-    if not stat.S_ISREG(before.st_mode):
-        raise RecoveryRefused(refusal)
-    identity = (before.st_dev, before.st_ino)
-    descriptor = -1
-    digest = sha256()
-    payload = bytearray()
-    try:
-        descriptor = os.open(
-            binding.basename,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=binding.parent_fd,
-        )
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != identity
-        ):
-            raise RecoveryRefused(refusal)
-        while chunk := os.read(descriptor, 64 * 1024):
-            digest.update(chunk)
-            payload.extend(chunk)
-    except OSError as exc:
-        raise RecoveryRefused(refusal) from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    after = os.stat(
-        binding.basename,
-        dir_fd=binding.parent_fd,
-        follow_symlinks=False,
-    )
-    if (
-        not stat.S_ISREG(after.st_mode)
-        or (after.st_dev, after.st_ino) != identity
-    ):
-        raise RecoveryRefused(refusal)
-    try:
-        contents = payload.decode("utf-8")
-    except UnicodeError as exc:
-        raise RecoveryRefused(refusal) from exc
-    return (before.st_dev, before.st_ino, digest.hexdigest()), contents
+    binding: _TargetBinding, refusal: str,
+) -> tuple[_OwnedWriteSnapshot | None, str | None]:
+    return bound_io.read_bound_text(binding, RecoveryRefused, refusal)
 
 
-def _snapshot_prewrite_target(
-    target: Path,
-) -> Optional[_OwnedWriteSnapshot]:
-    try:
-        target.lstat()
-    except FileNotFoundError:
-        return None
-    return _read_regular_file_snapshot(
-        target, "recovery target is not safe before write"
-    )
+def _snapshot_prewrite_target(target: Path) -> _OwnedWriteSnapshot | None:
+    return bound_io.read_prewrite_snapshot(target, RecoveryRefused, "recovery target is not safe before write")
 
 
-def _assert_prewrite_target_unchanged(
-    target: Path, expected: Optional[_OwnedWriteSnapshot]
-) -> None:
-    if expected is None:
-        try:
-            target.lstat()
-        except FileNotFoundError:
-            return
-        raise RecoveryRefused("recovery target changed before write")
-    current = _read_regular_file_snapshot(
-        target, "recovery target changed before write"
-    )
-    if current != expected:
-        raise RecoveryRefused("recovery target changed before write")
+def _assert_prewrite_target_unchanged(target: Path, expected: _OwnedWriteSnapshot | None) -> None:
+    bound_io.assert_path_snapshot(target, expected, RecoveryRefused, "recovery target changed before write")
 
 
 def _snapshot_controlled_ancestries(
-    controlled_root: Path, targets: List[Path]
-) -> Tuple[
-    Dict[Path, Tuple[Path, ...]],
-    Dict[Path, _DirectoryIdentity],
-]:
-    target_ancestries: Dict[Path, Tuple[Path, ...]] = {}
-    directory_snapshots: Dict[Path, _DirectoryIdentity] = {}
-    for target in targets:
-        ancestry = _controlled_ancestry_paths(controlled_root, target)
-        target_ancestries[target] = ancestry
-        for directory in ancestry:
-            if directory not in directory_snapshots:
-                directory_snapshots[directory] = _read_directory_identity(
-                    directory,
-                    "recovery controlled ancestry is unsafe",
-                )
-    return target_ancestries, directory_snapshots
+    controlled_root: Path, targets: list[Path],
+) -> tuple[dict[Path, tuple[Path, ...]], dict[Path, _DirectoryIdentity]]:
+    return bound_io.snapshot_controlled_ancestries(
+        controlled_root, targets, RecoveryRefused,
+        outside_refusal="recovery target is outside controlled root",
+        unsafe_refusal="recovery controlled ancestry is unsafe",
+    )
 
 
-def _controlled_ancestry_paths(
-    controlled_root: Path, target: Path
-) -> Tuple[Path, ...]:
-    root = Path(os.path.abspath(controlled_root))
-    absolute_target = Path(os.path.abspath(target))
-    try:
-        relative = absolute_target.relative_to(root)
-    except ValueError as exc:
-        raise RecoveryRefused(
-            "recovery target is outside controlled root"
-        ) from exc
-    if not relative.parts:
-        raise RecoveryRefused("recovery target is outside controlled root")
-    directories = [root]
-    current = root
-    for part in relative.parts[:-1]:
-        current = current / part
-        directories.append(current)
-    return tuple(directories)
 
 
-def _read_directory_identity(
-    directory: Path, refusal: str
-) -> _DirectoryIdentity:
-    try:
-        snapshot = directory.lstat()
-    except FileNotFoundError as exc:
-        raise RecoveryRefused(refusal) from exc
-    if not stat.S_ISDIR(snapshot.st_mode):
-        raise RecoveryRefused(refusal)
-    return snapshot.st_dev, snapshot.st_ino
 
 
 def _assert_controlled_ancestry_unchanged(
-    target: Path,
-    target_ancestries: Dict[Path, Tuple[Path, ...]],
-    directory_snapshots: Dict[Path, _DirectoryIdentity],
+    target: Path, target_ancestries: dict[Path, tuple[Path, ...]],
+    directory_snapshots: dict[Path, _DirectoryIdentity],
 ) -> None:
-    for directory in target_ancestries[target]:
-        if _read_directory_identity(
-            directory,
-            "recovery target ancestry changed before write",
-        ) != directory_snapshots[directory]:
-            raise RecoveryRefused(
-                "recovery target ancestry changed before write"
-            )
+    bound_io.assert_controlled_ancestry(
+        target, target_ancestries, directory_snapshots, RecoveryRefused, "recovery target ancestry changed before write",
+    )
 
 
 def _snapshot_owned_write(
@@ -1161,145 +960,30 @@ def _read_owned_write_snapshot(target: Path) -> _OwnedWriteSnapshot:
     )
 
 
-def _read_regular_file_snapshot(
-    target: Path, refusal: str
-) -> _OwnedWriteSnapshot:
-    try:
-        before = target.lstat()
-    except FileNotFoundError as exc:
-        raise RecoveryRefused(refusal) from exc
-    if not stat.S_ISREG(before.st_mode):
-        raise RecoveryRefused(refusal)
-    identity = (before.st_dev, before.st_ino)
-    descriptor: int | None = None
-    digest = sha256()
-    try:
-        descriptor = os.open(
-            target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        )
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != identity
-        ):
-            raise RecoveryRefused(refusal)
-        while chunk := os.read(descriptor, 64 * 1024):
-            digest.update(chunk)
-    except OSError as exc:
-        raise RecoveryRefused(refusal) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    try:
-        after = target.lstat()
-    except FileNotFoundError as exc:
-        raise RecoveryRefused(refusal) from exc
-    if (
-        not stat.S_ISREG(after.st_mode)
-        or (after.st_dev, after.st_ino) != identity
-    ):
-        raise RecoveryRefused(refusal)
-    return before.st_dev, before.st_ino, digest.hexdigest()
+def _read_regular_file_snapshot(target: Path, refusal: str) -> _OwnedWriteSnapshot:
+    return bound_io.read_path_snapshot(target, RecoveryRefused, refusal)
 
 
 def _stage_text(
-    target: Path,
-    contents: str,
-    *,
-    binding: _TargetBinding | None = None,
+    target: Path, contents: str, *, binding: _TargetBinding | None = None,
 ) -> _StagedText:
-    if binding is None:
-        parent_fd = _open_staging_parent(target.parent)
-        target_name = target.name
-    else:
-        binding.assert_parent()
-        parent_fd = os.dup(binding.parent_fd)
-        target_name = binding.basename
-    descriptor = -1
-    staged: _StagedText | None = None
-    try:
-        basename = f".{target_name}.{uuid4().hex}.tmp"
-        descriptor = os.open(
-            basename,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-            dir_fd=parent_fd,
-        )
-        staged = _StagedText(
-            path=target.parent / basename,
-            parent_fd=parent_fd,
-            basename=basename,
-            identity=(os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino),
-        )
-        parent_fd = -1
-        try:
-            target_snapshot = os.stat(
-                target_name,
-                dir_fd=staged.parent_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            mode = 0o600
-        else:
-            if not stat.S_ISREG(target_snapshot.st_mode):
-                raise RecoveryRefused(
-                    "recovery target is not safe before write"
-                )
-            mode = stat.S_IMODE(target_snapshot.st_mode)
-        handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
-        descriptor = -1
-        with handle:
-            handle.write(contents)
-            handle.flush()
-            os.fsync(handle.fileno())
-            os.fchmod(handle.fileno(), mode)
-        return staged
-    except Exception:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if staged is not None:
-            staged.cleanup()
-        elif parent_fd >= 0:
-            os.close(parent_fd)
-        raise
+    return bound_io.stage_file(
+        target, contents, binding=binding, mode=None, durable_text=True, refused=RecoveryRefused,
+        staging_refusal="recovery staging parent is unsafe",
+        target_refusal="recovery target is not safe before write",
+        stage_refusal="recovery staged file changed before mutation",
+    )
 
 
-def _open_staging_parent(parent: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        parent_fd = os.open(parent, flags)
-    except OSError as exc:
-        raise RecoveryRefused("recovery staging parent is unsafe") from exc
-    try:
-        opened = os.fstat(parent_fd)
-        current = parent.lstat()
-        if (
-            not stat.S_ISDIR(opened.st_mode)
-            or not stat.S_ISDIR(current.st_mode)
-            or (opened.st_dev, opened.st_ino)
-            != (current.st_dev, current.st_ino)
-        ):
-            raise RecoveryRefused("recovery staging parent is unsafe")
-        return parent_fd
-    except Exception:
-        os.close(parent_fd)
-        raise
 
 
 def _atomic_replace(staged: _StagedText, target: Path) -> None:
+    # Compatibility/fault seam: the staged resource retains its original
+    # destination; the shared owner performs the only filesystem replacement.
     binding = staged.target_binding
     if binding is None:
         raise RecoveryRefused("recovery target binding is missing")
-    staged.assert_owned()
-    binding.assert_parent()
-    os.replace(
-        staged.basename,
-        binding.basename,
-        src_dir_fd=staged.parent_fd,
-        dst_dir_fd=binding.parent_fd,
-    )
-    staged.release()
+    bound_io.replace_stage(binding, staged, check_parent=True)
 
 
 def _new_quarantine_path(source_path: Path) -> Path:
@@ -1999,9 +1683,8 @@ def plan_recovery(
     *,
     accept_hermes_upgrade: bool = False,
 ) -> RecoveryPlan:
-    from . import decomposed
-    if detection.decomposed or decomposed.is_managed(detection.root):
-        return decomposed.plan(detection, accept_hermes_upgrade=accept_hermes_upgrade)
+    if detection.decomposed or decomposed_ownership.is_managed(detection.root):
+        return _plan_decomposed_recovery(detection, accept_hermes_upgrade=accept_hermes_upgrade)
     return _plan_from_evidence(
         detection,
         _read_evidence(detection),
@@ -3025,3 +2708,102 @@ def _deduplicate_findings(findings) -> Tuple[RecoveryFinding, ...]:
         seen.add(key)
         result.append(finding)
     return tuple(result)
+
+
+def _plan_decomposed_recovery(detection, *, accept_hermes_upgrade=False):
+    try:
+        snapshot, _, _, state = decomposed_ownership._inspect(detection.root)
+        fingerprint = decomposed_ownership._fingerprint(snapshot)
+        executable = state == "owned_incomplete" or (state in decomposed_ownership.EXPLICIT_UPGRADE_STATES and accept_hermes_upgrade and detection.supported)
+        actions = ("restore_owned_hooks",) if state == "owned_incomplete" else ("accept_hermes_upgrade",) if state in decomposed_ownership.EXPLICIT_UPGRADE_STATES else ()
+        findings = ()
+        if state == "stale_unpatched":
+            findings = (RecoveryFinding("hermes_upgrade_hooks_missing", "warning",
+                        "Hermes source changed without owned hooks (an updater/autostash may remove them). "
+                        "Use install --accept-hermes-upgrade --yes after reviewing the upgrade; "
+                        "restart Gateway after successful repair."),)
+        elif state == "stale_reapplied":
+            findings = (RecoveryFinding("hermes_upgrade_hooks_reapplied", "warning",
+                        "Known hooks were reapplied over the exact current Git sources while ownership remained stale. "
+                        "Review the upgrade and use install --accept-hermes-upgrade --yes; "
+                        "restart Gateway after successful repair."),)
+        return RecoveryPlan(detection.root, state, executable, fingerprint, actions, findings)
+    except (OSError, ValueError, UnicodeError):
+        try:
+            fingerprint = decomposed_ownership._fingerprint(decomposed_ownership._snapshot(detection.root))
+        except (OSError, ValueError):
+            fingerprint = sha256(b"unsafe decomposed evidence").hexdigest()
+        return RecoveryPlan(detection.root, "refused", False, fingerprint, (),
+                            (RecoveryFinding("user_modified", "error", "Decomposed ownership cannot be verified."),))
+
+
+def install_decomposed(detection, *, no_repair=False, expected_fingerprint=None, accept_hermes_upgrade=False):
+    from .detect import detect_hermes
+    with _root_lock(detection.root):
+        snapshot, originals, rendered, state = decomposed_ownership._inspect(detection.root)
+        if expected_fingerprint and decomposed_ownership._fingerprint(snapshot) != expected_fingerprint:
+            raise ValueError("recovery evidence changed; rerun diagnosis")
+        detection = detect_hermes(detection.root)
+        if not detection.supported:
+            raise ValueError("unsupported decomposed Hermes: " + detection.reason)
+        if state == "installed":
+            return False
+        if state in {"owned_incomplete", *decomposed_ownership.EXPLICIT_UPGRADE_STATES} and no_repair:
+            raise ValueError("decomposed ownership needs repair; --no-repair set")
+        if state in decomposed_ownership.EXPLICIT_UPGRADE_STATES and not (accept_hermes_upgrade and detection.supported):
+            raise ValueError("decomposed source upgrade requires --accept-hermes-upgrade")
+        fresh = _plan_decomposed_recovery(detection, accept_hermes_upgrade=accept_hermes_upgrade)
+        if fresh.fingerprint != decomposed_ownership._fingerprint(snapshot):
+            raise ValueError("decomposed evidence changed before install")
+        rendered = rendered or decomposed_ownership.render(originals, detection.hook_strategy)
+        manifest = {
+            "manifest_version": DECOMPOSED_MANIFEST_VERSION, "layout": "gateway-decomposed-v1",
+            "integration_mode": "legacy-patch",
+            "targets": {name: {"path": name, "backup": name + BACKUP_SUFFIX,
+                                "original_sha256": sha256(raw).hexdigest(),
+                                "patched_sha256": sha256(rendered[name]).hexdigest()}
+                        for name, raw in originals.items()},
+        }
+        manifest["integrity"] = decomposed_ownership.snapshot_provenance(originals, rendered)
+        validate_decomposed_manifest(manifest)
+        changes = [(detection.root / name, raw.decode("utf-8")) for name, raw in rendered.items()
+                   if snapshot[name] != raw]
+        if state in {"clean", *decomposed_ownership.EXPLICIT_UPGRADE_STATES}:
+            changes = [(detection.root / (name + BACKUP_SUFFIX), raw.decode("utf-8"))
+                       for name, raw in originals.items()] + changes
+        changes.append((detection.root / MANIFEST_NAME, json.dumps(manifest, indent=2) + "\n"))
+        if _secure_dirfd_transactions_supported():
+            _commit_recovery_changes(detection, fresh, changes, accept_hermes_upgrade=accept_hermes_upgrade)
+        else:
+            # Explicit installation on Windows uses the same verified portable
+            # writer as the monolithic installer. Automatic recovery and backup
+            # deletion retain their stronger directory-handle requirement.
+            from .file_transaction import _snapshot_restore_evidence, _write_targets_portably
+            evidence = {name: detection.root / name for name in
+                        (*DECOMPOSED_SOURCE_TARGETS, *(n + BACKUP_SUFFIX for n in DECOMPOSED_SOURCE_TARGETS), MANIFEST_NAME)}
+            identities, directories = _snapshot_restore_evidence(detection.root, evidence)
+            if decomposed_ownership._fingerprint(decomposed_ownership._snapshot(detection.root)) != fresh.fingerprint:
+                raise ValueError("decomposed evidence changed before portable install")
+            _write_targets_portably(changes, expected_identities=identities,
+                                    expected_directories=directories,
+                                    preserve_earlier_writes_on_rollback_failure=True)
+        decomposed_ownership._inspect(detection.root)
+        return True
+
+
+def restore_decomposed(detection):
+    _require_secure_dirfd_transactions()
+    with _root_lock(detection.root):
+        snapshot, originals, _, state = decomposed_ownership._inspect(detection.root, render_hooks=False)
+        if state == "clean":
+            return
+        if state in decomposed_ownership.EXPLICIT_UPGRADE_STATES:
+            raise ValueError("decomposed source drift; refusing restore until upgrade is accepted")
+        fresh = _plan_decomposed_recovery(detection)
+        if fresh.fingerprint != decomposed_ownership._fingerprint(snapshot):
+            raise ValueError("decomposed evidence changed before restore")
+        changes = [(detection.root / name, raw.decode("utf-8")) for name, raw in originals.items()
+                   if snapshot[name] != raw]
+        changes.extend((detection.root / (name + BACKUP_SUFFIX), None) for name in originals)
+        changes.append((detection.root / MANIFEST_NAME, None))
+        _commit_recovery_changes(detection, fresh, changes)

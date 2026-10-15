@@ -3705,3 +3705,150 @@ def test_queued_followup_interruption_reports_metrics_and_the_block_compiles():
     # The helper is imported where the block uses it, so the generated code resolves at runtime.
     assert "import interrupted_turn_locals as _hfc_interrupted_locals" in patched
     assert patcher._apply_queued_followup_patch(patched) == patched
+
+
+# Execute the generated fixture, rather than trusting marker presence alone.
+_CALLBACK_IDENTITY_CASES = {
+    'progress': ('progress_callback', patcher.TOOL_PATCH_BEGIN,
+        'event_type, tool_name=None, preview=None, args=None, **kwargs',
+        "native_trace.append(('progress', label))"),
+    'interim': ('_interim_assistant_cb', patcher.THINKING_DELTA_PATCH_BEGIN,
+        'text, *, already_streamed=False',
+        "native_trace.append(('interim', label))"),
+    'stream': ('_stream_delta_cb', patcher.ANSWER_DELTA_PATCH_BEGIN,
+        'text', '_stream_consumer.on_delta(text)'),
+}
+
+
+def _callback_identity_fixture(kind, *, duplicate=False, tts=False, newline='\n'):
+    name, _marker, args, body = _CALLBACK_IDENTITY_CASES[kind]
+    callback = (
+        f'    def {name}({args}):\n'
+        '        label = "first"\n'
+        f'        {body}\n'
+    )
+    source = (
+        'async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n'
+        '    return await self._run_agent(source, event_message_id=event.message_id)\n\n'
+        'async def _run_agent(self, source, event_message_id=None):\n'
+        '    _loop_for_step = asyncio.get_running_loop()\n'
+        '    def _run_still_current():\n'
+        '        return True\n'
+        + callback
+    )
+    if duplicate:
+        source += callback.replace('"first"', '"second"')
+    if tts:
+        # Both definitions can exist in the AST while only the text path binds
+        # at runtime. Selection must keep its existing preferred-call policy.
+        source += (
+            '    if use_tts:\n'
+            '        def _stream_delta_cb(text):\n'
+            '            _stts_consumer_ref.on_delta(text)\n'
+        )
+    source += f'    return {name}\n'
+    return source.replace('\n', newline)
+
+
+async def _execute_callback_identity(source, kind, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from hermes_feishu_card import hook_runtime
+
+    events, native = [], []
+    def emit(data, *, event_name):
+        events.append((event_name, data))
+        return True
+    monkeypatch.setattr(hook_runtime, 'emit_from_hermes_locals_threadsafe', emit)
+    namespace = {
+        'asyncio': asyncio, 'native_trace': native, 'use_tts': False,
+        '_stream_consumer': SimpleNamespace(on_delta=lambda text: native.append(('text', text))),
+        '_stts_consumer_ref': SimpleNamespace(on_delta=lambda text: native.append(('tts', text))),
+    }
+    exec(compile(source, '<callback-identity-fixture>', 'exec'), namespace)
+    owner = SimpleNamespace(platform='feishu', chat_id='chat_fixture')
+    callback = await namespace['_run_agent'](SimpleNamespace(), owner, 'turn_fixture')
+    if kind == 'progress':
+        callback('tool.started', 'tool_fixture', 'preview_fixture')
+    else:
+        callback('body_fixture')
+    return events, native, owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['progress', 'interim', 'stream'])
+async def test_legacy_callback_identity_rejects_multiple_final_candidates(kind, monkeypatch):
+    original = _callback_identity_fixture(kind, duplicate=True)
+    patched = patcher.apply_patch(original)
+    events, native, _owner = await _execute_callback_identity(patched, kind, monkeypatch)
+    # Python binds the second definition. A marker in the first is not wiring.
+    assert events == []
+    assert native == ([('text', 'body_fixture')] if kind == 'stream' else [(kind, 'second')])
+    assert _CALLBACK_IDENTITY_CASES[kind][1] not in patched
+    assert patcher.apply_patch(patched) == patched
+    assert patcher.remove_patch(patched) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['progress', 'interim', 'stream'])
+@pytest.mark.parametrize('newline', ['\n', '\r\n'], ids=['lf', 'crlf'])
+async def test_existing_callback_marker_cannot_bypass_changed_identity(kind, newline, monkeypatch):
+    original = _callback_identity_fixture(kind, newline=newline)
+    patched = patcher.apply_patch(original)
+    assert _CALLBACK_IDENTITY_CASES[kind][1] in patched
+    name, _marker, args, body = _CALLBACK_IDENTITY_CASES[kind]
+    shadow = (f'    def {name}({args}):\n'
+              '        label = "second"\n'
+              f'        {body}\n').replace('\n', newline)
+    anchor = f'    return {name}{newline}'
+    changed = patched.replace(anchor, shadow + anchor)
+    unpatched_changed = original.replace(anchor, shadow + anchor)
+    refreshed = patcher.apply_patch(changed)
+    events, native, _owner = await _execute_callback_identity(refreshed, kind, monkeypatch)
+    assert events == []
+    assert native == ([('text', 'body_fixture')] if kind == 'stream' else [(kind, 'second')])
+    assert _marker not in refreshed
+    assert patcher.apply_patch(refreshed) == refreshed
+    assert patcher.remove_patch(refreshed) == unpatched_changed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['progress', 'interim', 'stream'])
+@pytest.mark.parametrize('newline', ['\n', '\r\n'], ids=['lf', 'crlf'])
+async def test_unique_callback_identity_executes_and_reapplies_byte_exact(kind, newline, monkeypatch):
+    original = _callback_identity_fixture(kind, newline=newline)
+    patched = patcher.apply_patch(original)
+    assert patcher.apply_patch(patched) == patched
+    assert patcher.remove_patch(patched) == original
+    events, native, owner = await _execute_callback_identity(patched, kind, monkeypatch)
+    expected = {'progress': 'tool.updated', 'interim': 'thinking.delta', 'stream': 'answer.delta'}[kind]
+    assert [name for name, _data in events] == [expected]
+    assert events[0][1]['source'] is owner
+    assert events[0][1]['message_id'] == 'turn_fixture'
+    assert native == []
+
+
+@pytest.mark.asyncio
+async def test_unique_preferred_text_callback_stays_ahead_of_tts_and_executes(monkeypatch):
+    original = _callback_identity_fixture('stream', tts=True)
+    patched = patcher.apply_patch(original)
+    assert patched.count(patcher.ANSWER_DELTA_PATCH_BEGIN) == 1
+    assert patched.index(patcher.ANSWER_DELTA_PATCH_BEGIN) < patched.index('_stream_consumer.on_delta(text)')
+    assert patcher.apply_patch(patched) == patched
+    assert patcher.remove_patch(patched) == original
+    events, native, owner = await _execute_callback_identity(patched, 'stream', monkeypatch)
+    assert [name for name, _data in events] == ['answer.delta']
+    assert events[0][1]['source'] is owner and native == []
+
+
+@pytest.mark.asyncio
+async def test_unique_tts_only_callback_keeps_legacy_fallback_and_executes(monkeypatch):
+    original = _callback_identity_fixture('stream').replace(
+        '_stream_consumer.on_delta(text)', '_stts_consumer_ref.on_delta(text)'
+    )
+    patched = patcher.apply_patch(original)
+    assert patcher.apply_patch(patched) == patched
+    assert patcher.remove_patch(patched) == original
+    events, native, owner = await _execute_callback_identity(patched, 'stream', monkeypatch)
+    assert [name for name, _data in events] == ['answer.delta']
+    assert events[0][1]['source'] is owner and native == []

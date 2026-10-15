@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 TERMINAL_TOOL_STATUSES = {
+    "blocked",
+    "timeout",
+    "unverified",
     "completed",
     "success",
     "succeeded",

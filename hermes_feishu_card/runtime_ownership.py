@@ -10,6 +10,20 @@ from typing import Any
 from .process_identity import LocalProcessMonitor
 
 
+def python_executable_identity(executable: str | os.PathLike[str]) -> str:
+    """Return a path-free, domain-separated identity for a Python runtime."""
+    path = Path(executable).expanduser()
+    try:
+        canonical_parent = path.parent.resolve(strict=False)
+    except (OSError, RuntimeError):
+        canonical_parent = path.parent.absolute()
+    canonical = os.path.normcase(str(canonical_parent / path.name))
+    material = b"hermes-feishu-streaming-card:python-executable:v1\0" + os.fsencode(
+        canonical
+    )
+    return f"python-sha256:{hashlib.sha256(material).hexdigest()}"
+
+
 def runtime_target_identity(root: str | Path, *, home: str | Path | None = None) -> str:
     source = Path(root).expanduser().resolve()
     canonical = os.path.normcase(str(source))

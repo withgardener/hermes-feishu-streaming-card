@@ -239,6 +239,11 @@ V3.10.0 的 command-card adapter hook 会在运行时包装 runner 的 `_handle_
 
 ## Agent clarify / approval 交互
 
+Hybrid 的 clarify 自然超时状态来自原 `wait_for_response`，不解析答案文案：只有已经准入的原 handle、同一 runtime/turn/session/tool-call、有限等待期限已到，且原返回为 `None`、原 response 未写入、event 未设置，才给这一工具调用记录 display-only `timeout`。取消、真实回答、未知关联及等待异常不据此标记超时；原返回值和异常原样保留。该观察借用本次等待的局部引用，复用每轮有界 outcome map，不注册第二个 waiter/resolver，也不延长交互有效期。最终 post-tool 的 `ok/error` 可使用此事实修正展示，显式取消状态仍保留。
+
+Hermes 的专用 clarify executor 不经过通用 dispatcher，因此可能没有 approval 的 turn/call ContextVar。此时仅在两者都为空、原 gateway session 已匹配时，使用官方 `pre_tool_call` 在本轮记录的执行线程、call ID 与规范化问题/选项指纹，继续绑定已准入的同一原 handle。非空冲突 ContextVar 不回退；同线程重叠调用全部标为歧义，直到各自精确 post-tool 结束也不重新启用旧调用。记录最多 128 条，终结后保留本轮墓碑以拒绝迟到 pre-tool，随轮次回收；它只关联展示状态，不授予执行权限。回归须包含 Hermes 的实际专用执行分支和签名 HTTP admission 链，不能只测通用 dispatcher。
+
+
 `interaction.requested` 使用 Feishu WebSocket card-action 可回调的 legacy interactive payload，普通流式输出使用 schema 2.0。已有 schema 2.0 owner 不直接切到 legacy 交互消息。clarify/approval 选择后先保留问题与决定回执；后续确有输出时才新建同路由 schema 2.0 续答卡，确认送达后切换 owner。连续下一题没有输出时不夹空卡。完整规则和唯一 legacy owner 的失败/恢复分支见[交互续答](interaction-continuation.md)。
 
 HTTP callback 可达时，Feishu/Lark POST 到 sidecar `/card/actions`；WebSocket 场景由 Hermes adapter 转发 `interaction.select`。首次 turn/interaction 会接线，不依赖 slash/model/resume 预热；生成闭包只有 `ctx` 时必须证明 Gateway、source、profile 与同一 live adapter 的归属。已连接 SDK dispatcher 不重建。

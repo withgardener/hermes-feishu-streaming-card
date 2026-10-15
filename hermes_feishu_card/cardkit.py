@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .card_limits import serialize_card_for_delivery
+from .delivery import FeishuAPIError
 
 
 logger = logging.getLogger(__name__)
@@ -127,7 +128,6 @@ class CardKitTransport:
         self.entities = {k: e for k, e in self.entities.items() if id(e) not in expired}
 
     async def send(self, chat_id: str, card: dict[str, Any], **kwargs: Any) -> Any:
-        from .feishu_client import FeishuAPIError
         card = _normalize_element_ids(card)
         serialized = serialize_card_for_delivery(card)
         delivery_uuid = kwargs.get('delivery_uuid')
@@ -181,7 +181,6 @@ class CardKitTransport:
         body = {**body, 'sequence': entity.sequence,
                 'uuid': sha256(f'{entity.card_id}:{entity.sequence}'.encode()).hexdigest()[:40]}
         token = await self.client._tenant_token()
-        from .feishu_client import FeishuAPIError
         try:
             await self.client._request_json(
                 method, f'/cardkit/v1/cards/{quote(entity.card_id, safe="")}{suffix}',

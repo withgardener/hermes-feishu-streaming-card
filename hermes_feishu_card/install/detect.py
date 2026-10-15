@@ -240,7 +240,7 @@ def detect_hermes(root: str | Path) -> HermesDetection:
                 base_py, "gateway/platforms/base.py"
             )
     if decomposed:
-        from . import decomposed as decomposed_ownership
+        from . import decomposed_ownership
         if decomposed_ownership.is_managed(hermes_root):
             try:
                 _, originals, _, _ = decomposed_ownership._inspect(hermes_root, render_hooks=False)
@@ -896,22 +896,7 @@ def _is_hooks_emit(func: ast.expr) -> bool:
     )
 
 
-_LAYOUT_MARKERS = {
-    "message_handler": patcher.PATCH_BEGIN,
-    "completion_return": patcher.COMPLETE_PATCH_BEGIN,
-    "tool_callback": patcher.STABLE_TOOL_PATCH_BEGIN,
-    "answer_delta_callback": patcher.ANSWER_DELTA_PATCH_BEGIN,
-    "thinking_delta_callback": patcher.THINKING_DELTA_PATCH_BEGIN,
-    "status_callback": patcher.STATUS_PATCH_BEGIN,
-    "clarify_callback": patcher.CLARIFY_PATCH_BEGIN,
-    "approval_callback": patcher.APPROVAL_PATCH_BEGIN,
-    "command_card": patcher.COMMAND_CARD_PATCH_BEGIN,
-    "hfc_command": patcher.HFC_COMMAND_PATCH_BEGIN,
-    "slash_confirm": patcher.SLASH_CONFIRM_PATCH_BEGIN,
-    "startup": patcher.COMMAND_CARD_STARTUP_PATCH_BEGIN,
-    "redelivery": patcher.NATIVE_REDELIVERY_PATCH_BEGIN,
-    "platform_notice": patcher.PLATFORM_NOTICE_PATCH_BEGIN,
-}
+_LAYOUT_MARKERS = patcher.DECOMPOSED_LAYOUT_MARKERS
 
 
 def _detect_layout_capabilities(sources, cron_contents, cron_target):

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,22 +18,11 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DEFAULT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
-GROUPS = {
-    "runtime": ["tests/unit/test_hook_runtime.py", "tests/integration/test_server.py"],
-    "render": ["tests/unit/test_render.py", "tests/unit/test_session.py",
-               "tests/unit/test_native_tables.py"],
-    "config": ["tests/unit/test_config.py", "tests/unit/test_package_metadata.py"],
-    "install": ["tests/unit/test_patcher.py", "tests/integration/test_cli_install.py"],
-    "process": ["tests/unit/test_process.py", "tests/integration/test_cli_process.py"],
-    "docs": ["tests/unit/test_docs.py", "tests/unit/test_package_metadata.py"],
-    "preflight": ["tests/unit/test_preflight.py"],
-    "appearance": ["tests/unit/test_presentation.py", "tests/unit/test_card_preview.py",
-                   "tests/unit/test_reading_presets.py", "tests/unit/test_render.py",
-                   "tests/unit/test_session_store.py", "tests/unit/test_legacy_owner_checkpoint.py",
-                   "tests/integration/test_reading_presets_http.py", "tests/integration/test_combined_stability.py"],
-    "quota": ["tests/unit/test_subscription_usage.py", "tests/unit/test_render.py",
-              "tests/integration/test_server.py"],
-}
+# Explicit routes keep added runtime files visible during refactors. Unknown
+# files still require a deliberate group; do not infer safety from a filename.
+_ROUTING = json.loads(Path(__file__).with_name("preflight_routes.json").read_text())
+GROUPS = _ROUTING["groups"]
+SOURCE_GROUPS = _ROUTING["sources"]
 _PROBE = r'''
 import importlib.util, importlib.metadata, json, pathlib, sys
 from urllib.parse import urlparse, unquote
@@ -140,29 +130,15 @@ def select_targets(paths, modules):
     for name in paths if not modules else []:
         if re.fullmatch(r"tests/(?:unit|integration)/test_[A-Za-z0-9_]+\.py", name):
             direct.add(name)
-        elif name.startswith("docs/") or name in {"README.md", "README.en.md", "CHANGELOG.md", "AGENTS.md"}:
+        elif name.startswith("docs/") or name in {"README.md", "README.en.md", "CHANGELOG.md", "AGENTS.md", "TODO.md"}:
             groups.add("docs")
-        elif name in {"hermes_feishu_card/presentation.py", "hermes_feishu_card/preview.py",
-                      "hermes_feishu_card/preview_template.html", "hermes_feishu_card/reading.py"}:
-            groups.add("appearance")
-        elif name == "hermes_feishu_card/render_options.py":
-            groups.update({"appearance", "runtime"})
-        elif name == "hermes_feishu_card/subscription_usage.py":
-            groups.add("quota")
-        elif name in {"hermes_feishu_card/session.py", "hermes_feishu_card/session_store.py"}:
-            groups.update({"render", "appearance"})
-        elif name == "tools/preflight.py":
+        elif name in SOURCE_GROUPS:
+            groups.update(SOURCE_GROUPS[name])
+        elif name in {"tools/preflight.py", "tools/preflight_routes.json"}:
             groups.add("preflight")
-        elif name.startswith("hermes_feishu_card/install/") or name.startswith("install"):
+        elif name in {"install.sh", "install.ps1", "install-docker.sh"}:
             groups.add("install")
-        elif name in {"hermes_feishu_card/hook_runtime.py", "hermes_feishu_card/server.py"}:
-            groups.add("runtime")
-        elif name in {"hermes_feishu_card/render.py", "hermes_feishu_card/text.py",
-                      "hermes_feishu_card/native_tables.py"}:
-            groups.add("render")
-        elif name in {"hermes_feishu_card/process.py", "hermes_feishu_card/persistent_service.py"}:
-            groups.add("process")
-        elif name in {"hermes_feishu_card/config.py", "hermes_feishu_card/__init__.py", "config.yaml.example", "pyproject.toml"}:
+        elif name in {"config.yaml.example", "pyproject.toml"}:
             groups.add("config")
         else:
             unknown += 1
@@ -205,13 +181,68 @@ def child_environment(environ, private, fixture):
     return env
 
 
-def execute_suite(root, targets, fixture, environ, report, base="HEAD"):
+def _scratch_reference_state(private):
+    """Conservatively prove that the completed child has no live file users."""
+    lsof = shutil.which("lsof")
+    if lsof is None:
+        return "unknown"
+    try:
+        probe = subprocess.run(
+            [lsof, "-t", "+D", str(private)], capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if probe.stdout.strip():
+        return "busy"
+    return "unused" if probe.returncode == 1 and not probe.stderr.strip() else "unknown"
+
+
+def cleanup_scratch(private, identity):
+    """Remove only this invocation's bulky state; keep its diagnostic evidence."""
+    def still_owned():
+        try:
+            current = private.lstat()
+            return (not private.is_symlink()
+                    and (current.st_dev, current.st_ino) == identity)
+        except OSError:
+            return False
+
+    if not still_owned():
+        return {"status": "retained_identity_changed"}
+    # The fd-based implementation refuses directory-to-symlink swaps. On
+    # platforms without it, retain scratch rather than weaken this boundary.
+    if not shutil.rmtree.avoids_symlink_attacks:
+        return {"status": "retained_platform_unverified"}
+    references = _scratch_reference_state(private)
+    if references != "unused":
+        return {"status": "retained_" + references}
+    removed = 0
+    for name in ("pytest", "home", "state"):
+        if not still_owned():
+            return {"status": "retained_identity_changed", "removed_trees": removed}
+        path = private / name
+        try:
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                return {"status": "retained_unexpected_entry", "removed_trees": removed}
+            removed += 1
+        except OSError:
+            return {"status": "retained_cleanup_error", "removed_trees": removed}
+    return {"status": "reclaimed", "removed_trees": removed, "evidence_retained": True}
+
+
+def execute_suite(root, targets, fixture, environ, report, base="HEAD", *, keep_artifacts=False):
     # Retain owner-only logs for local diagnosis; stdout JSON contains no paths
     # or raw pytest output (which can contain local paths and parametrized data).
     # macOS tempfile paths commonly start with the /var symlink. The delivery
     # ledger deliberately refuses symlink ancestors, so pass a canonical path.
     private = Path(tempfile.mkdtemp(prefix="hfc-preflight-")).resolve()
     private.chmod(0o700)
+    stat = private.stat()
+    identity = (stat.st_dev, stat.st_ino)
     (private / "state").mkdir(mode=0o700)
     (private / "home").mkdir(mode=0o700)
     env = child_environment(environ, private, fixture)
@@ -234,6 +265,7 @@ def execute_suite(root, targets, fixture, environ, report, base="HEAD"):
             report["pytest"]["counts"] = counts
         except (ET.ParseError, ValueError):
             report["pytest"]["summary"] = "unavailable"
+    report["cleanup"] = {"status": "retained_failure" if result.returncode else "retained_requested"}
     if result.returncode:
         return result.returncode if result.returncode > 0 else 1
     committed = run_read(["git", "diff", "--check", base, "HEAD", "--"], root)
@@ -241,6 +273,10 @@ def execute_suite(root, targets, fixture, environ, report, base="HEAD"):
     staged = run_read(["git", "diff", "--cached", "--check"], root)
     code = committed.returncode or diff.returncode or staged.returncode
     report["diff_check"] = {"status": "passed" if code == 0 else "failed", "exit_code": code}
+    if code:
+        report["cleanup"] = {"status": "retained_failure"}
+    elif not keep_artifacts:
+        report["cleanup"] = cleanup_scratch(private, identity)
     return code
 
 
@@ -251,6 +287,7 @@ def main(argv=None, *, root=None, cwd=None, environ=None):
     mode.add_argument("--suite", choices=("focused", "full"), help="explicitly run pytest, then git diff --check")
     parser.add_argument("--module", choices=sorted(GROUPS), action="append", default=[], help="focused group; repeat to combine")
     parser.add_argument("--base", default="HEAD", help="focused auto-selection base; includes staged, unstaged and untracked files")
+    parser.add_argument("--keep-artifacts", action="store_true", help="retain successful pytest scratch as well as logs; failures are always retained")
     args = parser.parse_args(argv)
     if args.module and args.suite != "focused":
         parser.error("--module requires --suite focused")
@@ -290,7 +327,7 @@ def main(argv=None, *, root=None, cwd=None, environ=None):
                     raise ValueError("selected_test_missing")
             if needs_fixture(root, targets) and report["fixture"]["status"] != "verified":
                 raise ValueError("fixed_fixture_required")
-            code = execute_suite(root, targets, fixture, environ, report, base)
+            code = execute_suite(root, targets, fixture, environ, report, base, keep_artifacts=args.keep_artifacts)
             report["status"] = ("passed" if report["fixture"]["status"] == "verified" else "partial") if code == 0 else "failed"
     except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as exc:
         # Only fixed reason tokens may enter a shareable result.

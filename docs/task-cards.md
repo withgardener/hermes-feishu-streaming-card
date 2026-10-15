@@ -1,6 +1,6 @@
 # 任务卡片与离线预览（4.7.0）
 
-`task` 把卡片分为状态、正文、过程和统计四个阅读区域。它沿用已有投递与权限流程，适合希望先看答案、再查看执行细节的用户。这些选项从 4.7.0 开始提供，保持主动启用。
+`task` 把卡片分为状态、正文、过程和统计四个阅读区域。它沿用已有投递与权限流程，开发分支采用已确认的 B「任务分区」方向：状态色标题与展开的过程，便于连续追踪执行和回看完成历史。这些选项从 4.7.0 开始提供，保持主动启用。
 
 ## 启用与回退
 
@@ -15,12 +15,14 @@ card:
 
 ## 卡片变化
 
+开发分支的 `task` 过程默认展开；完成状态仍保留历史。希望延续旧版折叠方式时显式设置 `card.timeline_expanded: false`。`classic`、`focused`、`detailed` 及所有显式覆盖不变。该方向尚待本轮真实客户端验收。
+
 | 场景 | 任务布局 |
 | --- | --- |
 | 开始与执行 | 顶部只说明任务状态；正文集中显示当前动作；参数和历史在实际包含该工具的“执行过程”中查看 |
 | 没有新事件 | 超过 60 秒显示“等待新进展”，写明执行情况尚待确认；旧动作标为“上次动作” |
 | 审批与选择 | 统一状态标题，完整问题留在正文，范围和原有操作保留；选择后显示回执 |
-| 完成 | 省去重复副标题，正文优先；成功工具行默认收起，失败和中断证据保留 |
+| 完成 | 省去重复副标题，正文优先；成功工具保留在展开的过程里，避免正文再次重复，失败和中断证据保留 |
 | 失败 | 明确显示“已停止”，保留已收到的答案及错误 |
 | 展示恢复 | 显示“等待状态同步”，不会恢复旧授权或宣称任务已续跑 |
 | 页脚 | 只保留有依据的耗时、模型和用量，不重复动作与工具数；无标题的完成回复保留唯一完成标识；非 Codex GPT 回合不显示订阅额度 |
@@ -58,6 +60,8 @@ hermes-feishu-card card-config --config ~/.hermes_feishu_card/config.yaml --prev
 ## English quick reference
 
 This opt-in feature is available from **4.7.0**; see the release notes for accepted desktop scope and unverified cases. Set `card.reading_preset: task` to opt into the task layout. Explicit display values retain precedence; restart through the existing service manager after editing. Switch to `classic`, `focused` or `detailed` to revert.
+
+The development branch follows the approved B direction: state-colored headers and expanded process history by default. Successful steps remain in the process history after completion without a duplicate body summary. Set `timeline_expanded: false` to retain the released version's collapsed default. Real-client acceptance for this change is still tracked separately.
 
 Task cards emphasize observed state and the complete answer, keep reasoning in a collapsible process panel, retain permission scope and callback ownership, and omit unreported footer metrics. After 60 seconds without an event, one bounded update explains that execution status is unknown. Pending input and terminal states stop refreshes. Restored display does not restore execution or authorization.
 

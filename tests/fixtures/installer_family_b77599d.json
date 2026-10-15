@@ -1,0 +1,429 @@
+{
+  "baseline": "b77599da8eb1b7400ad61880a31b9775af5dad46",
+  "actual_checkout": "48b82d905e41078f5d8eb8aa82ea96448d722a8b",
+  "equivalent_sha256": {
+    "hermes_feishu_card/install/decomposed.py": "c9aff1de123224c09323165bd32de082ed3e1858cc37f21bb4ab96176be36c0b",
+    "hermes_feishu_card/install/manifest.py": "b705d1f778f58d804593bf5edc59d6027392089dcb6e353d0ebad2381c0b512c",
+    "hermes_feishu_card/install/integrity.py": "83b6ff6cb87dc7c0214a473f39146b3af0c87c08e2ec1f8f6aa0a8f1d1c51fa2",
+    "hermes_feishu_card/install/recovery.py": "d56de699917f57ca2078063989c35e811e5dbcd7f0669da80d4cca2accddc8c9",
+    "hermes_feishu_card/install/detect.py": "5fc518a435fb38a00cdaaa744967640bdea7468760a6f3c9dc90cd41b7bc79fb",
+    "hermes_feishu_card/install/patcher.py": "358e9c24464023f9cb505b999bdc413160c020bea4442becbdfcae96879b35f9"
+  },
+  "manifest_cases": [
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        },
+        "integrity": {
+          "kind": "synthetic extra"
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": true,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestVersionError",
+          "message": "install manifest version is unsupported; newer installer required; refusing to mutate"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 999,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestVersionError",
+          "message": "install manifest version is unsupported; newer installer required; refusing to mutate"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "wrong",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestVersionError",
+          "message": "install manifest version is unsupported; newer installer required; refusing to mutate"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "hybrid",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestVersionError",
+          "message": "install manifest version is unsupported; newer installer required; refusing to mutate"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {}
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": []
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/unknown.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {},
+      "expected": {
+        "general": {
+          "value": 1
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestVersionError",
+          "message": "install manifest version is unsupported; newer installer required; refusing to mutate"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 1
+      },
+      "expected": {
+        "general": {
+          "value": 1
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 2
+      },
+      "expected": {
+        "general": {
+          "value": 2
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed ownership manifest"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "../run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "wrong",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    },
+    {
+      "input": {
+        "manifest_version": 4,
+        "layout": "gateway-decomposed-v1",
+        "integration_mode": "legacy-patch",
+        "targets": {
+          "gateway/run.py": {
+            "path": "gateway/run.py",
+            "backup": "gateway/run.py.hermes-feishu-card.bak",
+            "original_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patched_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "extra": "bad"
+          }
+        }
+      },
+      "expected": {
+        "general": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        },
+        "decomposed": {
+          "error": "ManifestStructureError",
+          "message": "invalid decomposed target ownership"
+        }
+      }
+    }
+  ],
+  "fingerprints": [
+    {
+      "input": {},
+      "expected": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "input": {
+        "gateway/run.py": null
+      },
+      "expected": "66877fffd9b953b81821045684ac3579f002f6950b5fcd4c02520c4bcc594fc0"
+    },
+    {
+      "input": {
+        "gateway/run.py": "print(1)\n",
+        "VERSION": "0.20\n",
+        "missing": null
+      },
+      "expected": "5fdfb11259e1eaeba4de7f911c9cc1546f79a7b9ebc9361a2f9b00000eb7b601"
+    }
+  ]
+}

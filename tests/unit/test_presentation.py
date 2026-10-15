@@ -375,8 +375,8 @@ def test_task_clarify_controls_name_choices_without_changing_values(multi_select
     assert snapshot(value) == before
 
 
-@pytest.mark.parametrize("status,color", [("completed", "green"), ("failed", "red")])
-def test_task_interaction_receipt_color_matches_its_own_state(status, color):
+@pytest.mark.parametrize("status,label", [("completed", "选择已记录"), ("failed", "此次选择已失效")])
+def test_task_interaction_receipt_keeps_its_own_state_and_color(status, label):
     from hermes_feishu_card.render import render_legacy_interaction_callback_card
     value = session(status="tool_running")
     value.active_interaction = InteractionState(
@@ -384,7 +384,8 @@ def test_task_interaction_receipt_color_matches_its_own_state(status, color):
         options=[InteractionOption("继续", "yes")],
     )
     card = render_legacy_interaction_callback_card(value, presentation="task")
-    assert card["header"]["template"] == color
+    assert card["header"]["template"] == ("red" if status == "failed" else "green")
+    assert card["header"]["title"]["content"] == f"Hermes Agent · {label}"
 
 
 def test_task_failed_approval_marks_prompt_as_history_without_losing_scope():

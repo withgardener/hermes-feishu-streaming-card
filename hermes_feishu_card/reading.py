@@ -5,95 +5,27 @@ import copy
 from collections.abc import Mapping
 from typing import Any
 
-
-# This derived field is internal: the legacy hide switch still covers both
-# successful and failed terminals, including an explicit False override.
-HIDE_SUCCESSFUL_TOOL_ACTIVITY = "_hide_successful_tool_activity"
-PRESENTATION_MODE = "_presentation_mode"
-READING_PRESETS = {
-    "classic": {
-        PRESENTATION_MODE: "classic",
-        "show_reasoning": True,
-        "stream_thinking_to_body": True,
-        "hide_completed_tool_activity": False,
-        "reasoning_format": "panel",
-        "timeline_expanded": False,
-        HIDE_SUCCESSFUL_TOOL_ACTIVITY: False,
-    },
-    "focused": {
-        PRESENTATION_MODE: "classic",
-        "show_reasoning": True,
-        "stream_thinking_to_body": False,
-        "hide_completed_tool_activity": False,
-        "reasoning_format": "panel",
-        "timeline_expanded": False,
-        HIDE_SUCCESSFUL_TOOL_ACTIVITY: True,
-    },
-    "detailed": {
-        PRESENTATION_MODE: "classic",
-        "show_reasoning": True,
-        "stream_thinking_to_body": False,
-        "hide_completed_tool_activity": False,
-        "reasoning_format": "panel",
-        "timeline_expanded": True,
-        HIDE_SUCCESSFUL_TOOL_ACTIVITY: False,
-    },
-    "task": {
-        PRESENTATION_MODE: "task",
-        "show_reasoning": True,
-        "stream_thinking_to_body": False,
-        "hide_completed_tool_activity": False,
-        "reasoning_format": "panel",
-        "timeline_expanded": False,
-        HIDE_SUCCESSFUL_TOOL_ACTIVITY: True,
-    },
-}
-READING_FIELDS = (
-    "reading_preset", "show_reasoning", "stream_thinking_to_body",
-    "hide_completed_tool_activity", "reasoning_format", "timeline_expanded",
-    "max_timeline_items", "max_reasoning_chars", "max_tool_result_chars",
-    "table_overflow_mode",
-    "native_tables",
-    "timeline_order", "timeline_tools_per_reasoning", "thinking_body_tail_chars",
-    "width_mode", "text_sizes", "footer_fields", "interaction_mode", "streaming_mode",
+from .config_rules import (
+    HIDE_SUCCESSFUL_TOOL_ACTIVITY as HIDE_SUCCESSFUL_TOOL_ACTIVITY,
+    PRESENTATION_MODE as PRESENTATION_MODE,
+    READING_PRESETS as READING_PRESETS,
+    READING_FIELDS as READING_FIELDS,
+    normalize_reading_preset as normalize_reading_preset,
+    expand_reading_preset as expand_reading_preset,
 )
-
-
-def normalize_reading_preset(value: object, *, path: str = "card.reading_preset") -> str:
-    if not isinstance(value, str) or value.strip().lower() not in READING_PRESETS:
-        raise ValueError(f"{path} must be classic, focused, detailed or task")
-    return value.strip().lower()
-
-
-def expand_reading_preset(card: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Expand one scope before merging it over its parent scope.
-
-    Already resolved scopes carry the derived terminal flag. Preserve it when
-    they travel through the existing profile/factory merge a second time.
-    """
-    incoming = copy.deepcopy(dict(card or {}))
-    result: dict[str, Any] = {}
-    if "reading_preset" in incoming:
-        preset = normalize_reading_preset(incoming["reading_preset"])
-        incoming["reading_preset"] = preset
-        result.update(READING_PRESETS[preset])
-    if "hide_completed_tool_activity" in incoming and HIDE_SUCCESSFUL_TOOL_ACTIVITY not in incoming:
-        # A legacy explicit value has higher priority than preset behavior.
-        result[HIDE_SUCCESSFUL_TOOL_ACTIVITY] = False
-    result.update(incoming)
-    return result
 
 
 def explain_reading_config(
     raw: Mapping[str, Any], *, profile_id: str | None = None, bot_id: str | None = None,
+    include_scope: bool = False,
 ) -> dict[str, Any]:
     """Resolve the same config scopes as the runner, returning only safe values.
 
     Callers validate the YAML with load_config first. No credentials, paths,
     route identifiers, user titles, or arbitrary config objects are returned.
     """
-    from .config import DEFAULT_CONFIG, CARD_TEXT_SIZE_DEFAULTS, merge_card_config, normalize_text_sizes, normalize_width_mode
-    from .presentation import TASK_TEXT_SIZE_DEFAULTS
+    from .config_rules import DEFAULT_CONFIG, CARD_TEXT_SIZE_DEFAULTS, merge_card_config, normalize_text_sizes, normalize_width_mode
+    from .card_view import TASK_TEXT_SIZE_DEFAULTS
 
     resolved = copy.deepcopy(DEFAULT_CONFIG["card"])
     resolved["reading_preset"] = "classic"
@@ -225,7 +157,7 @@ def explain_reading_config(
         sources["hide_completed_tool_activity"] if resolved["hide_completed_tool_activity"]
         else sources[HIDE_SUCCESSFUL_TOOL_ACTIVITY]
     )
-    return {
+    report = {
         "values": values,
         "sources": {key: sources[key] for key in values},
         "text_size_sources": text_size_sources,
@@ -233,3 +165,8 @@ def explain_reading_config(
         "running_config": "not_checked",
         "note": "Read-only. Scope order: global, profile, bot; explicit fields win within each scope. These are next-load values, not proof of the running configuration. Restart the sidecar after editing YAML.",
     }
+    if include_scope:
+        # Private selector for the local control request, removed by the CLI
+        # before output. Do not publish configured profile/bot identifiers.
+        report["_selected_scope"] = {"profile_id": profile_id or "default", "bot_id": selected_bot}
+    return report

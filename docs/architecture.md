@@ -71,3 +71,7 @@ Windows non-loopback 在无法验证 state directory 的 ACL 私有性时 fail-c
 ## 旧代码边界
 
 `legacy/adapter/`、`legacy/sidecar/`、`legacy/patch/` 及 `legacy/` 下的旧安装/patch 脚本是历史 legacy/dual 实现，不是 active runtime。当前维护只以 `hermes_feishu_card/`、当前 CLI、安装器安全模型和 `docs/wiki/` 为准。
+
+## 开发分支重构边界
+
+已实施模块、兼容名称与尚未完成的拆分见[模块边界记录](wiki/refactor-boundaries.md)。已加载配置接口复用私有 process token，只读本进程的 factory 默认值；正文转换保留独立的完整来源；观测耗时仅描述受理事件范围。完整计划、真实客户端和公开发行各自留证。

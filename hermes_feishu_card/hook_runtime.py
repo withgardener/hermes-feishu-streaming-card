@@ -30,6 +30,28 @@ from urllib import request
 
 from . import __version__
 from .card_limits import serialize_card_for_delivery
+from .canonical_turn import (
+    publish_canonical_turn_id,
+    clear_canonical_turn_id,
+    consume_canonical_turn_id,
+    canonical_turn_context_limit,
+    _canonical_turn_registry_size,
+    reset_canonical_turn_for_tests,
+)
+from .command_cards import (
+    model_picker_options as _model_picker_options,
+    model_picker_provider_tree as _model_picker_provider_tree,
+    model_picker_provider as _model_picker_provider,
+    hfc_native_model_picker_card as _hfc_native_model_picker_card,
+    resume_picker_options as _resume_picker_options,
+    parse_model_picker_choice as _parse_model_picker_choice,
+    hfc_slash_confirm_detail as _hfc_slash_confirm_detail,
+    hfc_button as _hfc_button,
+    hfc_select_static as _hfc_select_static,
+    hfc_command_result_card as _hfc_command_result_card,
+    hfc_command_result_title as _hfc_command_result_title,
+    hfc_command_result_template as _hfc_command_result_template,
+)
 from .events import completion_turn_outcome
 from .event_auth import (
     sign_event_request,
@@ -227,19 +249,6 @@ _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, repr=False)
-class _CanonicalTurnFrame:
-    turn_id: str
-    token: object
-
-
-@dataclass(frozen=True, repr=False)
-class _CanonicalTurnEntry:
-    token: object
-    owner: object
-    turn_id: str
-
-
-@dataclass(frozen=True, repr=False)
 class HybridTerminalRecord:
     """Detached one-shot terminal evidence; it carries no suppress decision."""
 
@@ -366,12 +375,6 @@ _HFC_NATIVE_HANDOFF_CHUNK: ContextVar[dict[str, Any] | None] = ContextVar(
     "hfc_native_handoff_chunk",
     default=None,
 )
-_HFC_CANONICAL_TURN_CARRIER: ContextVar[tuple[_CanonicalTurnFrame, ...]] = (
-    ContextVar("hfc_canonical_turn_carrier", default=())
-)
-_CANONICAL_TURN_REGISTRY_LIMIT = 1024
-_CANONICAL_TURN_REGISTRY_LOCK = threading.RLock()
-_CANONICAL_TURN_REGISTRY: dict[object, _CanonicalTurnEntry] = {}
 _HFC_NATIVE_HANDOFF_ROUTE: ContextVar[str | None] = ContextVar(
     "hfc_native_handoff_route",
     default=None,
@@ -470,9 +473,7 @@ def reset_runtime_state() -> None:
     _HFC_NATIVE_HANDOFF_SEND_TRACKER.set(None)
     _HFC_NATIVE_HANDOFF_CHUNK.set(None)
     _HFC_NATIVE_HANDOFF_ROUTE.set(None)
-    with _CANONICAL_TURN_REGISTRY_LOCK:
-        _CANONICAL_TURN_REGISTRY.clear()
-        _HFC_CANONICAL_TURN_CARRIER.set(())
+    reset_canonical_turn_for_tests()
     for task in list(_NATIVE_HANDOFF_ACK_TASKS):
         task.cancel()
     _NATIVE_HANDOFF_ACK_TASKS.clear()
@@ -480,158 +481,6 @@ def reset_runtime_state() -> None:
     with _GATEWAY_RUNNER_LOCK:
         _GATEWAY_RUNNER_REF = None
     reset_runtime_control_for_tests()
-
-
-def _canonical_turn_owner() -> tuple[threading.Thread, asyncio.Task[Any] | None]:
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:
-        task = None
-    return threading.current_thread(), task
-
-
-def _same_canonical_turn_owner(left: object, right: object) -> bool:
-    return left is right or (
-        type(left) is tuple
-        and len(left) == 2
-        and type(right) is tuple
-        and len(right) == 2
-        and left[0] is right[0]
-        and left[1] is right[1]
-    )
-
-
-def _live_canonical_turn_frames_locked(
-    frames: object,
-    owner: object,
-) -> tuple[_CanonicalTurnFrame, ...] | None:
-    if type(frames) is not tuple:
-        return None
-    live_frames: list[_CanonicalTurnFrame] = []
-    for frame in frames:
-        if type(frame) is not _CanonicalTurnFrame:
-            return None
-        entry = _CANONICAL_TURN_REGISTRY.get(frame.token)
-        if entry is None:
-            continue
-        if (
-            entry.token is not frame.token
-            or not _same_canonical_turn_owner(entry.owner, owner)
-            or entry.turn_id != frame.turn_id
-        ):
-            return None
-        live_frames.append(frame)
-    return tuple(live_frames)
-
-
-def publish_canonical_turn_id(turn_id: object) -> object | None:
-    """Push an exact turn id into this thread/task's scoped carrier."""
-    if type(turn_id) is not str or not turn_id.strip():
-        return None
-    owner = _canonical_turn_owner()
-    token = object()
-    entry = _CanonicalTurnEntry(token=token, owner=owner, turn_id=turn_id)
-    with _CANONICAL_TURN_REGISTRY_LOCK:
-        if len(_CANONICAL_TURN_REGISTRY) >= _CANONICAL_TURN_REGISTRY_LIMIT:
-            return None
-        frames = _live_canonical_turn_frames_locked(
-            _HFC_CANONICAL_TURN_CARRIER.get(), owner
-        )
-        if frames is None:
-            return None
-        _CANONICAL_TURN_REGISTRY[token] = entry
-        _HFC_CANONICAL_TURN_CARRIER.set(
-            (*frames, _CanonicalTurnFrame(turn_id=turn_id, token=token))
-        )
-    return token
-
-
-def clear_canonical_turn_id(token: object) -> bool:
-    """Pop only the exact innermost frame owned by the current thread/task."""
-    if type(token) is not object:
-        return False
-    owner = _canonical_turn_owner()
-    with _CANONICAL_TURN_REGISTRY_LOCK:
-        frames = _live_canonical_turn_frames_locked(
-            _HFC_CANONICAL_TURN_CARRIER.get(), owner
-        )
-        if frames is None:
-            return False
-        if not frames or frames[-1].token is not token:
-            _HFC_CANONICAL_TURN_CARRIER.set(frames)
-            return False
-        frame = frames[-1]
-        entry = _CANONICAL_TURN_REGISTRY.get(token)
-        if (
-            entry is None
-            or entry.token is not token
-            or not _same_canonical_turn_owner(entry.owner, owner)
-            or entry.turn_id != frame.turn_id
-        ):
-            return False
-        del _CANONICAL_TURN_REGISTRY[token]
-        _HFC_CANONICAL_TURN_CARRIER.set(frames[:-1])
-    return True
-
-
-def consume_canonical_turn_id(explicit_turn_id: object = None) -> str | None:
-    """Return an exact explicit/carried id; mismatches are a hard fence."""
-    if explicit_turn_id is not None and (
-        type(explicit_turn_id) is not str or not explicit_turn_id.strip()
-    ):
-        return None
-    owner = _canonical_turn_owner()
-    carried: str | None = None
-    with _CANONICAL_TURN_REGISTRY_LOCK:
-        original_frames = _HFC_CANONICAL_TURN_CARRIER.get()
-        frames = _live_canonical_turn_frames_locked(original_frames, owner)
-        if frames is None:
-            # Hermes copies ContextVars into tool worker threads.  Such a
-            # worker must not gain implicit access to the turn, and it must
-            # never be allowed to clear the owning frame.  It may, however,
-            # present the exact explicit turn id carried by the still-live
-            # opaque frame.  This keeps clarify/approval callbacks correlated
-            # without weakening reset/clear revocation or accepting a guessed
-            # id from an unrelated context.
-            if explicit_turn_id is None or type(original_frames) is not tuple:
-                return None
-            copied_live: list[_CanonicalTurnFrame] = []
-            for frame in original_frames:
-                if type(frame) is not _CanonicalTurnFrame:
-                    return None
-                entry = _CANONICAL_TURN_REGISTRY.get(frame.token)
-                if entry is None:
-                    continue
-                if entry.token is not frame.token or entry.turn_id != frame.turn_id:
-                    return None
-                copied_live.append(frame)
-            if not copied_live or copied_live[-1].turn_id != explicit_turn_id:
-                return None
-            return explicit_turn_id
-        if frames != original_frames:
-            _HFC_CANONICAL_TURN_CARRIER.set(frames)
-        if frames:
-            frame = frames[-1]
-            entry = _CANONICAL_TURN_REGISTRY.get(frame.token)
-            if (
-                entry is None
-                or entry.token is not frame.token
-                or not _same_canonical_turn_owner(entry.owner, owner)
-                or entry.turn_id != frame.turn_id
-            ):
-                return None
-            carried = entry.turn_id
-    if explicit_turn_id is None:
-        return carried
-    if carried is not None and carried != explicit_turn_id:
-        return None
-    return explicit_turn_id
-
-
-def _canonical_turn_registry_size() -> int:
-    """Testing/diagnostic count only; never exposes turn identities."""
-    with _CANONICAL_TURN_REGISTRY_LOCK:
-        return len(_CANONICAL_TURN_REGISTRY)
 
 
 def _plugin_runtime() -> Any | None:
@@ -713,6 +562,47 @@ def bind_ingress_from_hermes_locals(local_vars: object) -> bool:
         if not callable(method):
             return False
         return method(*values, thread_id) is True
+    except Exception:
+        return False
+
+
+class _HybridProgressOwnership:
+    """Bounded presentation receipt owned by a single Hermes TurnContext."""
+
+    def __init__(self, owner: object, runtime: object, route: tuple[object, ...]):
+        self.owner = owner
+        self.runtime = runtime
+        self.route = route
+
+
+def suppress_hybrid_native_progress(local_vars: object, *, owner: object = None) -> bool:
+    """Read current card ownership; unknown routing always keeps native delivery."""
+    try:
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return False
+        assert type(local_vars) is dict
+        values = tuple(local_vars.get(name) for name in (
+            "gateway_session_key", "generation", "chat_id", "profile_id",
+        ))
+        thread_id = local_vars.get("thread_id")
+        if not all(_exact_nonblank_string(value) for value in values):
+            return False
+        if type(thread_id) is not str:
+            return False
+        runtime = _plugin_runtime()
+        if runtime is None or runtime.progress_owner_live() is not True:
+            return False
+        route = (turn_id, *values, thread_id)
+        previous = getattr(owner, "_hfc_progress_ownership", None)
+        if (type(previous) is _HybridProgressOwnership and previous.owner is owner
+                and previous.runtime is runtime and previous.route == route):
+            return True
+        method = getattr(runtime, "owns_native_progress", None)
+        accepted = callable(method) and method(*route) is True
+        if accepted and owner is not None:
+            owner._hfc_progress_ownership = _HybridProgressOwnership(owner, runtime, route)
+        return accepted
     except Exception:
         return False
 
@@ -865,6 +755,59 @@ def resolve_pending_interaction_from_hermes_locals(
         pending_handle,
         selected_value,
     )
+
+
+def wait_for_owned_clarify(
+    local_vars, interaction_data, pending_handle, waiter, timeout,
+):
+    """Observe original wait facts without changing its return or exceptions."""
+    observer = None
+    runtime = None
+    values = None
+    correlation = None
+    tool_observation = None
+    try:
+        values = _thin_interaction_values(
+            local_vars, "clarify", interaction_data, pending_handle,
+        )
+        from tools import approval
+        if values is not None and approval._approval_session_key.get() == values[1]:
+            runtime = _plugin_runtime()
+            correlation = (
+                approval._approval_session_key.get(), approval._approval_turn_id.get(),
+                approval._approval_tool_call_id.get(),
+            )
+            call = correlation[2]
+            if correlation[1:] == ("", ""):
+                # Hermes' specialized clarify executor bypasses the generic
+                # dispatcher's approval ContextVars. Require its exact official
+                # pre-tool observation on this execution thread and handle.
+                tool_observation = runtime.clarify_tool_call_for_wait(*values[1:])
+                call = None if tool_observation is None else tool_observation.tool_call_id
+            elif correlation[1] != values[2]:
+                call = None
+            if call:
+                observer = runtime.clarify_timeout_observer(*values[1:], call, timeout)
+    except Exception:
+        observer = None
+    # Deliberately outside the observer guard: owned wait failures propagate.
+    response = waiter(interaction_data["interaction_id"], timeout=float(timeout))
+    try:
+        if (observer is not None and _plugin_runtime() is runtime
+                and correlation == (
+                    approval._approval_session_key.get(), approval._approval_turn_id.get(),
+                    approval._approval_tool_call_id.get(),
+                )
+                and _thin_interaction_values(
+                    local_vars, "clarify", interaction_data, pending_handle,
+                ) == values
+                and (tool_observation is None or runtime.clarify_tool_call_is_current(
+                    values[1], values[2], tool_observation,
+                ))):
+            observer(response)
+    except Exception:
+        pass
+    return response
 
 
 def admit_pending_interaction_from_hermes_locals(
@@ -3672,334 +3615,6 @@ async def _request_command_card_choice_async(
         return None
 
 
-def _model_picker_options(
-    providers: Any,
-    *,
-    current_model: str = "",
-    max_options: int = 24,
-) -> list[dict[str, Any]]:
-    options: list[dict[str, Any]] = []
-    if not isinstance(providers, list):
-        return options
-    current = str(current_model or "").strip()
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
-        provider_slug = str(provider.get("slug") or provider.get("provider") or "").strip()
-        provider_name = str(provider.get("name") or provider_slug or "provider").strip()
-        models = provider.get("models")
-        if not isinstance(models, list):
-            continue
-        for model in models:
-            model_id = str(model or "").strip()
-            if not model_id:
-                continue
-            label = f"{provider_name} · {model_id}"
-            if model_id == current:
-                label = f"当前 · {label}"
-            options.append(
-                {
-                    "label": label[:80],
-                    "value": json.dumps(
-                        {"provider": provider_slug, "model": model_id},
-                        ensure_ascii=False,
-                    ),
-                    "style": "primary" if model_id == current else "default",
-                }
-            )
-            if len(options) >= max_options:
-                return options
-    return options
-
-
-def _model_picker_provider_tree(providers: Any) -> list[dict[str, Any]]:
-    """Return the public provider/model tree already selected by Hermes."""
-    if not isinstance(providers, list):
-        return []
-    normalized: list[dict[str, Any]] = []
-    seen_providers: set[str] = set()
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
-        provider_slug = str(
-            provider.get("slug") or provider.get("provider") or ""
-        ).strip()
-        provider_key = provider_slug.casefold()
-        models = provider.get("models")
-        if not provider_slug or provider_key in seen_providers or not isinstance(models, list):
-            continue
-        model_ids: list[str] = []
-        seen_models: set[str] = set()
-        for model in models:
-            model_id = str(model or "").strip()
-            if not model_id or model_id in seen_models:
-                continue
-            seen_models.add(model_id)
-            model_ids.append(model_id)
-        if not model_ids:
-            continue
-        try:
-            total_models = int(provider.get("total_models", len(model_ids)))
-        except (TypeError, ValueError):
-            total_models = len(model_ids)
-        total_models = max(len(model_ids), total_models)
-        seen_providers.add(provider_key)
-        normalized.append(
-            {
-                "slug": provider_slug,
-                "name": str(provider.get("name") or provider_slug).strip()
-                or provider_slug,
-                "models": model_ids,
-                "total_models": total_models,
-                "is_current": bool(provider.get("is_current")),
-            }
-        )
-    return normalized
-
-
-def _model_picker_provider_options(
-    providers: list[dict[str, Any]],
-    *,
-    current_provider: str,
-    max_options: int = 100,
-) -> list[dict[str, str]]:
-    options: list[dict[str, str]] = []
-    current = str(current_provider or "").strip().casefold()
-    for provider in providers:
-        provider_slug = str(provider.get("slug") or "").strip()
-        provider_name = str(provider.get("name") or provider_slug).strip()
-        models = provider.get("models")
-        if not provider_slug or not isinstance(models, list) or not models:
-            continue
-        try:
-            total_models = max(len(models), int(provider.get("total_models", len(models))))
-        except (TypeError, ValueError):
-            total_models = len(models)
-        label = f"{provider_name} ({total_models} 个模型)"
-        if bool(provider.get("is_current")) or provider_slug.casefold() == current:
-            label = f"当前 · {label}"
-        options.append({"label": label[:80], "value": provider_slug})
-        if len(options) >= max_options:
-            break
-    return options
-
-
-def _model_picker_model_options(
-    provider: dict[str, Any],
-    *,
-    current_model: str,
-    max_options: int = 100,
-) -> list[dict[str, str]]:
-    options: list[dict[str, str]] = []
-    provider_slug = str(provider.get("slug") or "").strip()
-    models = provider.get("models")
-    if not provider_slug or not isinstance(models, list):
-        return options
-    current = str(current_model or "").strip()
-    for model in models:
-        model_id = str(model or "").strip()
-        if not model_id:
-            continue
-        label = f"当前 · {model_id}" if model_id == current else model_id
-        options.append(
-            {
-                "label": label[:80],
-                "value": json.dumps(
-                    {"provider": provider_slug, "model": model_id},
-                    ensure_ascii=False,
-                ),
-            }
-        )
-        if len(options) >= max_options:
-            break
-    return options
-
-
-def _model_picker_provider(
-    providers: list[dict[str, Any]], provider_slug: str
-) -> dict[str, Any] | None:
-    selected = str(provider_slug or "").strip().casefold()
-    for provider in providers:
-        if str(provider.get("slug") or "").strip().casefold() == selected:
-            return provider
-    return None
-
-
-def _model_picker_current_provider_slug(
-    providers: list[dict[str, Any]], current_provider: str
-) -> str:
-    for provider in providers:
-        if bool(provider.get("is_current")):
-            return str(provider.get("slug") or "").strip()
-    current = str(current_provider or "").strip().casefold()
-    for provider in providers:
-        provider_slug = str(provider.get("slug") or "").strip()
-        if provider_slug.casefold() == current:
-            return provider_slug
-    return ""
-
-
-def _hfc_native_model_picker_card(
-    *,
-    picker_id: str,
-    providers: list[dict[str, Any]],
-    current_provider: str,
-    current_model: str,
-    selected_provider: str = "",
-) -> dict[str, Any]:
-    provider = _model_picker_provider(providers, selected_provider)
-    if provider is None:
-        current_provider_slug = _model_picker_current_provider_slug(
-            providers, current_provider
-        )
-        options = _model_picker_provider_options(
-            providers,
-            current_provider=current_provider,
-        )
-        description_parts = []
-        if current_model:
-            description_parts.append(f"当前模型：`{current_model}`")
-        if current_provider:
-            description_parts.append(f"当前 Provider：`{current_provider}`")
-        description_parts.append("先选择 Provider，再选择模型。")
-        elements: list[dict[str, Any]] = [
-            {"tag": "markdown", "content": "\n".join(description_parts)},
-            {
-                "tag": "action",
-                "actions": [
-                    _hfc_select_static(
-                        placeholder="选择 Provider",
-                        value={
-                            "hfc_action": "model_picker",
-                            "hfc_model_picker_id": picker_id,
-                            "hfc_model_picker_view": "providers",
-                        },
-                        options=options,
-                        initial_option=next(
-                            (
-                                option["value"]
-                                for option in options
-                                if option["value"].casefold()
-                                == current_provider_slug.casefold()
-                            ),
-                            "",
-                        ),
-                    )
-                ],
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _hfc_button(
-                        "取消",
-                        {
-                            "hfc_action": "model_picker",
-                            "hfc_model_picker_id": picker_id,
-                            "hfc_model_picker_nav": "cancel",
-                        },
-                    )
-                ],
-            },
-        ]
-        title = "选择模型"
-    else:
-        provider_slug = str(provider.get("slug") or "").strip()
-        provider_name = str(provider.get("name") or provider_slug).strip()
-        options = _model_picker_model_options(
-            provider,
-            current_model=current_model,
-        )
-        initial_option = ""
-        if provider_slug.casefold() == str(current_provider or "").strip().casefold():
-            initial_option = next(
-                (
-                    option["value"]
-                    for option in options
-                    if json.loads(option["value"]).get("model") == current_model
-                ),
-                "",
-            )
-        elements = [
-            {
-                "tag": "markdown",
-                "content": f"Provider：`{provider_name}`\n\n请选择模型。",
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _hfc_select_static(
-                        placeholder="选择模型",
-                        value={
-                            "hfc_action": "model_picker",
-                            "hfc_model_picker_id": picker_id,
-                            "hfc_model_picker_view": "models",
-                        },
-                        options=options,
-                        initial_option=initial_option,
-                    )
-                ],
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _hfc_button(
-                        "返回",
-                        {
-                            "hfc_action": "model_picker",
-                            "hfc_model_picker_id": picker_id,
-                            "hfc_model_picker_nav": "back",
-                        },
-                    ),
-                    _hfc_button(
-                        "取消",
-                        {
-                            "hfc_action": "model_picker",
-                            "hfc_model_picker_id": picker_id,
-                            "hfc_model_picker_nav": "cancel",
-                        },
-                    ),
-                ],
-            },
-        ]
-        title = f"选择模型 · {provider_name}"
-
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"content": title, "tag": "plain_text"},
-            "template": "blue",
-        },
-        "elements": elements,
-    }
-
-
-def _resume_picker_options(
-    sessions: Any,
-    *,
-    current_session_id: str = "",
-    max_options: int = 10,
-) -> list[dict[str, str]]:
-    options: list[dict[str, str]] = []
-    if not isinstance(sessions, list):
-        return options
-    current = str(current_session_id or "").strip()
-    for row in sessions:
-        if not isinstance(row, dict):
-            continue
-        session_id = str(row.get("id") or "").strip()
-        title = str(row.get("title") or "").strip()
-        if not session_id or not title:
-            continue
-        preview = str(row.get("preview") or "").strip()[:40]
-        prefix = "当前 · " if session_id == current else ""
-        suffix = f" — {preview}" if preview else ""
-        label = f"{prefix}{title}{suffix}"[:80]
-        options.append({"label": label, "value": session_id})
-        if len(options) >= max_options:
-            break
-    return options
-
-
 def _hfc_resume_source_name(source: Any) -> str | None:
     platform = getattr(source, "platform", None)
     value = str(getattr(platform, "value", platform) or "").strip().lower()
@@ -4340,20 +3955,6 @@ def _hfc_install_update_command_handler(runner_type: type[Any]) -> bool:
     return True
 
 
-def _parse_model_picker_choice(choice: str) -> tuple[str, str] | None:
-    try:
-        data = json.loads(choice)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    provider = str(data.get("provider") or "").strip()
-    model = str(data.get("model") or "").strip()
-    if not provider or not model:
-        return None
-    return provider, model
-
-
 def _metadata_reply_to(metadata: dict[str, Any] | None) -> str:
     if not isinstance(metadata, dict):
         return ""
@@ -4584,77 +4185,6 @@ def _hfc_info(message: str) -> None:
         logger.info("[hermes-feishu-card] %s", message)
     except Exception:
         pass
-
-
-def _hfc_slash_confirm_detail(message: str) -> str:
-    text = str(message or "").strip()
-    text = re.sub(r"^⚠️\s*\*\*Confirm /[^*]+\*\*\s*", "", text).strip()
-    text = re.split(r"\n\s*Choose:\s*\n", text, maxsplit=1)[0].strip()
-    text = re.sub(r"\n\s*_Text fallback:.*$", "", text, flags=re.DOTALL).strip()
-    return text or str(message or "").strip()
-
-
-def _hfc_button(label: str, value: dict[str, Any], button_type: str = "default") -> dict[str, Any]:
-    return {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": label},
-        "type": button_type,
-        "value": value,
-    }
-
-
-def _hfc_select_static(
-    *,
-    placeholder: str,
-    value: dict[str, Any],
-    options: list[dict[str, str]],
-    initial_option: str = "",
-) -> dict[str, Any]:
-    element: dict[str, Any] = {
-        "tag": "select_static",
-        "placeholder": {"tag": "plain_text", "content": placeholder},
-        "value": value,
-        "options": [
-            {
-                "text": {"tag": "plain_text", "content": str(option.get("label") or "")[:80]},
-                "value": str(option.get("value") or ""),
-            }
-            for option in options
-            if option.get("label") and option.get("value")
-        ],
-    }
-    if initial_option:
-        element["initial_option"] = initial_option
-    return element
-
-
-def _hfc_command_result_card(
-    *,
-    title: str,
-    content: str,
-    template: str = "green",
-) -> dict[str, Any]:
-    from .render import MAIN_CONTENT_CHUNK_CHARS
-    from .text import split_markdown_blocks
-
-    normalized_content = str(content or "").strip() or "已处理。"
-    return {
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {
-            "title": {"content": title, "tag": "plain_text"},
-            "template": template,
-        },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": chunk,
-            }
-            for chunk in split_markdown_blocks(
-                normalized_content,
-                MAIN_CONTENT_CHUNK_CHARS,
-            )
-        ],
-    }
 
 
 def _hfc_build_native_command_feedback_card(
@@ -4896,30 +4426,6 @@ async def _hfc_direct_card_allowed_async(
         ).card
     except Exception:
         return False
-
-
-def _hfc_command_result_title(command: str) -> str:
-    normalized = str(command or "").strip().lower()
-    return {
-        "new": "会话已重置",
-        "reset": "会话已重置",
-        "clear": "上下文已清理",
-        "undo": "已撤销上一步",
-        "stop": "已停止",
-        "model": "模型已更新",
-        "compress": "上下文压缩",
-    }.get(normalized, f"/{normalized}" if normalized else "命令反馈")
-
-
-def _hfc_command_result_template(content: str) -> str:
-    text = str(content or "").strip().lower()
-    if text.startswith(("❌", "error", "failed")) or "失败" in text or "error:" in text:
-        return "red"
-    if text.startswith(("⏳", "正在", "running", "starting")):
-        return "blue"
-    if text.startswith(("⚠️", "warning")) or "cancel" in text or "取消" in text:
-        return "orange"
-    return "green"
 
 
 def _hfc_take_feishu_command_result_context(

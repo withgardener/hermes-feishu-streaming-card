@@ -246,7 +246,9 @@ def test_thin_carrier_concurrent_copied_context_clear_succeeds_exactly_once(
     monkeypatch,
 ):
     shared_owner = object()
-    monkeypatch.setattr(hook_runtime, "_canonical_turn_owner", lambda: shared_owner)
+    from hermes_feishu_card import canonical_turn
+
+    monkeypatch.setattr(canonical_turn, "_canonical_turn_owner", lambda: shared_owner)
     token = hook_runtime.publish_canonical_turn_id("turn-concurrent")
     copied_contexts = [copy_context(), copy_context()]
     barrier = threading.Barrier(2)
@@ -348,7 +350,9 @@ def test_thin_carrier_foreign_object_alias_and_subclass_tokens_fail_closed():
 
 
 def test_thin_carrier_registry_is_bounded_and_full_publish_fails_closed(monkeypatch):
-    monkeypatch.setattr(hook_runtime, "_CANONICAL_TURN_REGISTRY_LIMIT", 3)
+    from hermes_feishu_card import canonical_turn
+
+    monkeypatch.setattr(canonical_turn, "_CANONICAL_TURN_REGISTRY_LIMIT", 3)
     tokens = [
         hook_runtime.publish_canonical_turn_id(f"turn-{index}")
         for index in range(3)

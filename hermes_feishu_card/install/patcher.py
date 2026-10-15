@@ -2,7 +2,32 @@ import ast
 import re
 import textwrap
 
+from .source_layout import (
+    DECOMPOSED_GATEWAY_TARGETS as DECOMPOSED_GATEWAY_TARGETS,
+    DECOMPOSED_TARGETS as DECOMPOSED_TARGETS,
+)
 from . import stop_cancellation
+from .gateway_contracts import find_stale_interrupted_location
+from .cron_contracts import (
+    find_cron_deliver_body_location as _find_cron_deliver_body_location,
+    find_cron_media_delivery_location as _find_cron_media_delivery_location,
+)
+
+from .base_contracts import (
+    find_base_patch_locations,
+    _has_decomposed_base,
+    _has_split_exact_base,
+    _parse_exact_base_content,
+)
+from .ast_contracts import (
+    _body_location,
+    _is_docstring_expr,
+    _leading_whitespace,
+    _line_ending,
+    _line_indent,
+    _same_expression,
+    _strip_line_ending,
+)
 
 from .patch_descriptors import (
     HYBRID_PATCH_DESCRIPTORS,
@@ -93,7 +118,6 @@ EXACT_BASE_FINAL_DELIVERY_PATCH_END = (
 )
 
 _HANDLER_NAME = "_handle_message_with_agent"
-_CRON_DELIVER_NAME = "_deliver_result"
 _NO_FINAL_NEWLINE = "# HERMES_FEISHU_CARD_NO_FINAL_NEWLINE"
 _SUPPORTED_STRATEGIES = {"legacy_gateway_run", "gateway_run_013_plus"}
 
@@ -1389,34 +1413,12 @@ def _apply_callback_patch(
     if owned_block is not None:
         lines = content.splitlines(keepends=True)
         begin_index, end_index = owned_block
-        if required_callback_calls:
-            # Hermes may define the same local callback name for multiple
-            # mutually-exclusive transports. Rebuild selector-sensitive
-            # blocks from the unpatched source so upgrades can relocate an
-            # older hook that landed in the wrong callback.
-            content = "".join(lines[:begin_index] + lines[end_index + 1 :])
-            return _apply_callback_patch(
-                content,
-                callback_name=callback_name,
-                begin_marker=begin_marker,
-                end_marker=end_marker,
-                renderer=renderer,
-                required_outer_names=required_outer_names,
-                required_callback_args=required_callback_args,
-                required_callback_calls=required_callback_calls,
-                allow_turn_context=allow_turn_context,
-            )
-        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
-        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
-        expected = (
-            _render_turn_context_hook_block(renderer, indent, newline)
-            if allow_turn_context
-            and any("_hfc_turn_ctx = ctx" in line for line in lines[begin_index : end_index + 1])
-            else renderer(indent, newline)
-        )
-        if lines[begin_index : end_index + 1] == expected:
-            return content
-        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+        # A marker proves ownership of these lines, not the identity of the
+        # callback that still runs. Re-select from the original source for every
+        # callback, including progress/interim callbacks without preferred calls.
+        # Unknown/ambiguous optional seams stay unpatched instead of retaining a
+        # stale hook and reporting it as a verified installation.
+        content = "".join(lines[:begin_index] + lines[end_index + 1 :])
 
     tree = _parse_content(content)
     lines = content.splitlines(keepends=True)
@@ -1638,76 +1640,6 @@ def _branch_returns(body) -> bool:
     return False
 
 
-def _find_cron_deliver_body_location(tree, lines):
-    node = _find_cron_deliver_node(tree)
-    return _body_location(node, lines) if node is not None else None
-
-
-def _find_cron_media_delivery_location(tree, lines):
-    node = _find_cron_deliver_node(tree)
-    if node is None:
-        return None
-
-    extract_assignment = None
-    filter_assignment = None
-    for statement in node.body:
-        if not isinstance(statement, ast.Assign):
-            continue
-        if _assigns_media_and_cleaned_content(statement):
-            extract_assignment = statement
-        if _assigns_filtered_media_files(statement):
-            filter_assignment = statement
-    target = filter_assignment or extract_assignment
-    if target is None or target.lineno is None:
-        return None
-    end_lineno = getattr(target, "end_lineno", None) or target.lineno
-    return end_lineno, _line_indent(lines, target.lineno - 1)
-
-
-def _find_cron_deliver_node(tree):
-    for node in tree.body:
-        if _is_cron_deliver(node):
-            return node
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            for child in node.body:
-                if _is_cron_deliver(child):
-                    return child
-    return None
-
-
-def _assigns_media_and_cleaned_content(statement) -> bool:
-    names = {
-        element.id
-        for target in statement.targets
-        if isinstance(target, (ast.Tuple, ast.List))
-        for element in target.elts
-        if isinstance(element, ast.Name)
-    }
-    if not {"media_files", "cleaned_delivery_content"}.issubset(names):
-        return False
-    value = statement.value
-    return (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Attribute)
-        and value.func.attr == "extract_media"
-    )
-
-
-def _assigns_filtered_media_files(statement) -> bool:
-    if not any(
-        isinstance(target, ast.Name) and target.id == "media_files"
-        for target in statement.targets
-    ):
-        return False
-    value = statement.value
-    return (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Attribute)
-        and value.func.attr == "filter_media_delivery_paths"
-    )
-
-
 def _find_callback_body_location(
     tree,
     lines,
@@ -1731,19 +1663,20 @@ def _find_callback_body_location(
             ):
                 continue
             candidates.append(node)
+    candidate = _select_callback_candidate(candidates, required_callback_calls)
+    return _body_location(candidate, lines) if candidate is not None else None
+
+
+def _select_callback_candidate(candidates, required_callback_calls=()):
+    """Keep the established preferred-call fallback, but never guess a target."""
     if required_callback_calls:
         preferred = [
-            node
-            for node in candidates
+            node for node in candidates
             if _has_required_callback_calls(node, required_callback_calls)
         ]
         if preferred:
             candidates = preferred
-        elif len(candidates) != 1:
-            return None
-    if not candidates:
-        return None
-    return _body_location(candidates[0], lines)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _find_turn_runner_callback_body_location(
@@ -1787,21 +1720,12 @@ def _find_turn_runner_callback_body_location(
     ]
     if direct_context:
         candidates = [node for node in candidates if _binds_turn_context(node)]
-    if required_callback_calls:
-        preferred = [
-            node
-            for node in candidates
-            if _has_required_callback_calls(node, required_callback_calls)
-        ]
-        if preferred:
-            candidates = preferred
-        elif len(candidates) != 1:
-            return None
-    if len(candidates) != 1:
+    candidate = _select_callback_candidate(candidates, required_callback_calls)
+    if candidate is None:
         return None
     if direct_context:
-        return _turn_context_binding_location(candidates[0], lines)
-    return _body_location(candidates[0], lines)
+        return _turn_context_binding_location(candidate, lines)
+    return _body_location(candidate, lines)
 
 
 def _find_stable_tool_lifecycle_location(tree, lines):
@@ -2003,54 +1927,8 @@ def _function_argument_names(node) -> set[str]:
     return {arg.arg for arg in args}
 
 
-def _body_location(node, lines):
-    if not node.body:
-        return None
-
-    if _is_docstring_expr(node.body[0]):
-        return _body_location_after_docstring(node, lines)
-
-    insert_before = node.body[0]
-    if _is_unsafe_one_line_body(node, insert_before):
-        return None
-    insert_at = insert_before.lineno - 1
-    return insert_at, _line_indent(lines, insert_at)
-
-
-def _body_location_after_docstring(node, lines):
-    if len(node.body) > 1:
-        insert_before = node.body[1]
-        if _is_unsafe_one_line_body(node, insert_before):
-            return None
-        insert_at = insert_before.lineno - 1
-        return insert_at, _line_indent(lines, insert_at)
-
-    docstring = node.body[0]
-    end_lineno = getattr(docstring, "end_lineno", docstring.lineno)
-    if end_lineno is None or docstring.lineno is None or docstring.lineno == node.lineno:
-        return None
-    insert_at = end_lineno
-    return insert_at, _line_indent(lines, docstring.lineno - 1)
-
-
-def _is_unsafe_one_line_body(handler, body_node) -> bool:
-    return body_node.lineno is None or body_node.lineno == handler.lineno
-
-
-def _is_docstring_expr(node) -> bool:
-    return (
-        isinstance(node, ast.Expr)
-        and isinstance(getattr(node, "value", None), ast.Constant)
-        and isinstance(node.value.value, str)
-    )
-
-
 def _is_handler(node) -> bool:
     return isinstance(node, ast.AsyncFunctionDef) and node.name == _HANDLER_NAME
-
-
-def _is_cron_deliver(node) -> bool:
-    return isinstance(node, ast.FunctionDef) and node.name == _CRON_DELIVER_NAME
 
 
 def _find_owned_block(content: str):
@@ -2363,681 +2241,14 @@ def _find_gateway_runner_method(tree, name: str):
     return None
 
 
-def _parse_exact_base_content(content: str):
-    try:
-        tree = ast.parse(content)
-    except SyntaxError as exc:
-        raise ValueError("could not find safe BasePlatformAdapter contract") from exc
-    return tree
-
-
 def _find_exact_base_patch_locations(tree, lines):
-    """Return the two insertion locations after validating Hermes' pipeline."""
-    if _has_split_exact_base(tree):
-        if _has_decomposed_base(tree):
-            return _find_split_decomposed_base_patch_locations(tree, lines)
-        # Only the reported decomposed layout has a verified split contract.
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-    if _has_decomposed_base(tree):
-        return _find_decomposed_base_patch_locations(tree, lines)
-    method = _find_exact_base_process_method(tree)
-    method_nodes = list(ast.walk(method))
-
-    extract_media = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_exact_assignment_call(
-            node,
-            targets=("media_files", "response"),
-            owner="self",
-            function="extract_media",
-            args=("response",),
+    return find_base_patch_locations(
+        tree, lines,
+        owned_ledger_blocks=(
+            "".join(_render_split_base_final_delivery_hook_block("", "\n")),
+            "".join(_render_decomposed_split_base_final_hook_block("", "\n")),
         ),
     )
-    filter_media = _unique_exact_base_node(
-        method_nodes,
-        _is_exact_media_filter_assignment,
-    )
-    extract_images = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_exact_assignment_call(
-            node,
-            targets=("images", "text_content"),
-            owner="self",
-            function="extract_images",
-            args=("response",),
-        ),
-    )
-    strip_text = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_strip_assignment(
-            node,
-            target="text_content",
-            source="text_content",
-        ),
-    )
-    extract_local = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_exact_assignment_call(
-            node,
-            targets=("local_files", "text_content"),
-            owner="self",
-            function="extract_local_files",
-            args=("text_content",),
-        ),
-    )
-    filter_local = _unique_exact_base_node(
-        method_nodes,
-        _is_exact_local_filter_assignment,
-    )
-    recovered = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_strip_assignment(
-            node,
-            target="_recovered",
-            source="response",
-        ),
-    )
-    restore_text = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_exact_name_assignment(
-            node,
-            target="text_content",
-            value="_recovered",
-        ),
-    )
-    final_metadata = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_exact_assignment_call(
-            node,
-            targets=("_final_thread_metadata",),
-            owner=None,
-            function="_mark_notify_metadata",
-            args=("_thread_metadata",),
-        ),
-    )
-    tts_caption_default = _unique_exact_base_node(
-        method_nodes,
-        lambda node: _is_exact_constant_assignment(
-            node,
-            target="_tts_caption_delivered",
-            value=False,
-        ),
-    )
-    text_guard = _unique_exact_base_node(
-        method_nodes,
-        lambda node: isinstance(node, ast.If)
-        and _same_expression(
-            node.test,
-            "text_content and not _tts_caption_delivered",
-        ),
-    )
-
-    guard_nodes = list(ast.walk(text_guard))
-    delivery_adapter = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_assignment_call(
-            node,
-            targets=("delivery_adapter",),
-            owner="self",
-            function="_final_delivery_adapter",
-            args=("event.source",),
-        ),
-    )
-    reply_anchor = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_assignment_call(
-            node,
-            targets=("_reply_anchor",),
-            owner=None,
-            function="_reply_anchor_for_event",
-            args=("event",),
-        ),
-    )
-    compute_obligation = _unique_exact_base_node(
-        guard_nodes,
-        _is_exact_compute_obligation_assignment,
-    )
-    obligation_default = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_constant_assignment(
-            node,
-            target="_obligation_id",
-            value=None,
-        )
-        and node.lineno < compute_obligation.lineno,
-    )
-    record_obligation = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_ledger_call(
-            node,
-            function="record_obligation",
-            required_keywords={
-                "obligation_id": "_obligation_id",
-                "content": "text_content",
-            },
-        ),
-    )
-    mark_attempting = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_positional_call(
-            node,
-            function="mark_attempting",
-            args=("_obligation_id",),
-        ),
-    )
-    send = _unique_exact_base_node(guard_nodes, _is_exact_final_send_assignment)
-    record_delivery = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_positional_call(
-            node,
-            function="_record_delivery",
-            args=("result",),
-        ),
-    )
-    mark_delivered = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_positional_call(
-            node,
-            function="mark_delivered",
-            args=("_obligation_id",),
-        ),
-    )
-    mark_failed = _unique_exact_base_node(
-        guard_nodes,
-        lambda node: _is_exact_mark_failed_call(node),
-    )
-
-    # The ledger operations must finish in one direct child statement before
-    # the send. Merely checking line order would accept a source drift where
-    # `_send_with_retry` moved inside the ledger try, reopening the exact crash
-    # window this patch is meant to close.
-    send_position = _direct_child_position(text_guard.body, send)
-    ledger_positions = {
-        _direct_child_position(text_guard.body, node)
-        for node in (compute_obligation, record_obligation, mark_attempting)
-    }
-    if (
-        send_position is None
-        or None in ledger_positions
-        or len(ledger_positions) != 1
-        or next(iter(ledger_positions)) >= send_position
-    ):
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-
-    ordered = (
-        extract_media,
-        filter_media,
-        extract_images,
-        strip_text,
-        extract_local,
-        filter_local,
-        recovered,
-        restore_text,
-        final_metadata,
-        tts_caption_default,
-        text_guard,
-        delivery_adapter,
-        reply_anchor,
-        obligation_default,
-        compute_obligation,
-        record_obligation,
-        mark_attempting,
-        send,
-        record_delivery,
-        mark_delivered,
-        mark_failed,
-    )
-    if any(getattr(node, "lineno", None) is None for node in ordered):
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-    line_numbers = [node.lineno for node in ordered]
-    if line_numbers != sorted(line_numbers) or len(set(line_numbers)) != len(line_numbers):
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-
-    no_text_index = text_guard.lineno - 1
-    send_index = send.lineno - 1
-    return (
-        (no_text_index, _line_indent(lines, no_text_index)),
-        (send_index, _line_indent(lines, send_index)),
-    )
-
-
-def _is_split_record_obligation_call(node) -> bool:
-    if not isinstance(node, ast.Assign):
-        return False
-    if _assignment_target_names(node) != ("obligation_id",):
-        return False
-    value = _assignment_value(node)
-    if not isinstance(value, ast.Await) or not isinstance(value.value, ast.Call):
-        return False
-    call = value.value
-    owner, function = _call_function(call)
-    return (
-        owner == "self"
-        and function == "_record_delivery_obligation"
-        and not call.keywords
-        and len(call.args) == 5
-        and all(
-            _same_expression(actual, expected)
-            for actual, expected in zip(
-                call.args,
-                (
-                    "event",
-                    "session_key",
-                    "text_content",
-                    "delivery_adapter",
-                    "is_ephemeral_response",
-                ),
-            )
-        )
-    )
-
-
-def _has_split_exact_base(tree) -> bool:
-    classes = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BasePlatformAdapter"
-    ]
-    return len(classes) == 1 and sum(
-        isinstance(node, ast.AsyncFunctionDef) and node.name == "send_final_ledgered"
-        for node in classes[0].body
-    ) == 1
-
-
-def _validate_split_ledger_bracket(ledger):
-    """Require an executable, contiguous ledger bracket, not just ordered AST hits."""
-    expected = ast.parse("""
-delivery_adapter = self._final_delivery_adapter(event.source)
-obligation_id = await self._record_delivery_obligation(event, session_key, text_content, delivery_adapter, is_ephemeral_response)
-result = await delivery_adapter._send_with_retry(chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
-if obligation_id is not None:
-    await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
-return result, delivery_adapter
-""").body
-    body = []
-    # Hermes may hand crash recovery from the turn marker to the ledger here.
-    # Accept only this exact optional guard, once, after recording and before
-    # sending. Keep it in generated source; never weaken the delivery bracket.
-    release_guard = ast.parse("if obligation_id is not None:\n    await self._release_turn_marker(event)").body[0]
-    release_seen = False
-    # Hermes records reply latency after the actual send and before finalizing
-    # the obligation. Preserve exactly this optional synchronous call, once.
-    clock_stop = ast.parse("stop_reply_clock(delivery_adapter, event.source.chat_id, result)").body[0]
-    clock_seen = False
-    for index, node in enumerate(ledger.body):
-        if len(body) == 3 and not clock_seen and ast.dump(node) == ast.dump(clock_stop):
-            clock_seen = True
-            continue
-        if len(body) == 2 and not release_seen and ast.dump(node) == ast.dump(release_guard):
-            release_seen = True
-            continue
-        if index == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-            continue
-        # The upstream informational log between adapter selection and recording
-        # is the only non-contract statement accepted at this seam.
-        if (len(body) == 1 and isinstance(node, ast.Expr)
-                and isinstance(node.value, ast.Call)
-                and _call_function(node.value) == ("logger", "info")):
-            continue
-        owned_hooks = (
-            _render_split_base_final_delivery_hook_block("", "\n"),
-            _render_decomposed_split_base_final_hook_block("", "\n"),
-        )
-        if len(body) == 2 and any(
-            ast.dump(node) == ast.dump(ast.parse("".join(block)).body[0])
-            for block in owned_hooks
-        ):
-            continue
-        body.append(node)
-    args = ledger.args
-    if (args.vararg or args.kwarg or args.posonlyargs
-            or [ast.dump(n) for n in body] != [ast.dump(n) for n in expected]):
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-
-
-def _is_split_final_send_assignment(node) -> bool:
-    if _assignment_target_names(node) != ("result",):
-        return False
-    value = _assignment_value(node)
-    if not isinstance(value, ast.Await) or not isinstance(value.value, ast.Call):
-        return False
-    call = value.value
-    if not (
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "_send_with_retry"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "delivery_adapter"
-        and not call.args
-    ):
-        return False
-    expected = {
-        "chat_id": "event.source.chat_id",
-        "content": "text_content",
-        "reply_to": "reply_to",
-        "metadata": "metadata",
-    }
-    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
-    return len(call.keywords) == len(expected) and set(keywords) == set(expected) and all(
-        _same_expression(keywords[name], expression)
-        for name, expression in expected.items()
-    )
-
-
-def _is_split_finalize_obligation_call(node) -> bool:
-    if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
-        return False
-    call = node.value
-    return (
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "_finalize_delivery_obligation"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "self"
-        and not call.keywords
-        and len(call.args) == 4
-        and _same_expression(call.args[0], "obligation_id")
-        and _same_expression(call.args[1], "result")
-        and _same_expression(call.args[2], "event")
-        and _same_expression(call.args[3], "delivery_adapter")
-    )
-
-
-def _find_exact_base_process_method(tree):
-    classes = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BasePlatformAdapter"
-    ]
-    if len(classes) != 1:
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-    methods = [
-        node
-        for node in classes[0].body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_process_message_background"
-    ]
-    if len(methods) != 1:
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-    return methods[0]
-
-
-def _unique_exact_base_node(nodes, predicate):
-    matches = [node for node in nodes if predicate(node)]
-    if len(matches) != 1:
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-    return matches[0]
-
-
-def _direct_child_position(body, target):
-    target_id = id(target)
-    for index, statement in enumerate(body):
-        if any(id(node) == target_id for node in ast.walk(statement)):
-            return index
-    return None
-
-
-def _assignment_target_names(node):
-    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-        return None
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    names = []
-    for target in targets:
-        if isinstance(target, ast.Name):
-            names.append(target.id)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            if not all(isinstance(item, ast.Name) for item in target.elts):
-                return None
-            names.extend(item.id for item in target.elts)
-        else:
-            return None
-    return tuple(names)
-
-
-def _assignment_value(node):
-    if isinstance(node, (ast.Assign, ast.AnnAssign)):
-        return node.value
-    return None
-
-
-def _same_expression(node, source: str) -> bool:
-    expected = ast.parse(source, mode="eval").body
-    return ast.dump(node, include_attributes=False) == ast.dump(
-        expected,
-        include_attributes=False,
-    )
-
-
-def _call_function(call):
-    if not isinstance(call, ast.Call):
-        return None, None
-    func = call.func
-    if isinstance(func, ast.Name):
-        return None, func.id
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        return func.value.id, func.attr
-    return None, None
-
-
-def _is_exact_delivery_filter_assignment(
-    node,
-    *,
-    target: str,
-    function: str,
-) -> bool:
-    if _assignment_target_names(node) != (target,):
-        return False
-    call = _assignment_value(node)
-    if not isinstance(call, ast.Call):
-        return False
-    owner, actual_function = _call_function(call)
-    if (
-        owner != "self"
-        or actual_function != function
-        or len(call.args) != 1
-        or not _same_expression(call.args[0], target)
-    ):
-        return False
-    if not call.keywords:
-        return True
-    return (
-        len(call.keywords) == 1
-        and call.keywords[0].arg == "session_key"
-        and _same_expression(call.keywords[0].value, "session_key")
-    )
-
-
-def _is_exact_media_filter_assignment(node) -> bool:
-    return _is_exact_delivery_filter_assignment(
-        node,
-        target="media_files",
-        function="filter_media_delivery_paths",
-    )
-
-
-def _is_exact_local_filter_assignment(node) -> bool:
-    return _is_exact_delivery_filter_assignment(
-        node,
-        target="local_files",
-        function="filter_local_delivery_paths",
-    )
-
-
-def _is_exact_assignment_call(node, *, targets, owner, function, args):
-    if _assignment_target_names(node) != targets:
-        return False
-    value = _assignment_value(node)
-    if isinstance(value, ast.Await):
-        value = value.value
-    actual_owner, actual_function = _call_function(value)
-    if (actual_owner, actual_function) != (owner, function):
-        return False
-    if value.keywords or len(value.args) != len(args):
-        return False
-    return all(_same_expression(arg, expected) for arg, expected in zip(value.args, args))
-
-
-def _is_strip_assignment(node, *, target: str, source: str) -> bool:
-    if _assignment_target_names(node) != (target,):
-        return False
-    outer = _assignment_value(node)
-    if not (
-        isinstance(outer, ast.Call)
-        and isinstance(outer.func, ast.Attribute)
-        and outer.func.attr == "strip"
-        and not outer.args
-        and not outer.keywords
-    ):
-        return False
-    inner = outer.func.value
-    return (
-        isinstance(inner, ast.Call)
-        and isinstance(inner.func, ast.Name)
-        and inner.func.id == "_strip_media_directives"
-        and len(inner.args) == 1
-        and not inner.keywords
-        and _same_expression(inner.args[0], source)
-    )
-
-
-def _is_exact_name_assignment(node, *, target: str, value: str) -> bool:
-    return _assignment_target_names(node) == (target,) and _same_expression(
-        _assignment_value(node),
-        value,
-    )
-
-
-def _is_exact_constant_assignment(node, *, target: str, value) -> bool:
-    assigned = _assignment_value(node)
-    return (
-        _assignment_target_names(node) == (target,)
-        and isinstance(assigned, ast.Constant)
-        and assigned.value is value
-    )
-
-
-def _is_exact_compute_obligation_assignment(node) -> bool:
-    if _assignment_target_names(node) != ("_obligation_id",):
-        return False
-    call = _assignment_value(node)
-    owner, function = _call_function(call)
-    return (
-        owner is None
-        and function == "compute_obligation_id"
-        and len(call.args) == 3
-        and not call.keywords
-        and _same_expression(call.args[0], "session_key")
-        and _same_expression(call.args[2], "text_content")
-    )
-
-
-def _expression_call(node):
-    if not isinstance(node, ast.Expr):
-        return None
-    value = node.value
-    if isinstance(value, ast.Await):
-        value = value.value
-    return value if isinstance(value, ast.Call) else None
-
-
-def _exact_ledger_call_arguments(node, *, function: str):
-    """Return ledger call arguments for direct or awaited ``to_thread`` calls.
-
-    Hermes 0.20 moved the synchronous delivery-ledger writes behind
-    ``await asyncio.to_thread(...)``.  Keep this unwrapping deliberately local
-    to the verified ledger anchors: accepting an unawaited coroutine here would
-    let the patcher certify a delivery contract that never records its state.
-    """
-    if not isinstance(node, ast.Expr):
-        return None
-    value = node.value
-    awaited = isinstance(value, ast.Await)
-    if awaited:
-        value = value.value
-    if not isinstance(value, ast.Call):
-        return None
-
-    owner, actual_function = _call_function(value)
-    if owner is None and actual_function == function:
-        return value.args, value.keywords
-    if not awaited or (owner, actual_function) != ("asyncio", "to_thread"):
-        return None
-    if not value.args:
-        return None
-    target = value.args[0]
-    if not isinstance(target, ast.Name) or target.id != function:
-        return None
-    return value.args[1:], value.keywords
-
-
-def _is_exact_ledger_call(node, *, function: str, required_keywords) -> bool:
-    parts = _exact_ledger_call_arguments(node, function=function)
-    if parts is None:
-        return False
-    args, raw_keywords = parts
-    if args:
-        return False
-    keywords = {
-        keyword.arg: keyword.value for keyword in raw_keywords if keyword.arg
-    }
-    return all(
-        name in keywords and _same_expression(keywords[name], expression)
-        for name, expression in required_keywords.items()
-    )
-
-
-def _is_exact_positional_call(node, *, function: str, args) -> bool:
-    parts = _exact_ledger_call_arguments(node, function=function)
-    if parts is None:
-        return False
-    actual_args, keywords = parts
-    return (
-        not keywords
-        and len(actual_args) == len(args)
-        and all(
-            _same_expression(arg, expected)
-            for arg, expected in zip(actual_args, args)
-        )
-    )
-
-
-def _is_exact_final_send_assignment(node) -> bool:
-    if _assignment_target_names(node) != ("result",):
-        return False
-    value = _assignment_value(node)
-    if not isinstance(value, ast.Await) or not isinstance(value.value, ast.Call):
-        return False
-    call = value.value
-    if not (
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "_send_with_retry"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "delivery_adapter"
-        and not call.args
-    ):
-        return False
-    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
-    expected = {
-        "chat_id": "event.source.chat_id",
-        "content": "text_content",
-        "reply_to": "_reply_anchor",
-        "metadata": "_final_thread_metadata",
-    }
-    return set(keywords) == set(expected) and all(
-        _same_expression(keywords[name], expression)
-        for name, expression in expected.items()
-    )
-
-
-def _is_exact_mark_failed_call(node) -> bool:
-    parts = _exact_ledger_call_arguments(node, function="mark_failed")
-    if parts is None:
-        return False
-    args, keywords = parts
-    return (
-        len(args) == 2
-        and not keywords
-        and _same_expression(args[0], "_obligation_id")
-    )
-
 
 def _find_redelivery_startup_call(func):
     for node in func.body:
@@ -4731,12 +3942,6 @@ def _child_indent(indent: str) -> str:
     return indent + " " * 4
 
 
-def _line_indent(lines, index: int) -> str:
-    if index < 0 or index >= len(lines):
-        return ""
-    return _leading_whitespace(_strip_line_ending(lines[index]))
-
-
 def _needs_leading_newline(lines, insert_at: int) -> bool:
     return insert_at == len(lines) and bool(lines) and _line_ending(lines[-1]) == ""
 
@@ -4754,26 +3959,6 @@ def _detect_newline(content: str) -> str:
     if crlf_index != -1 and crlf_index == lf_index - 1:
         return "\r\n"
     return "\n"
-
-
-def _line_ending(line: str) -> str:
-    if line.endswith("\r\n"):
-        return "\r\n"
-    if line.endswith("\n"):
-        return "\n"
-    return ""
-
-
-def _strip_line_ending(line: str) -> str:
-    if line.endswith("\r\n"):
-        return line[:-2]
-    if line.endswith("\n"):
-        return line[:-1]
-    return line
-
-
-def _leading_whitespace(line: str) -> str:
-    return line[: len(line) - len(line.lstrip(" \t"))]
 
 
 def _render_legacy_run_target(content: str) -> str:
@@ -4851,12 +4036,22 @@ HYBRID_PATCH_REGISTRY = PatchDescriptorRegistry(
 
 # September 2026 facade layout. Keep this separate from the fixed-tag Hybrid
 # descriptor registry: source layout is not evidence of native hook support.
-DECOMPOSED_GATEWAY_TARGETS = (
-    "gateway/run_turn.py", "gateway/run_turn_runner.py", "gateway/run_inbound.py",
-    "gateway/run_busy.py", "gateway/run_startup.py", "gateway/run_notifications.py",
-)
-DECOMPOSED_TARGETS = (*DECOMPOSED_GATEWAY_TARGETS,
-                      "cron/scheduler_delivery.py", "gateway/platforms/base.py")
+DECOMPOSED_LAYOUT_MARKERS = {
+    "message_handler": PATCH_BEGIN,
+    "completion_return": COMPLETE_PATCH_BEGIN,
+    "tool_callback": STABLE_TOOL_PATCH_BEGIN,
+    "answer_delta_callback": ANSWER_DELTA_PATCH_BEGIN,
+    "thinking_delta_callback": THINKING_DELTA_PATCH_BEGIN,
+    "status_callback": STATUS_PATCH_BEGIN,
+    "clarify_callback": CLARIFY_PATCH_BEGIN,
+    "approval_callback": APPROVAL_PATCH_BEGIN,
+    "command_card": COMMAND_CARD_PATCH_BEGIN,
+    "hfc_command": HFC_COMMAND_PATCH_BEGIN,
+    "slash_confirm": SLASH_CONFIRM_PATCH_BEGIN,
+    "startup": COMMAND_CARD_STARTUP_PATCH_BEGIN,
+    "redelivery": NATIVE_REDELIVERY_PATCH_BEGIN,
+    "platform_notice": PLATFORM_NOTICE_PATCH_BEGIN,
+}
 
 
 def apply_gateway_fragment(content: str, target: str, *, strategy="gateway_run_013_plus") -> str:
@@ -4936,320 +4131,6 @@ def _render_decomposed_complete_hook_block(indent, newline):
             for line in _render_complete_hook_block_with_reply_anchor(indent, newline)]
 
 
-def _has_decomposed_base(tree):
-    return any(isinstance(c, ast.ClassDef) and c.name == "BasePlatformAdapter"
-               and any(isinstance(n, ast.AsyncFunctionDef) and n.name == "_send_final_text" for n in c.body)
-               for c in tree.body)
-
-
-def _find_decomposed_base_patch_locations(tree, lines):
-    """Verify the extracted methods AND their exact call/argument boundaries."""
-    error = "could not find safe BasePlatformAdapter contract"
-    process = _find_exact_base_process_method(tree)
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "BasePlatformAdapter")
-    def method(name):
-        matches = [n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == name]
-        if len(matches) != 1:
-            raise ValueError(error)
-        return matches[0]
-    extract, send, record, finish = (method(n) for n in (
-        "_extract_response_content", "_send_final_text", "_record_delivery_obligation", "_finalize_delivery_obligation"))
-    # Positional calls are only safe when the callee binds the same values.
-    # Matching names somewhere in the body does not prove that boundary.
-    for node, positional, keyword_only in (
-        (process, ("self", "event", "session_key"), ()),
-        (extract, ("self", "response", "event", "session_key"), ("is_ephemeral_response",)),
-        (send, ("self", "event", "session_key", "text_content", "metadata",
-                "is_ephemeral_response", "ephemeral_ttl", "record_delivery"), ()),
-        (record, ("self", "event", "session_key", "text_content", "delivery_adapter",
-                  "is_ephemeral_response"), ()),
-        (finish, ("self", "obligation_id", "result", "event", "delivery_adapter"), ()),
-    ):
-        args = node.args
-        if (tuple(a.arg for a in (*args.posonlyargs, *args.args)) != positional
-                or tuple(a.arg for a in args.kwonlyargs) != keyword_only
-                or args.vararg is not None or args.kwarg is not None):
-            raise ValueError(error)
-    def exact(scope, source):
-        expected = ast.parse(source).body[0]
-        return _unique_exact_base_node(ast.walk(scope), lambda n: ast.dump(n) == ast.dump(expected))
-    def ordered(nodes):
-        if any(a.lineno >= b.lineno for a, b in zip(nodes, nodes[1:])):
-            raise ValueError(error)
-    extracted = exact(process, 'extracted = await self._extract_response_content(response, event, session_key, is_ephemeral_response=is_ephemeral_response)')
-    assigned = exact(process, 'text_content, media_files = extracted.text_content, extracted.media_files')
-    metadata = exact(process, '_final_thread_metadata = _mark_notify_metadata(_thread_metadata)')
-    tts_default = exact(process, '_tts_caption_delivered = False')
-    guard = _unique_exact_base_node(ast.walk(process), lambda n: isinstance(n, ast.If) and _same_expression(n.test, 'text_content and not _tts_caption_delivered'))
-    delegated = exact(guard, 'await self._send_final_text(event, session_key, text_content, _final_thread_metadata, is_ephemeral_response, _ephemeral_ttl, _record_delivery)')
-    if guard.body != [delegated]:
-        raise ValueError(error)
-    attachments = _exact_deliver_attachments(process)
-    ordered([extracted, assigned, metadata, tts_default, guard, attachments])
-    # All three stages must be siblings in the response branch.
-    branches = [n for n in ast.walk(process) if isinstance(n, ast.If)
-                and all(part in n.orelse for part in (extracted, assigned, metadata, tts_default, guard, attachments))]
-    if len(branches) != 1 or not _same_expression(branches[0].test, 'not response'):
-        raise ValueError(error)
-    em = exact(extract, 'media_files, response = self.extract_media(response)')
-    fm = _unique_exact_base_node(ast.walk(extract), _is_exact_media_filter_assignment)
-    ei = exact(extract, 'images, text_content = self.extract_images(response)')
-    strip = exact(extract, 'text_content = _strip_media_directives(text_content).strip()')
-    el = exact(extract, 'local_files, text_content = self.extract_local_files(text_content)')
-    fl = _unique_exact_base_node(ast.walk(extract), _is_exact_local_filter_assignment)
-    recovered = exact(extract, '_recovered = _strip_media_directives(response).strip()')
-    restored = exact(extract, 'text_content = _recovered')
-    result = exact(extract, 'return _ExtractedResponse(text_content=text_content, images=images, media_files=media_files, local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)')
-    ordered([em, fm, ei, strip, el, fl, recovered, restored, result])
-    adapter = exact(send, 'delivery_adapter = self._final_delivery_adapter(event.source)')
-    ledger = exact(send, '_obligation_id = await self._record_delivery_obligation(event, session_key, text_content, delivery_adapter, is_ephemeral_response)')
-    final_send = exact(send, 'result = await delivery_adapter._send_with_retry(chat_id=event.source.chat_id, content=text_content, reply_to=_reply_anchor_for_event(event), metadata=metadata)')
-    delivered = exact(send, 'record_delivery(result)')
-    finalized = exact(send, 'if _obligation_id is not None:\n    await self._finalize_delivery_obligation(_obligation_id, result, event, delivery_adapter)')
-    if not all(n in send.body for n in (adapter, ledger, final_send, delivered, finalized)):
-        raise ValueError(error)
-    ordered([adapter, ledger, final_send, delivered, finalized])
-    source = exact(record, 'source = event.source')
-    computed = exact(record, 'obligation_id = compute_obligation_id(session_key, str(getattr(event, "message_id", "") or ""), text_content)')
-    recorded = exact(record, 'await asyncio.to_thread(record_obligation, obligation_id=obligation_id, session_key=session_key, platform=str(getattr(source.platform, "value", source.platform)), chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None), content=text_content, adapter_profile=getattr(delivery_adapter, "_owner_profile", None))')
-    attempting = exact(record, 'await asyncio.to_thread(mark_attempting, obligation_id)')
-    returned = exact(record, 'return obligation_id')
-    ordered([source, computed, recorded, attempting, returned])
-    tries = [n for n in record.body if isinstance(n, ast.Try) and all(x in n.body for x in (source, computed, recorded, attempting, returned))]
-    if len(tries) != 1:
-        raise ValueError(error)
-    exact(finish, 'if getattr(result, "success", False):\n    await asyncio.to_thread(mark_delivered, obligation_id)\n    return')
-    exact(finish, 'await asyncio.to_thread(mark_failed, obligation_id, error)')
-    return ((guard.lineno - 1, _line_indent(lines, guard.lineno - 1)),
-            (final_send.lineno - 1, _line_indent(lines, final_send.lineno - 1)))
-
-
-_DELIVER_ATTACHMENTS_PATTERNS = (
-    # Hermes 0.21.1+: _deliver_attachments gained record_delivery= kwarg
-    "await self._deliver_attachments(event, extracted, _final_thread_metadata, anything_sent=delivery_attempted or _tts_caption_delivered, record_delivery=_record_delivery)",
-    # Hermes <= 0.21.0: no record_delivery kwarg
-    "await self._deliver_attachments(event, extracted, _final_thread_metadata, anything_sent=delivery_attempted or _tts_caption_delivered)",
-)
-
-
-def _exact_deliver_attachments(process):
-    """Match the _deliver_attachments call site, accepting both pre- and
-    post-0.21.1 signatures (with/without ``record_delivery=`` kwarg)."""
-    calls = [node for node in ast.walk(process)
-             if isinstance(node, ast.Call)
-             and _call_function(node) == ("self", "_deliver_attachments")]
-    if len(calls) != 1:
-        raise ValueError("could not find safe BasePlatformAdapter contract")
-    patterns = {ast.dump(ast.parse(pattern).body[0]) for pattern in _DELIVER_ATTACHMENTS_PATTERNS}
-    # Count across both spellings. Trying them independently would accept two
-    # different attachment sends and silently admit a changed delivery pipeline.
-    return _unique_exact_base_node(
-        ast.walk(process), lambda node: ast.dump(node) in patterns
-    )
-
-
-def _find_split_decomposed_base_patch_locations(tree, lines):
-    """Verify decomposed Hermes after its ledger helper was extracted."""
-    error = "could not find safe BasePlatformAdapter contract"
-    process = _find_exact_base_process_method(tree)
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "BasePlatformAdapter"
-    )
-
-    def method(name):
-        matches = [
-            node
-            for node in cls.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == name
-        ]
-        if len(matches) != 1:
-            raise ValueError(error)
-        return matches[0]
-
-    extract, send, ledger, record, finish = (
-        method(name)
-        for name in (
-            "_extract_response_content",
-            "_send_final_text",
-            "send_final_ledgered",
-            "_record_delivery_obligation",
-            "_finalize_delivery_obligation",
-        )
-    )
-    _validate_split_ledger_bracket(ledger)
-    signatures = (
-        (process, ("self", "event", "session_key"), ()),
-        (
-            extract,
-            ("self", "response", "event", "session_key"),
-            ("is_ephemeral_response",),
-        ),
-        (
-            send,
-            ("self", "event", "session_key", "text_content", "metadata",
-             "is_ephemeral_response", "ephemeral_ttl", "record_delivery"),
-            (),
-        ),
-        (
-            ledger,
-            ("self", "event", "session_key", "text_content", "metadata"),
-            ("reply_to", "is_ephemeral_response"),
-        ),
-        (
-            record,
-            ("self", "event", "session_key", "text_content", "delivery_adapter",
-             "is_ephemeral_response"),
-            (),
-        ),
-        (
-            finish,
-            ("self", "obligation_id", "result", "event", "delivery_adapter"),
-            (),
-        ),
-    )
-    for node, positional, keyword_only in signatures:
-        args = node.args
-        if (
-            tuple(arg.arg for arg in (*args.posonlyargs, *args.args)) != positional
-            or tuple(arg.arg for arg in args.kwonlyargs) != keyword_only
-            or args.vararg is not None
-            or args.kwarg is not None
-        ):
-            raise ValueError(error)
-
-    def exact(scope, source):
-        expected = ast.parse(source).body[0]
-        return _unique_exact_base_node(
-            ast.walk(scope), lambda node: ast.dump(node) == ast.dump(expected)
-        )
-
-    def ordered(nodes):
-        if any(a.lineno >= b.lineno for a, b in zip(nodes, nodes[1:])):
-            raise ValueError(error)
-
-    extracted = exact(
-        process,
-        "extracted = await self._extract_response_content(response, event, session_key, is_ephemeral_response=is_ephemeral_response)",
-    )
-    assigned = exact(
-        process,
-        "text_content, media_files = extracted.text_content, extracted.media_files",
-    )
-    metadata = exact(
-        process,
-        "_final_thread_metadata = _mark_notify_metadata(_thread_metadata)",
-    )
-    tts_default = exact(process, "_tts_caption_delivered = False")
-    guard = _unique_exact_base_node(
-        ast.walk(process),
-        lambda node: isinstance(node, ast.If)
-        and _same_expression(node.test, "text_content and not _tts_caption_delivered"),
-    )
-    delegated = exact(
-        guard,
-        "await self._send_final_text(event, session_key, text_content, _final_thread_metadata, is_ephemeral_response, _ephemeral_ttl, _record_delivery)",
-    )
-    if guard.body != [delegated]:
-        raise ValueError(error)
-    attachments = _exact_deliver_attachments(process)
-    ordered([extracted, assigned, metadata, tts_default, guard, attachments])
-    branches = [
-        node
-        for node in ast.walk(process)
-        if isinstance(node, ast.If)
-        and all(
-            part in node.orelse
-            for part in (extracted, assigned, metadata, tts_default, guard, attachments)
-        )
-    ]
-    if len(branches) != 1 or not _same_expression(branches[0].test, "not response"):
-        raise ValueError(error)
-
-    em = exact(extract, "media_files, response = self.extract_media(response)")
-    fm = _unique_exact_base_node(ast.walk(extract), _is_exact_media_filter_assignment)
-    ei = exact(extract, "images, text_content = self.extract_images(response)")
-    strip = exact(extract, "text_content = _strip_media_directives(text_content).strip()")
-    el = exact(extract, "local_files, text_content = self.extract_local_files(text_content)")
-    fl = _unique_exact_base_node(ast.walk(extract), _is_exact_local_filter_assignment)
-    recovered = exact(extract, "_recovered = _strip_media_directives(response).strip()")
-    restored = exact(extract, "text_content = _recovered")
-    result = exact(
-        extract,
-        "return _ExtractedResponse(text_content=text_content, images=images, media_files=media_files, local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)",
-    )
-    ordered([em, fm, ei, strip, el, fl, recovered, restored, result])
-
-    delegated_call = exact(
-        send,
-        "result, delivery_adapter = await self.send_final_ledgered(event, session_key, text_content, metadata, reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)",
-    )
-    delivered = exact(send, "record_delivery(result)")
-    if delegated_call.lineno >= delivered.lineno:
-        raise ValueError(error)
-    record_source = exact(record, "source = event.source")
-    ledger_id = exact(
-        record, "_ledger_id = getattr(event, \"ledger_message_id\", None)"
-    )
-    ledger_fallback = exact(
-        record,
-        "if _ledger_id is None:\n    _ledger_id = getattr(event, \"message_id\", \"\")",
-    )
-    computed = _unique_exact_base_node(
-        ast.walk(record),
-        lambda node: _is_split_compute_obligation_assignment(node),
-    )
-    recorded = exact(
-        record,
-        "await asyncio.to_thread(record_obligation, obligation_id=obligation_id, session_key=session_key, platform=str(getattr(source.platform, \"value\", source.platform)), chat_id=source.chat_id, thread_id=getattr(source, \"thread_id\", None), content=text_content, adapter_profile=getattr(delivery_adapter, \"_owner_profile\", None))",
-    )
-    attempting = exact(record, "await asyncio.to_thread(mark_attempting, obligation_id)")
-    returned = exact(record, "return obligation_id")
-    ordered([record_source, ledger_id, ledger_fallback, computed, recorded, attempting, returned])
-    tries = [
-        node
-        for node in record.body
-        if isinstance(node, ast.Try)
-        and all(x in node.body for x in (record_source, ledger_id, ledger_fallback,
-                                          computed, recorded, attempting, returned))
-    ]
-    if len(tries) != 1:
-        raise ValueError(error)
-
-    ledger_nodes = list(ast.walk(method("send_final_ledgered")))
-    ledger_record = _unique_exact_base_node(ledger_nodes, _is_split_record_obligation_call)
-    final_send = _unique_exact_base_node(ledger_nodes, _is_split_final_send_assignment)
-    finalized = _unique_exact_base_node(ledger_nodes, _is_split_finalize_obligation_call)
-    ledger_return = exact(
-        method("send_final_ledgered"), "return result, delivery_adapter"
-    )
-    ordered([ledger_record, final_send, finalized, ledger_return])
-    return (
-        (guard.lineno - 1, _line_indent(lines, guard.lineno - 1)),
-        (final_send.lineno - 1, _line_indent(lines, final_send.lineno - 1)),
-    )
-
-
-def _is_split_compute_obligation_assignment(node) -> bool:
-    if _assignment_target_names(node) != ("obligation_id",):
-        return False
-    call = _assignment_value(node)
-    if not isinstance(call, ast.Call):
-        return False
-    owner, function = _call_function(call)
-    return (
-        owner is None
-        and function == "compute_obligation_id"
-        and not call.keywords
-        and len(call.args) == 3
-        and _same_expression(call.args[0], "session_key")
-        and (
-            _same_expression(call.args[1], "str(_ledger_id or \"\")")
-            or _same_expression(call.args[1], "_ledger_id")
-        )
-        and _same_expression(call.args[2], "text_content")
-    )
 
 
 def _render_decomposed_base_final_hook_block(indent, newline):
@@ -5282,7 +4163,6 @@ def _render_decomposed_base_no_text_hook_block(indent, newline):
     return block
 
 
-
 def _render_turn_timing_hook_block(indent, newline):
     return [f"{indent}{TURN_TIMING_PATCH_BEGIN}{newline}",
             f"{indent}try:{newline}",
@@ -5308,74 +4188,16 @@ def _apply_stale_interrupted_patch(content):
     content = _remove_simple_owned_patch(
         content, STALE_INTERRUPTED_PATCH_BEGIN, STALE_INTERRUPTED_PATCH_END,
         _render_stale_interrupted_hook_block, "stale interrupted patch markers")
-    handler = _find_handler_node(_parse_content(content))
-    if handler is None:
-        return content
-    discard_calls = [node for node in ast.walk(handler)
-                     if isinstance(node, ast.Call)
-                     and isinstance(node.func, ast.Attribute)
-                     and node.func.attr == "_hmwa_discard_stale_result"]
-    # Earlier verified layouts have no discarded-result branch.
-    if not discard_calls:
-        return content
-    expected = ast.parse(
-        "if not self._is_session_run_current(_quick_key, run_generation):\n"
-        "    self._hmwa_discard_stale_result(source, _quick_key, run_generation)\n"
-        "    return None\n"
-    ).body[0]
-    guards = [node for node in ast.walk(handler)
-              if isinstance(node, ast.If) and ast.dump(node) == ast.dump(expected)]
-    if len(discard_calls) != 1 or len(guards) != 1:
-        raise ValueError("stale result discard contract changed")
-    guard = guards[0]
-    blocks = [value for node in ast.walk(handler) for _, value in ast.iter_fields(node)
-              if isinstance(value, list) and guard in value]
-    if len(blocks) != 1:
-        raise ValueError("stale result control flow changed")
-    preceding = blocks[0][:blocks[0].index(guard)]
-    writes = [node for statement in preceding for node in ast.walk(statement)
-              if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
-              and any(isinstance(target, ast.Name) and target.id == "agent_result"
-                      for target in (node.targets if isinstance(node, ast.Assign) else [node.target]))]
-    if len(writes) != 1 or writes[0] not in preceding:
-        raise ValueError("stale result assignment changed")
-    assignment = writes[0]
-    awaited = assignment.value
-    call = awaited.value if isinstance(awaited, ast.Await) else None
-    required = {
-        "source": "source", "session_key": "session_key",
-        "run_generation": "run_generation",
-        "event_message_id": "self._reply_anchor_for_event(event)",
-    }
-    keywords = {item.arg: item.value for item in call.keywords} if isinstance(call, ast.Call) else {}
-    if "source" in keywords and _same_expression(keywords["source"], "_turn_source"):
-        # Verified main c8301ea6 pins channel inputs before execution. Accept
-        # only that exact tuple binding from this event/session/source; an
-        # arbitrary alias or reassignment must not broaden turn ownership.
-        pin = ast.parse(
-            "_turn_channel_prompt, _turn_source = self._pinned_channel_inputs("
-            "session_key, event.channel_prompt, source, internal=event.internal)"
-        ).body[0]
-        before_run = preceding[:preceding.index(assignment)]
-        pins = [node for node in before_run if ast.dump(node) == ast.dump(pin)]
-        pin_stores = [node for statement in before_run for node in ast.walk(statement)
-                      if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-                      and node.id in {"_turn_channel_prompt", "_turn_source"}]
-        if len(pins) != 1 or len(pin_stores) != 2:
-            raise ValueError("stale result pinned source binding changed")
-        required.update(source="_turn_source", channel_prompt="_turn_channel_prompt")
-    if (not isinstance(assignment, ast.Assign) or len(assignment.targets) != 1
-            or not isinstance(call, ast.Call) or call.args or None in keywords
-            or not _same_expression(call.func, "self._run_agent")
-            or any(key not in keywords or not _same_expression(keywords[key], value)
-                   for key, value in required.items())):
-        raise ValueError("stale result runner binding changed")
     lines = content.splitlines(keepends=True)
-    index = guard.body[0].lineno - 1
+    location = find_stale_interrupted_location(
+        _find_handler_node(_parse_content(content)), lines,
+    )
+    if location is None:
+        return content
+    index, indent = location
     lines[index:index] = _render_stale_interrupted_hook_block(
-        _line_indent(lines, index), _detect_newline(content))
+        indent, _detect_newline(content))
     return "".join(lines)
-
 
 def _apply_turn_timing_patch(content):
     content = _remove_simple_owned_patch(content, TURN_TIMING_PATCH_BEGIN, TURN_TIMING_PATCH_END,

@@ -1,0 +1,6 @@
+{
+  "commit": "50499df9dbf164d00261a05e19359ec72d986153",
+  "path": "hermes_feishu_card/install/hybrid_renderers.py",
+  "sha256": "468666d047bd2e235f6344179be637becf2152ac84f904d20e5d85fd8fd85714",
+  "purpose": "exact historical v3 renderer compatibility, no network/runtime config"
+}

@@ -1,4 +1,6 @@
 from hermes_feishu_card.render import MAIN_CONTENT_CHUNK_CHARS
+import pytest
+
 from hermes_feishu_card.text import (
     StreamingTextNormalizer,
     count_markdown_tables,
@@ -93,6 +95,22 @@ def test_count_markdown_tables_zero():
     from hermes_feishu_card.text import count_markdown_tables
     assert count_markdown_tables("hello world") == 0
     assert count_markdown_tables("| name | age |") == 0  # no separator
+
+
+@pytest.mark.parametrize("source", [
+    "", "plain text " * 20000, "无分隔符的中文正文\n" * 10000,
+    "｜表头｜值｜\n｜---｜---｜\n｜a｜b｜",
+    r"only escaped \| separator", "only `inline | code` here",
+    "```text\n| a | b |\n| --- | --- |\n| one | two |\n```",
+], ids=["empty", "long-ascii", "long-cjk", "fullwidth-pipes",
+        "escaped-pipe", "inline-code-pipe", "fenced-table"])
+def test_table_fastpath_preserves_non_tables_code_and_empty_input(source):
+    assert count_markdown_tables(source) == 0
+
+
+def test_table_fastpath_keeps_real_table_with_escaped_and_inline_code_pipes():
+    source = "| key | value |\n| --- | --- |\n| escaped | left\\|right |\n| code | `left|right` |\n"
+    assert count_markdown_tables(source) == 1
 
 
 def test_count_markdown_tables_normal():

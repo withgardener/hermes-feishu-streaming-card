@@ -7,9 +7,9 @@
 | 缺省 / `classic` | 保持正文回退 | 折叠 | 保留 | 保留 |
 | `focused` | 放入有界过程面板，正文等待答案 | 折叠 | 隐藏 | 保留最后活动 |
 | `detailed` | 放入有界过程面板，正文等待答案 | 展开 | 保留 | 保留 |
-| `task`（4.7.0） | 放入有界过程面板，正文等待答案 | 折叠，标题为“执行过程” | 隐藏成功工具 | 保留最后活动 |
+| `task`（开发分支 B 方向） | 放入有界过程面板，正文等待答案 | 默认展开，标题为“执行过程” | 保留过程中的成功工具，避免正文重复 | 保留最后活动 |
 
-`task` 同时调整状态标题、字号、交互提示和统计密度，详见[任务卡片与离线预览](../task-cards.md)。现有三个预设的展示默认保持不变。
+开发分支按已确认的 B 方向将 `task` 过程默认展开，并保留完成历史；旧版默认折叠，升级后需要保持折叠时显式设置 `timeline_expanded: false`。`task` 同时调整状态标题、字号、交互提示和统计密度，详见[任务卡片与离线预览](../task-cards.md)。现有三个预设的展示默认保持不变。
 
 这些是预设提供的默认值，已有显式设置仍会覆盖它们。`detailed` 继续遵守现有条目数、内容长度和卡片容量限制，并非无上限历史归档。预设不改变回答、失败原因、工具计数、审批、附件、终局投递、检查点和执行状态。
 
@@ -57,7 +57,28 @@ hermes-feishu-card card-config --config /path/to/config.yaml --profile-id work -
 
 输出阅读字段的有效值及来源（default、global、profile 或 bot 的预设/显式字段）。`terminal_tool_activity` 是解释结果，不是新 YAML 开关：`visible` 表示终态保留，`failed_only` 表示仅失败保留，`unsuccessful_only` 表示两种终态均仅隐藏成功工具。多个 profile 且没有 default 时要求指定 `--profile-id`，不会猜测。
 
-此命令不启动或重启服务，不修改配置，不请求 Feishu，不输出凭据、路由标识、配置路径或自定义标题。它说明所选 YAML 的下一次加载结果，不证明运行中的进程已经加载该文件；重启后须核实目标进程配置。
+此命令不启动或重启服务，不修改配置，不请求 Feishu，不输出凭据、路由标识、配置路径或自定义标题。默认说明所选 YAML 的下一次加载结果。
+
+开发分支新增可选 `--running`：通过本机受管侧车的私有控制接口核对已加载值，并逐项显示与下次加载值的差异。命令要求私有 pidfile、进程身份、配置文件路径和所选 profile/bot 均匹配；旧版侧车、未托管进程或无法核对的范围显示 `unavailable`，不把磁盘值冒充运行值。
+
+```bash
+hermes-feishu-card card-config --config /path/to/config.yaml --running --json
+```
+
+`verified` 仅证明当前侧车为新回合使用的已加载阅读默认值，不代表已经接受的卡片，也不包含逐事件覆盖。`auto` 与运行中解析出的 `callback` 按相同效果比较。修改 YAML 后仍需按原流程重启侧车；该命令不会替用户重启。
+
+## 精简阅读配置
+
+开发分支的 `--minimal-yaml` 输出所选层需要保留的阅读字段：
+
+```bash
+hermes-feishu-card card-config --config /path/to/config.yaml --minimal-yaml
+hermes-feishu-card card-config --config /path/to/config.yaml --profile-id work --bot-id support --minimal-yaml
+```
+
+输出注释说明目标是 global、profile 还是 bot；不会输出真实范围名称、凭据、路由或标题。将片段用于该层的 `card`：替换其中的阅读字段，保留其他字段和上层配置。它不是完整配置文件，也不是可以追加到任意层的通用片段。
+
+每次删除一个冗余字段都会用原配置合并器重新解释，确保与当前有效阅读值、预览一致。抵消上层设置的 `false`、字号覆盖，以及覆盖预设的旧开关都会按需保留。命令不写文件或重启；`--preview-dir` 可同时生成这组设置的离线示例。需要核对进程已加载值时，单独运行 `--running`。
 
 ## 采用与回退
 

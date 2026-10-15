@@ -20,6 +20,22 @@ env:
   HFC_FIXED_TAG_COMMIT: 3c27eb6234bf91b8ceee9e9071591b31e9b148cb
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install scoped quality tools
+        run: python -m pip install -e ".[test,quality]"
+      - name: Lint extracted boundaries
+        run: python -m ruff check
+      - name: Type-check extracted boundaries
+        run: python -m mypy
+
   upstream-hermes-compat:
     runs-on: ubuntu-latest
     strategy:
@@ -33,19 +49,19 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Checkout latest verified Hermes release
+      - name: Checkout earlier supported Hermes release fixture
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
           ref: 29112bef099274229cadff79cdff7bf7b99c4b77
           path: .upstream/stable
-      - name: Checkout latest verified Hermes main snapshot
+      - name: Checkout earlier supported Hermes main fixture
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
           ref: 2179a279ae04bfadf8efbc49a01ca0abfb738000
           path: .upstream/main
-      - name: Checkout local production Hermes snapshot
+      - name: Checkout recorded production Hermes source fixture
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
@@ -73,13 +89,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
-          ref: 818c13be1dc4fd28987e1e881a9408224afd4535
+          ref: e06df9c2eae6901f4c88f464e0ae6e753c0428b8 # v0.22.0
           path: .upstream/latest_stable
       - name: Checkout pinned Hermes latest_main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
-          ref: c57331677d7fc46298a7159cf3a650853f0966c5
+          ref: 0e427d788d253630d38a3a51cd76849e73cd6925 # main observed 2026-10-14
           path: .upstream/latest_main
       - name: Install test dependencies
         run: python -m pip install -e ".[test]"
@@ -130,7 +146,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -291,7 +307,7 @@ jobs:
         env:
           FEISHU_APP_ID: cli_test_only
           FEISHU_APP_SECRET: test_only_not_a_real_secret
-          HFC_VERSION: v4.7.7
+          HFC_VERSION: v5.0.0
         run: docker compose -f docker-compose.example.yml config --quiet
       - name: Start published Compose smoke topology
         run: >-

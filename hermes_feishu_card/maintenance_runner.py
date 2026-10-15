@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping
 
-from .config import load_config, merge_card_config
+from .config import load_config
+from .config_rules import merge_card_config
 from .maintenance_card import FeishuJobPublisher
 from .maintenance_store import (
     MaintenancePaths,

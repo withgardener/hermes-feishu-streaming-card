@@ -6,6 +6,7 @@ import math
 import re
 from typing import Any
 
+from .display_redaction import redact_tool_detail
 from .text import normalize_stream_text
 
 _PROCESS_ID = re.compile(r'proc_[0-9a-f]{12}')
@@ -25,11 +26,9 @@ def _mapping(value: object) -> dict:
 def _text(value: object, limit: int, *, tail: bool = False) -> str:
     if type(value) is not str or len(value) > 65536:
         return ''
-    # Import lazily to share the established display redaction contract without
-    # a session/render import cycle. Redact before clipping either end.
-    from .render import _redact_tool_detail
+    # Share display redaction without loading the renderer; redact before clipping.
     try:
-        text = _redact_tool_detail(normalize_stream_text(value)).strip()
+        text = redact_tool_detail(normalize_stream_text(value)).strip()
     except (ValueError, RecursionError):
         return ''
     return text[-limit:] if tail else text[:limit]

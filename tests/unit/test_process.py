@@ -534,15 +534,52 @@ def test_state_directory_parent_traversal_is_rejected_without_posix_permissions(
     ) == "state directory path must not contain parent traversal"
 
 
-def test_state_directory_resolution_failure_is_fail_closed(monkeypatch, tmp_path):
+def test_state_directory_symlink_loop_is_fail_closed(monkeypatch, tmp_path):
     loop = tmp_path / "loop"
     loop.symlink_to(loop, target_is_directory=True)
     monkeypatch.setattr(process, "state_dir", lambda: loop / "state")
+    mutations = []
+    monkeypatch.setattr(process.os, "mkdir", lambda *args, **kwargs: mutations.append("mkdir"))
+    monkeypatch.setattr(process.os, "chmod", lambda *args, **kwargs: mutations.append("chmod"))
+
+    # Python 3.13+ resolve(strict=False) leaves loops unresolved; the explicit
+    # lstat walk must still reject them. Older Python raises during resolve.
+    error = process._state_dir_security_error(
+        allow_missing=True,
+        require_private_mode=False,
+    )
+    assert error in {
+        "state directory could not be inspected",
+        "state directory path must not contain symbolic links",
+    }
+    assert process._prepare_private_state_dir() == f"failed: {error}"
+    assert mutations == []
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_state_directory_resolution_failure_is_fail_closed(
+    monkeypatch, tmp_path, error_type,
+):
+    target = tmp_path / "state"
+    monkeypatch.setattr(process, "state_dir", lambda: target)
+    original_resolve = process.Path.resolve
+    mutations = []
+
+    def fail_resolution(path, *args, **kwargs):
+        if path == target:
+            raise error_type("injected resolution failure")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(process.Path, "resolve", fail_resolution)
+    monkeypatch.setattr(process.os, "mkdir", lambda *args, **kwargs: mutations.append("mkdir"))
+    monkeypatch.setattr(process.os, "chmod", lambda *args, **kwargs: mutations.append("chmod"))
 
     assert process._state_dir_security_error(
         allow_missing=True,
         require_private_mode=False,
     ) == "state directory could not be inspected"
+    assert process._prepare_private_state_dir() == "failed: state directory could not be inspected"
+    assert mutations == []
 
 
 def test_start_sidecar_refuses_symlink_state_directory_without_chmod_target(
@@ -2742,3 +2779,116 @@ def test_numeric_pid_termination_is_disabled_on_all_platforms(monkeypatch):
 
     with pytest.raises(RuntimeError, match="disabled"):
         process.stop_pid(5678)
+
+
+@pytest.mark.parametrize("operation", ["start", "stop"])
+@pytest.mark.parametrize("pidfile_state", ["permission_denied", "dangling_symlink", "missing"])
+def test_pidfile_inspection_gate_with_modern_path_semantics(
+    monkeypatch, tmp_path, operation, pidfile_state,
+):
+    state_root = tmp_path / "private-state"
+    state_root.mkdir(mode=0o700)
+    record_path = state_root / process.PIDFILE_NAME
+    if pidfile_state == "permission_denied":
+        record_path.write_text("unreadable existing ownership evidence", encoding="utf-8")
+    elif pidfile_state == "dangling_symlink":
+        record_path.symlink_to(state_root / "missing-target")
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    # The Windows branch skips legacy POSIX pidfile migration. Removing the
+    # uid API reaches the same branch without changing os.name globally.
+    monkeypatch.setattr(process.os, "getuid", None, raising=False)
+    effects = []
+    metadata_errors = []
+    read_errors = []
+    original_open = process.os.open
+    original_stat = process.os.stat
+    original_lstat = process.os.lstat
+    original_exists = process.Path.exists
+    original_is_symlink = process.Path.is_symlink
+
+    def is_denied(path):
+        return pidfile_state == "permission_denied" and process.Path(path) == record_path
+
+    def denied_open(path, *args, **kwargs):
+        if is_denied(path):
+            read_errors.append("open")
+            raise PermissionError("synthetic pidfile read denied")
+        return original_open(path, *args, **kwargs)
+
+    def denied_stat(path, *args, **kwargs):
+        if is_denied(path):
+            metadata_errors.append("stat")
+            raise PermissionError("synthetic pidfile attributes denied")
+        return original_stat(path, *args, **kwargs)
+
+    def denied_lstat(path, *args, **kwargs):
+        if is_denied(path):
+            metadata_errors.append("lstat")
+            raise PermissionError("synthetic pidfile attributes denied")
+        return original_lstat(path, *args, **kwargs)
+
+    def exists_like_python314(path):
+        try:
+            return original_exists(path)
+        except OSError:
+            return False
+
+    def is_symlink_like_python314(path):
+        try:
+            return original_is_symlink(path)
+        except OSError:
+            return False
+
+    monkeypatch.setattr(process.os, "open", denied_open)
+    monkeypatch.setattr(process.os, "stat", denied_stat)
+    monkeypatch.setattr(process.os, "lstat", denied_lstat)
+    # Older pathlib caches OS functions in its accessor at import time. Patch
+    # that same I/O boundary too, otherwise the injected denial never reaches
+    # Path.lstat() on those supported interpreters.
+    accessor = getattr(record_path, "_accessor", None)
+    if accessor is not None:
+        monkeypatch.setattr(accessor, "stat", denied_stat)
+        if hasattr(accessor, "lstat"):
+            monkeypatch.setattr(accessor, "lstat", denied_lstat)
+    monkeypatch.setattr(process.Path, "exists", exists_like_python314)
+    monkeypatch.setattr(process.Path, "is_symlink", is_symlink_like_python314)
+
+    def forbidden(name):
+        def action(*_args, **_kwargs):
+            effects.append(name)
+            pytest.fail(f"unverified pidfile must not allow {name}")
+        return action
+
+    def token_boundary(_token):
+        if pidfile_state == "missing":
+            effects.append("missing-file-start-admitted")
+            raise ValueError("stop test before real credential write")
+        return forbidden("token write")()
+
+    monkeypatch.setattr(process, "write_control_token_file", token_boundary)
+    monkeypatch.setattr(process, "write_pid_record", forbidden("pidfile write"))
+    monkeypatch.setattr(process.subprocess, "Popen", forbidden("Popen"))
+    monkeypatch.setattr(process, "clear_pid", forbidden("clear_pid"))
+    monkeypatch.setattr(process, "stop_pid", forbidden("stop_pid"))
+    monkeypatch.setattr(process.os, "kill", forbidden("kill"))
+    config = {"service": {"manager": "detached"}, "server": {"host": "127.0.0.1", "port": 0}}
+    if operation == "start":
+        result = process.start_sidecar(tmp_path / "config.yaml", config)
+    else:
+        result = process.stop_sidecar(config)
+
+    if pidfile_state == "permission_denied":
+        assert read_errors and metadata_errors
+        assert result == f"failed: pidfile state could not be inspected; {operation} refused"
+        assert effects == []
+    elif pidfile_state == "dangling_symlink":
+        assert result == f"failed: invalid pidfile exists; {operation} refused"
+        assert effects == []
+        assert original_is_symlink(record_path)
+    elif operation == "start":
+        assert result == "failed: private control token file could not be prepared"
+        assert effects == ["missing-file-start-admitted"]
+    else:
+        assert result == "not running"
+        assert effects == []

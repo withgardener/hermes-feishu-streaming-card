@@ -85,6 +85,79 @@ def test_task_presentation_and_rules_changes_select_their_contract_tests():
             "tests/unit/test_session_store.py"} <= set(targets)
 
 
+def test_every_active_runtime_file_has_an_explicit_test_route():
+    """A new module must name a contract suite before focused CI can select it."""
+    for path in (preflight.ROOT / "hermes_feishu_card").rglob("*.py"):
+        if "_native_hook_provenance" in path.parts:
+            continue
+        targets, groups, unknown = preflight.select_targets(
+            [path.relative_to(preflight.ROOT).as_posix()], []
+        )
+        assert unknown == 0, path.name
+        assert groups and targets, path.name
+        assert all((preflight.ROOT / target).is_file() for target in targets)
+
+
+def test_unknown_installer_module_requires_an_explicit_route():
+    targets, groups, unknown = preflight.select_targets(
+        ["hermes_feishu_card/install/unreviewed_new_mutation.py"], []
+    )
+    assert (targets, groups, unknown) == ([], [], 1)
+
+
+def test_routing_manifest_changes_exercise_the_routing_contract():
+    targets, groups, unknown = preflight.select_targets(
+        ["tools/preflight_routes.json"], []
+    )
+    assert groups == ["preflight"] and unknown == 0
+    assert "tests/unit/test_preflight.py" in targets
+
+
+@pytest.mark.skipif(not shutil.rmtree.avoids_symlink_attacks, reason="fd-safe cleanup required")
+def test_successful_cleanup_keeps_evidence_and_never_follows_child_symlinks(tmp_path, monkeypatch):
+    private = tmp_path / "owned-run"
+    private.mkdir()
+    original = private.stat()
+    outside = tmp_path / "shared-fixture"
+    outside.mkdir()
+    (outside / "canary").write_text("preserve")
+    (private / "pytest").mkdir()
+    (private / "pytest/source").symlink_to(outside, target_is_directory=True)
+    (private / "home").mkdir()
+    (private / "state").mkdir()
+    (private / "pytest.log").write_text("proof")
+    monkeypatch.setattr(preflight, "_scratch_reference_state", lambda path: "unused")
+    result = preflight.cleanup_scratch(private, (original.st_dev, original.st_ino))
+    assert result["status"] == "reclaimed"
+    assert list(private.iterdir()) == [private / "pytest.log"]
+    assert (outside / "canary").read_text() == "preserve"
+
+
+@pytest.mark.parametrize("references", ["busy", "unknown"])
+def test_cleanup_retains_possible_live_scratch(tmp_path, monkeypatch, references):
+    original = tmp_path.stat()
+    (tmp_path / "pytest").mkdir()
+    (tmp_path / "pytest/canary").write_text("in use")
+    monkeypatch.setattr(preflight, "_scratch_reference_state", lambda path: references)
+    result = preflight.cleanup_scratch(tmp_path, (original.st_dev, original.st_ino))
+    assert result["status"].startswith("retained_")
+    assert (tmp_path / "pytest/canary").read_text() == "in use"
+
+
+def test_cleanup_rejects_changed_root_before_reference_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "_scratch_reference_state", lambda path: pytest.fail("unowned root probed"))
+    assert preflight.cleanup_scratch(tmp_path, (-1, -1))["status"] == "retained_identity_changed"
+
+
+def test_successful_suite_can_keep_full_scratch_for_retest(repo, capsys, monkeypatch):
+    root, _ = repo
+    (root / "tests/unit/test_example.py").write_text("def test_ok(tmp_path):\n    (tmp_path / 'retest.txt').write_text('retain')\n")
+    monkeypatch.setattr(preflight, "cleanup_scratch", lambda *args: pytest.fail("explicit keep ignored"))
+    code, report, stderr = invoke(capsys, repo, ["--suite", "full", "--keep-artifacts"])
+    assert code == 0 and report["cleanup"]["status"] == "retained_requested"
+    assert (Path(stderr.strip().split("private local log: ")[-1]).parent / "pytest").is_dir()
+
+
 def test_missing_fixture_reports_incomplete_and_blocks_full(repo, capsys, monkeypatch):
     monkeypatch.setattr(preflight, "execute_suite", lambda *args: pytest.fail("pytest started without required fixture"))
     for args in ([], ["--suite", "full"]):
@@ -334,3 +407,37 @@ def test_deleted_test_requires_a_replacement_matrix_instead_of_silent_omission(r
     code, report, _ = invoke(capsys, repo, ["--suite", "focused"])
     assert code == 2
     assert report["pytest"]["status"] == "not_run"
+
+
+def test_maintenance_evidence_change_selects_proof_and_cross_layer_stop_contracts():
+    targets, groups, unknown = preflight.select_targets(
+        ["hermes_feishu_card/maintenance_evidence.py"], []
+    )
+    assert not unknown
+    assert set(groups) == {"operations", "ownership"}
+    assert {
+        "tests/unit/test_maintenance_evidence.py",
+        "tests/unit/test_runtime_ownership.py",
+        "tests/integration/test_maintenance_runner.py",
+    } <= set(targets)
+
+
+def test_lifecycle_state_change_selects_server_and_flush_consumers():
+    targets, groups, unknown = preflight.select_targets(
+        ["hermes_feishu_card/lifecycle.py"], []
+    )
+    assert not unknown
+    assert set(groups) == {"process", "runtime", "render"}
+    assert {"tests/unit/test_lifecycle.py", "tests/unit/test_flush.py",
+            "tests/integration/test_server.py"} <= set(targets)
+
+
+def test_shared_bound_io_change_selects_all_three_transaction_consumers():
+    targets, groups, unknown = preflight.select_targets(
+        ["hermes_feishu_card/install/posix_transaction.py"], []
+    )
+    assert not unknown
+    assert set(groups) == {"install_transactions", "install", "diagnostics"}
+    assert {"tests/unit/test_bound_recovery_io.py", "tests/unit/test_recovery.py", "tests/unit/test_integrity.py",
+            "tests/integration/test_cli_install.py",
+            "tests/integration/test_cli_integrity.py"} <= set(targets)

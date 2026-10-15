@@ -336,3 +336,137 @@ def test_runtime_binding_uses_pm_committed_venv_with_real_child(tmp_path, legacy
     assert binding.runtime_python == managed / "bin" / "python"
     assert binding.purelib.is_relative_to(managed)
     assert binding.hermes_home == home
+
+
+@pytest.mark.parametrize("normalize_lists", [False, True])
+@pytest.mark.parametrize("plugin_config", [
+    {"enabled": ["hermes-feishu-card"]},
+    {"enabled": ["z-plugin", "hermes-feishu-card", "a-plugin"]},
+    {"enabled": ["hermes-feishu-card"], "disabled": ["z-disabled", "a-disabled"]},
+    {"enabled": ["hermes-feishu-card"], "entries": {
+        "hermes-feishu-card": {"allow_tool_override": True, "keep": "entry-value"},
+        "other-plugin": {"allow_tool_override": True}}},
+])
+def test_enable_plugin_accepts_exact_already_enabled_official_branch(
+    tmp_path, monkeypatch, plugin_config, normalize_lists
+):
+    # Official cmd_enable leaves lists untouched in its already_enabled branch.
+    # A normalized official variant remains supported, but no arbitrary subset.
+    original = "# exact preimage\n" + yaml.safe_dump({
+        "model": "synthetic-model", "plugins": plugin_config,
+    }, sort_keys=False)
+    binding = _binding(tmp_path, monkeypatch, original)
+    preimage = plugin.prepare_plugin_config(binding)
+    calls = []
+
+    def official_enable(candidate):
+        calls.append(candidate)
+        config = yaml.safe_load(candidate.config_path.read_bytes())
+        section = config["plugins"]
+        if normalize_lists:
+            section["enabled"] = sorted(set(section["enabled"]))
+            section["disabled"] = sorted(set(section.get("disabled", [])))
+        section.setdefault("entries", {}).setdefault(plugin.PLUGIN_KEY, {})[
+            "allow_tool_override"
+        ] = False
+        candidate.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(plugin, "_run_official_enable", official_enable)
+    ownership = plugin.enable_plugin(binding, preimage)
+    actual = yaml.safe_load(binding.config_path.read_bytes())
+    expected = json.loads(json.dumps({"model": "synthetic-model", "plugins": plugin_config}))
+    if normalize_lists:
+        expected["plugins"]["enabled"] = sorted(set(plugin_config["enabled"]))
+        expected["plugins"]["disabled"] = sorted(set(plugin_config.get("disabled", [])))
+    expected["plugins"].setdefault("entries", {}).setdefault(plugin.PLUGIN_KEY, {})[
+        "allow_tool_override"
+    ] = False
+    assert actual == expected
+    assert calls == [binding]
+    assert ownership.enabled_before is True
+    assert actual["plugins"]["entries"][plugin.PLUGIN_KEY]["allow_tool_override"] is False
+    plugin.restore_plugin_config(binding, preimage, ownership)
+    assert binding.config_path.read_bytes() == original.encode()
+
+
+@pytest.mark.parametrize("drift", ["model", "other-entry", "target-extra", "enabled-drop", "disabled-drop", "grant-true"])
+def test_enable_plugin_already_enabled_rejects_non_derived_delta_and_restores_exact(
+    tmp_path, monkeypatch, drift
+):
+    original = "# preserve comment and order\n" + yaml.safe_dump({
+        "model": "synthetic-model", "plugins": {
+            "enabled": ["z-plugin", plugin.PLUGIN_KEY, "a-plugin"],
+            "disabled": ["keep-disabled"],
+            "entries": {"other-plugin": {"keep": True}},
+        },
+    }, sort_keys=False)
+    binding = _binding(tmp_path, monkeypatch, original)
+    preimage = plugin.prepare_plugin_config(binding)
+
+    def drifting_enable(candidate):
+        config = yaml.safe_load(candidate.config_path.read_bytes())
+        section = config["plugins"]
+        section["entries"][plugin.PLUGIN_KEY] = {"allow_tool_override": False}
+        if drift == "model":
+            config["model"] = "changed-model"
+        elif drift == "other-entry":
+            section["entries"]["other-plugin"]["keep"] = False
+        elif drift == "target-extra":
+            section["entries"][plugin.PLUGIN_KEY]["unexpected"] = True
+        elif drift == "enabled-drop":
+            section["enabled"].remove("a-plugin")
+        elif drift == "disabled-drop":
+            section["disabled"] = []
+        else:
+            section["entries"][plugin.PLUGIN_KEY]["allow_tool_override"] = True
+        candidate.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(plugin, "_run_official_enable", drifting_enable)
+    with pytest.raises(plugin.PluginConfigRefused, match="unrelated"):
+        plugin.enable_plugin(binding, preimage)
+    assert binding.config_path.read_bytes() == original.encode()
+
+
+@pytest.mark.parametrize("enabled,disabled", [([], []), ([plugin.PLUGIN_KEY], [plugin.PLUGIN_KEY])])
+def test_enable_plugin_not_enabled_rejects_entry_only_shortcut(tmp_path, monkeypatch, enabled, disabled):
+    original = yaml.safe_dump({"plugins": {"enabled": enabled, "disabled": disabled}})
+    binding = _binding(tmp_path, monkeypatch, original)
+    preimage = plugin.prepare_plugin_config(binding)
+
+    def entry_only(candidate):
+        config = yaml.safe_load(candidate.config_path.read_bytes())
+        config["plugins"]["entries"] = {plugin.PLUGIN_KEY: {"allow_tool_override": False}}
+        candidate.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(plugin, "_run_official_enable", entry_only)
+    with pytest.raises(plugin.PluginConfigRefused, match="unrelated"):
+        plugin.enable_plugin(binding, preimage)
+    assert binding.config_path.read_bytes() == original.encode()
+
+
+@pytest.mark.parametrize("normalize_only", ["enabled", "disabled"])
+def test_enable_plugin_already_enabled_rejects_mixed_list_normalization(
+    tmp_path, monkeypatch, normalize_only
+):
+    original = yaml.safe_dump({"plugins": {
+        "enabled": ["z-plugin", plugin.PLUGIN_KEY, "a-plugin"],
+        "disabled": ["z-disabled", "a-disabled"],
+    }}, sort_keys=False)
+    binding = _binding(tmp_path, monkeypatch, original)
+    preimage = plugin.prepare_plugin_config(binding)
+
+    def partial_enable(candidate):
+        config = yaml.safe_load(candidate.config_path.read_bytes())
+        section = config["plugins"]
+        section[normalize_only] = sorted(set(section[normalize_only]))
+        section["entries"] = {plugin.PLUGIN_KEY: {"allow_tool_override": False}}
+        candidate.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(plugin, "_run_official_enable", partial_enable)
+    with pytest.raises(plugin.PluginConfigRefused, match="unrelated"):
+        plugin.enable_plugin(binding, preimage)
+    assert binding.config_path.read_bytes() == original.encode()

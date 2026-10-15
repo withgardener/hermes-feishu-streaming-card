@@ -710,3 +710,106 @@ def test_doctor_reports_v3_specific_fail_closed_findings(
         "cron_backup_source_mismatch",
         "base_install_state_incomplete",
     }
+
+
+def _execute_diagnostic_fixture(binding, entrypoint, decision):
+    return v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version="4.3.0",
+    )
+
+
+def test_plugin_enable_exit_zero_unrelated_change_reports_guard_and_restores(
+    tmp_path, monkeypatch,
+):
+    import subprocess
+    import sys
+
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    originals = {target: (root / target).read_bytes() for target in v3.HYBRID_PATCH_TARGET_ORDER}
+    original_config = binding.config_path.read_bytes()
+    original_run = subprocess.run
+    child_results = []
+
+    def controlled_enable_child(argv, **kwargs):
+        assert argv == [str(binding.runtime_python), "-I", "-m", "hermes_cli.main",
+                        "plugins", "enable", plugin.PLUGIN_KEY, "--no-allow-tool-override"]
+        assert kwargs["cwd"] == str(root)
+        assert kwargs["env"] == {"HOME": str(binding.hermes_home), "HERMES_HOME": str(binding.hermes_home)}
+        # Execute a real bounded child at the process port. This synthetic child
+        # represents an official command that succeeds but changes other config.
+        script = ("from pathlib import Path; "
+                  f"Path({str(binding.config_path)!r}).write_text("
+                  "'private: CHANGED\\nplugins:\\n  enabled: [hermes-feishu-card]\\n', encoding='utf-8')")
+        result = original_run([sys.executable, "-I", "-c", script], **kwargs)
+        child_results.append(result)
+        return result
+
+    monkeypatch.setattr(plugin.subprocess, "run", controlled_enable_child)
+    try:
+        with pytest.raises(v3.FixedTagInstallRefused) as caught:
+            _execute_diagnostic_fixture(binding, entrypoint, decision)
+        assert len(child_results) == 1 and child_results[0].returncode == 0
+        assert binding.config_path.read_bytes() == original_config
+        assert all((root / target).read_bytes() == raw for target, raw in originals.items())
+        manifest = json.loads((root / ".hermes_feishu_card_manifest").read_text())
+        assert manifest["phase"] == "prepared"
+        assert type(caught.value.__cause__) is plugin.PluginConfigRefused
+        assert str(caught.value.__cause__) == "official plugin enable changed unrelated config"
+        assert str(caught.value) == "official plugin enable changed unrelated config"
+    finally:
+        v3.restore_fixed_tag_hybrid_install(binding=binding)
+    assert binding.config_path.read_bytes() == original_config
+    assert not (root / ".hermes_feishu_card_manifest").exists()
+
+
+def test_plugin_preimage_drift_reports_guard_without_running_enable(tmp_path, monkeypatch):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    originals = {target: (root / target).read_bytes() for target in v3.HYBRID_PATCH_TARGET_ORDER}
+    prepare = plugin.prepare_plugin_config
+    changed = b"private: USER-EDIT\nplugins: {}\n"
+
+    def prepare_then_edit(candidate):
+        preimage = prepare(candidate)
+        candidate.config_path.write_bytes(changed)
+        return preimage
+
+    monkeypatch.setattr(plugin, "prepare_plugin_config", prepare_then_edit)
+    monkeypatch.setattr(plugin, "_run_official_enable", lambda _: pytest.fail("preimage guard must precede command"))
+    with pytest.raises(v3.FixedTagInstallRefused) as caught:
+        _execute_diagnostic_fixture(binding, entrypoint, decision)
+    assert binding.config_path.read_bytes() == changed  # Never erase a concurrent user edit.
+    assert all((root / target).read_bytes() == raw for target, raw in originals.items())
+    assert type(caught.value.__cause__) is plugin.PluginConfigRefused
+    assert str(caught.value.__cause__) == "Hermes config changed after preimage"
+    assert str(caught.value) == "Hermes config changed after preimage"
+
+
+@pytest.mark.parametrize("error_type", [plugin.PluginConfigRefused, RuntimeError])
+@pytest.mark.parametrize("message", ["SYNTHETIC-SECRET: token=DO-NOT-EXPORT", "Hermes config changed after preimage SYNTHETIC-SECRET"])
+def test_plugin_enable_unknown_exception_is_hidden_and_original_cause_retained(
+    tmp_path, monkeypatch, error_type, message,
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    original_config = binding.config_path.read_bytes()
+    originals = {target: (root / target).read_bytes() for target in v3.HYBRID_PATCH_TARGET_ORDER}
+    original_error = error_type(message)
+
+    def fail_unknown(*_args):
+        raise original_error
+
+    monkeypatch.setattr(plugin, "enable_plugin", fail_unknown)
+    try:
+        with pytest.raises(v3.FixedTagInstallRefused) as caught:
+            _execute_diagnostic_fixture(binding, entrypoint, decision)
+        assert str(caught.value) == "official plugin enable failed"
+        assert "SYNTHETIC-SECRET" not in str(caught.value)
+        assert caught.value.__cause__ is original_error
+        assert binding.config_path.read_bytes() == original_config
+        assert all((root / target).read_bytes() == raw for target, raw in originals.items())
+    finally:
+        v3.restore_fixed_tag_hybrid_install(binding=binding)

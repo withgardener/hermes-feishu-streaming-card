@@ -1,6 +1,6 @@
 # 开发规则与技术栈
 
-本页是日常开发约束；详细领域不变量见[维护指南](maintenance-guide.md)。[V5 建议](../roadmap-v5.md)中的任务体验已获准进入开发分支，当前实现与验收边界见[任务卡片](../task-cards.md)；这不授权更改其他默认值或 Python 支持范围。
+本页是日常开发约束；详细领域不变量见[维护指南](maintenance-guide.md)。[V5 建议](../roadmap-v5.md)中的核心任务体验已随 4.7.0 发布，当前实现与验收边界见[任务卡片](../task-cards.md)。[完整重构与升级计划](../plans/2026-10-13-refactor-upgrade.md)已进入实施，当前授权不改变默认值或 Python 支持范围。
 
 ## 技术栈与采用原则
 
@@ -13,9 +13,10 @@
 | 状态 | 内存 session + 私有有界文件检查点/账本 | 明确保留时间、容量、原子写与损坏处理；展示恢复不恢复执行 |
 | 构建与检查 | setuptools；pytest；GitHub Actions/CodeQL/Dependabot | 普通 wheel 与公开安装独立验收；不把扫描无告警解释为无漏洞 |
 
-当前未配置 formatter、linter、typechecker、coverage 门禁或性能基准。
-新增工具先用独立 PR 在有限范围验证收益；禁止借工具引入全仓格式改写。
-Ruff/类型检查属于后续建议，未接入前不要把它们写成已经执行的门禁。
+Ruff 0.17.0 与 mypy 2.4.0 从已提取模块逐步接入，范围以 `pyproject.toml` 的显式列表为准。
+在 Python 3.12 开发环境安装 `.[test,quality]` 后执行 `python -m ruff check` 和 `python -m mypy`。
+质量工具的运行环境不改变 >=3.9 的产品支持声明；3.9 仍走独立运行回归。
+暂未设置全仓格式化、coverage 门禁；禁止借工具引入全仓格式改写或批量忽略现有问题。
 不因“下一大版本”改用另一语言、Web 框架、数据库或消息队列；新增依赖必须说明用户收益、版本兼容、维护成本、安全更新和回退方式。
 
 ## 模块职责
@@ -52,7 +53,7 @@ python tools/preflight.py --suite focused --module process
 python tools/preflight.py --suite focused --module runtime --module render
 ```
 
-只选本次需要的组。自动映射不完整时会拒绝猜测；`AGENTS.md` 需显式选 `docs`。
+只选本次需要的组。自动路由在 `tools/preflight_routes.json` 逐文件登记所有 active 模块；新增文件必须明确选择契约组，未知文件仍拒绝猜测。`AGENTS.md` 自动进入 `docs`。
 组选择是起点，不保证涵盖 runner、credential file、CardKit 等所有关联测试；按[维护矩阵](maintenance-guide.md)补齐。
 
 全量需要 `HFC_FIXED_TAG_SOURCE_ROOT` 指向 provenance 指定提交、摘要一致、工作区干净的 Git checkout。缺 fixture 的 docs 聚焦运行可以通过，但总报告可能是 `partial`；须分别记录 `pytest.status` 与 fixture 状态。
@@ -77,3 +78,5 @@ python tools/preflight.py --suite focused --module runtime --module render
 每个 PR 列出最重要的验收证据和未覆盖边界。保留首轮失败证据；只有明确归因后才重跑，不能用反复重跑替代定位。
 
 每批验证结束后检查本任务创建的临时目录、复制源码、候选安装包与服务。确认没有进程或后续验收依赖后直接回收；保留失败日志、结果报告、来源哈希及必要回滚材料。最终验收结束再清理不再复用的隔离环境和任务专用依赖，托管工作树使用托管工具归档。记录准确路径与实测占用，不把归档会话当作释放磁盘。
+
+preflight 成功后保留私有 `pytest.log` 和 JUnit 结果；仅当本次目录身份未变、没有打开的文件引用且平台支持安全目录删除时，回收本次的 pytest/HOME/state 树。失败或无法确认时保留；`--keep-artifacts` 可显式保留成功现场。不扫描或删除其他任务及共享 fixture。

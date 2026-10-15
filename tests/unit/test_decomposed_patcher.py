@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_feishu_card import cli, hook_runtime
-from hermes_feishu_card.install import decomposed, patcher, recovery
+from hermes_feishu_card.install import decomposed, decomposed_ownership, patcher, recovery
 from hermes_feishu_card.install.detect import detect_hermes
 
 FIXTURE = Path(__file__).parents[1] / "fixtures/hermes_decomposed"
@@ -521,7 +521,7 @@ def test_legacy_layout_migration_rejects_unverified_ownership(hermes, damage):
 def test_owned_restore_does_not_depend_on_current_renderer(hermes, monkeypatch):
     before = sources(hermes)
     decomposed.install(detect_hermes(hermes))
-    monkeypatch.setattr(decomposed, "render", lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("future renderer")))
+    monkeypatch.setattr(decomposed_ownership, "render", lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("future renderer")))
     decomposed.restore(detect_hermes(hermes))
     assert sources(hermes) == before
 

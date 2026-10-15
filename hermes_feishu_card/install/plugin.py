@@ -291,6 +291,13 @@ def enable_plugin(
         raise PluginConfigRefused("Hermes config changed after preimage")
     before = _load_config_mapping(before_bytes)
     expected, enabled_before = _expected_enabled_config(before)
+    # Hermes skips list writes when the plugin is already enabled. Both
+    # official branches must preserve every unrelated field exactly.
+    already_enabled_expected = (
+        _expected_enabled_config(before, preserve_enabled_lists=True)[0]
+        if enabled_before
+        else expected
+    )
     try:
         return_code = _run_official_enable(binding)
     except Exception as exc:
@@ -305,7 +312,7 @@ def enable_plugin(
     except PluginConfigRefused:
         _restore_exact_config(binding, before_bytes, expected_sha256=after_sha256)
         raise
-    if after != expected:
+    if after != expected and after != already_enabled_expected:
         _restore_exact_config(binding, before_bytes, expected_sha256=after_sha256)
         raise PluginConfigRefused("official plugin enable changed unrelated config")
     added_by_hfc = after_bytes != before_bytes
@@ -393,7 +400,9 @@ def cleanup_plugin_config_preimage(preimage: PluginConfigPreimage) -> None:
         path.unlink()
 
 
-def _expected_enabled_config(before: Mapping[str, object]) -> tuple[dict[str, object], bool]:
+def _expected_enabled_config(
+    before: Mapping[str, object], *, preserve_enabled_lists: bool = False
+) -> tuple[dict[str, object], bool]:
     expected = json.loads(json.dumps(before))
     plugins = expected.get("plugins")
     if plugins is None:
@@ -413,10 +422,11 @@ def _expected_enabled_config(before: Mapping[str, object]) -> tuple[dict[str, ob
     ):
         raise PluginConfigRefused("plugins config shape is invalid")
     enabled_before = PLUGIN_KEY in enabled and PLUGIN_KEY not in disabled
-    plugins["enabled"] = sorted(set(enabled) | {PLUGIN_KEY})
-    plugins["disabled"] = sorted(
-        set(disabled) - {PLUGIN_KEY, "hermes_feishu_card"}
-    )
+    if not (preserve_enabled_lists and enabled_before):
+        plugins["enabled"] = sorted(set(enabled) | {PLUGIN_KEY})
+        plugins["disabled"] = sorted(
+            set(disabled) - {PLUGIN_KEY, "hermes_feishu_card"}
+        )
     entry = entries.get(PLUGIN_KEY)
     if entry is None:
         entry = {}

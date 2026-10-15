@@ -53,7 +53,9 @@ def test_all_preview_states_keep_safe_payloads_and_complete_answer():
     data = build_preview(report)
     assert report == before
     assert len(data["scenarios"]) == 9
+    colors = {"running": "blue", "waiting": "default", "approval": "orange", "clarify": "orange", "completed": "green", "short": "green", "stopped": "red", "restored": "default", "notice": "green"}
     for sample in data["scenarios"]:
+        assert sample["cards"]["task"]["header"]["template"] == colors[sample["id"]], sample["id"]
         for card in sample["cards"].values():
             assert inspect_card_limits(card).safe, sample["id"]
     complete = next(s for s in data["scenarios"] if s["id"] == "completed")
@@ -65,6 +67,42 @@ def test_all_preview_states_keep_safe_payloads_and_complete_answer():
     approval = next(s for s in data["scenarios"] if s["id"] == "approval")
     assert "schema" not in approval["cards"]["task"]
     assert "原配置先备份" in str(approval["cards"]["task"])
+
+
+@pytest.mark.parametrize("expanded", [None, False, True])
+def test_completed_preview_keeps_full_history_after_answer_and_honors_explicit_expansion(expanded):
+    settings = {"reading_preset": "task"}
+    if expanded is not None:
+        settings["timeline_expanded"] = expanded
+    data = build_preview(explain_reading_config({"card": settings}))
+    completed = next(sample for sample in data["scenarios"] if sample["id"] == "completed")
+    card = completed["cards"]["task"]
+    elements = card["body"]["elements"]
+    history = next(item for item in elements if item.get("element_id") == "auxiliary_timeline")
+    answer = next(item for item in elements if item.get("element_id") == "main_content")
+    assert elements.index(answer) < elements.index(history)
+    assert history["expanded"] is (True if expanded is None else expanded)
+    history_text = json.dumps(history, ensure_ascii=False)
+    assert "读取项目说明" in history_text
+    assert "检查项目测试" in history_text
+    assert "python -m pytest tests/unit -q" in history_text
+    assert "执行中" not in history_text
+    assert "真实客户端效果仍需单独验收" in json.dumps(card, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("legacy_hide", [None, False, True])
+def test_expanded_completed_history_keeps_successful_tools_without_default_body_duplicates(legacy_hide):
+    settings = {"reading_preset": "task"}
+    if legacy_hide is not None:
+        settings["hide_completed_tool_activity"] = legacy_hide
+    completed = next(sample for sample in build_preview(explain_reading_config({"card": settings}))["scenarios"] if sample["id"] == "completed")
+    elements = completed["cards"]["task"]["body"]["elements"]
+    history = next(item for item in elements if item.get("element_id") == "auxiliary_timeline")
+    assert history["expanded"] is True
+    assert "读取项目说明" in json.dumps(history, ensure_ascii=False)
+    assert "检查项目测试" in json.dumps(history, ensure_ascii=False)
+    summaries = [item for item in elements if item.get("element_id", "").startswith("tool_activity_")]
+    assert bool(summaries) is (legacy_hide is False)
 
 
 def test_preview_cli_is_offline_read_only_and_does_not_export_private_values(tmp_path, capsys, monkeypatch):

@@ -14,7 +14,7 @@ from tests.fixtures.hermes_v020_plugin_api import PluginContext
 
 
 EXPECTED_HOOKS = {
-    "pre_llm_call", "post_llm_call", "on_session_end",
+    "pre_llm_call", "post_llm_call", "post_api_request", "on_session_end",
     "on_session_reset", "on_session_finalize", "pre_tool_call",
     "post_tool_call", "pre_approval_request", "post_approval_response",
     "subagent_start", "subagent_stop",
@@ -83,11 +83,12 @@ def test_register_context_matches_v020_and_has_no_valid_hooks_attribute():
     assert not hasattr(context, "VALID_HOOKS")
 
 
-def test_one_host_registration_error_does_not_abort_later_hooks():
-    context = PluginContext(reject_hooks={"post_llm_call"})
+@pytest.mark.parametrize("rejected_hook", ["post_llm_call", "post_api_request"])
+def test_one_host_registration_error_does_not_abort_later_hooks(rejected_hook):
+    context = PluginContext(reject_hooks={rejected_hook})
     assert hermes_plugin.register(context) is None
-    assert "post_llm_call" not in context.registered
-    assert set(context.registered) == EXPECTED_HOOKS - {"post_llm_call"}
+    assert rejected_hook not in context.registered
+    assert set(context.registered) == EXPECTED_HOOKS - {rejected_hook}
 
 
 def test_registered_callback_returns_none_when_runtime_callback_raises(monkeypatch):
@@ -523,8 +524,9 @@ def test_runtime_callback_calls_its_bound_runtime_method_without_global_redispat
     assert called == [{"turn_id": "turn-bound"}]
 
 
+@pytest.mark.parametrize("hook_name", ["pre_llm_call", "post_api_request"])
 def test_one_context_gate_transitions_inert_active_disabled_without_appending(
-    monkeypatch,
+    monkeypatch, hook_name,
 ):
     acquired = []
 
@@ -558,26 +560,27 @@ def test_one_context_gate_transitions_inert_active_disabled_without_appending(
     called = []
     monkeypatch.setattr(
         runtime,
-        "handle_pre_llm_call",
+        "handle_" + hook_name,
         lambda **kwargs: called.append(kwargs),
     )
     assert context.registered == callbacks
     assert len(context.register_calls) == len(EXPECTED_HOOKS)
-    assert callbacks["pre_llm_call"](turn_id="turn-active") is None
+    assert callbacks[hook_name](turn_id="turn-active") is None
     assert called == [{"turn_id": "turn-active"}]
 
     monkeypatch.setenv("HERMES_FEISHU_CARD_ENABLED", "0")
     assert hermes_plugin.register(context) is None
     assert plugin_runtime.active_plugin_runtime() is None
     assert len(context.register_calls) == len(EXPECTED_HOOKS)
-    assert callbacks["pre_llm_call"](turn_id="turn-disabled") is None
+    assert callbacks[hook_name](turn_id="turn-disabled") is None
     assert called == [{"turn_id": "turn-active"}]
     assert len(acquired) == 1
     assert lease.close_calls == 1
 
 
+@pytest.mark.parametrize("hook_name", ["pre_llm_call", "post_api_request"])
 def test_active_context_gate_callback_fails_open_when_exact_runtime_method_raises(
-    monkeypatch,
+    monkeypatch, hook_name,
 ):
     class Lease:
         close_calls = 0
@@ -603,16 +606,17 @@ def test_active_context_gate_callback_fails_open_when_exact_runtime_method_raise
         calls.append(kwargs)
         raise RuntimeError("private callback failure detail")
 
-    monkeypatch.setattr(runtime, "handle_pre_llm_call", fail_exact_method)
+    monkeypatch.setattr(runtime, "handle_" + hook_name, fail_exact_method)
 
-    assert context.registered["pre_llm_call"](turn_id="turn-active") is None
+    assert context.registered[hook_name](turn_id="turn-active") is None
     assert calls == [{"turn_id": "turn-active"}]
     assert plugin_runtime.active_plugin_runtime() is runtime
     assert lease.close_calls == 0
 
 
+@pytest.mark.parametrize("rejected_hook", ["post_llm_call", "post_api_request"])
 def test_context_gate_retries_only_the_missing_hook_after_transient_rejection(
-    monkeypatch,
+    monkeypatch, rejected_hook,
 ):
     monkeypatch.setenv("HERMES_FEISHU_CARD_ENABLED", "0")
 
@@ -623,22 +627,22 @@ def test_context_gate_retries_only_the_missing_hook_after_transient_rejection(
 
         def register_hook(self, name, callback):
             self.register_calls.append(name)
-            if name == "post_llm_call" and self.reject_once:
+            if name == rejected_hook and self.reject_once:
                 self.reject_once = False
                 raise RuntimeError("transient host rejection")
             return PluginContext.register_hook(self, name, callback)
 
     context = TransientContext()
     assert hermes_plugin.register(context) is None
-    assert set(context.registered) == EXPECTED_HOOKS - {"post_llm_call"}
+    assert set(context.registered) == EXPECTED_HOOKS - {rejected_hook}
     assert len(context.register_calls) == len(EXPECTED_HOOKS)
 
     assert hermes_plugin.register(context) is None
     assert set(context.registered) == EXPECTED_HOOKS
-    assert context.register_calls.count("post_llm_call") == 2
+    assert context.register_calls.count(rejected_hook) == 2
     assert all(
         context.register_calls.count(name) == 1
-        for name in EXPECTED_HOOKS - {"post_llm_call"}
+        for name in EXPECTED_HOOKS - {rejected_hook}
     )
     calls_after_complete = list(context.register_calls)
     assert hermes_plugin.register(context) is None

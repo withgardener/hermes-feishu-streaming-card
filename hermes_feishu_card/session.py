@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .observations import TurnObservation
+
 from dataclasses import dataclass, field, replace
 from copy import deepcopy
 import json
@@ -116,6 +118,8 @@ class InteractionState:
     reply_in_thread: bool = False
     runtime_admission: object | None = field(default=None, repr=False)
     runtime_turn_id: str = field(default="", repr=False)
+    # Ephemeral delivery evidence; active_interaction is excluded from checkpoints.
+    runtime_delivery_fingerprint: str = field(default="", repr=False)
     # The approval card's own Feishu message id, recorded when the card is delivered. A timed-out
     # approval refreshes THAT card in place instead of sending a second paused card (#314).
     feishu_message_id: str = ""
@@ -188,6 +192,7 @@ class CardSession:
     provider: str = ""
     context: Dict[str, Any] = field(default_factory=dict)
     duration: float = 0.0
+    observation: TurnObservation = field(default_factory=TurnObservation, repr=False)
     subscription_usage: str = ""
     subscription_usage_checked: bool = False
     attachments: list[dict[str, str]] = field(default_factory=list)
@@ -260,6 +265,19 @@ class CardSession:
         event: SidecarEvent,
         *,
         advance_sequence: bool = True,
+    ) -> bool:
+        observed_at = time.monotonic()
+        previous_answer = self.answer_text
+        applied = self._apply_state(event, advance_sequence=advance_sequence)
+        if applied:
+            self.observation.observe(
+                event.event, now=observed_at,
+                answer_changed=(self.answer_text != previous_answer and bool(self.answer_text.strip())),
+            )
+        return applied
+
+    def _apply_state(
+        self, event: SidecarEvent, *, advance_sequence: bool = True,
     ) -> bool:
         if (
             event.conversation_id != self.conversation_id

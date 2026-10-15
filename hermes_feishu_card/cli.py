@@ -20,7 +20,24 @@ from typing import Any, Callable
 
 import yaml
 
+from hermes_feishu_card.install import posix_transaction
+from hermes_feishu_card.install.file_transaction import (
+    _RestoreIdentity, _RestoreEvidenceSnapshot,
+    _snapshot_restore_evidence,
+    _restore_text_sha256,
+    _read_restore_text,
+    _assert_restore_evidence_set_unchanged,
+    _write_targets_portably,
+)
+
 from hermes_feishu_card import __version__ as PACKAGE_VERSION
+from hermes_feishu_card.cli_reports import (
+    format_route_chain as _format_route_chain,
+    exact_delivery_contract_status as _exact_delivery_contract_status,
+    doctor_exit_code as _doctor_exit_code,
+    format_doctor_explanation as _format_doctor_explanation,
+    format_hermes_detection as _format_hermes_detection,
+)
 from hermes_feishu_card.config import load_config
 from hermes_feishu_card.instance_binding import configured_hermes_home, setup_hermes_home
 from hermes_feishu_card.delivery_policy import normalize_native_chats
@@ -128,7 +145,7 @@ from hermes_feishu_card.persistent_service import (
     persistent_sidecar_setup_blocker,
 )
 from hermes_feishu_card.render import render_card
-from hermes_feishu_card.server import python_executable_identity
+from hermes_feishu_card.runtime_ownership import python_executable_identity
 from hermes_feishu_card.session import CardSession
 
 
@@ -145,56 +162,11 @@ COMPOSE_HOST_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 FEISHU_SDK_INSTALL_SPEC = "lark-oapi==1.6.8"
 FEISHU_SDK_REQUIRED_PARAMETER = "extra_ua_tags"
 RUNTIME_PROBE_TIMEOUT_SECONDS = 30
-_RestoreIdentity = tuple[int, int]
-_RestoreEvidenceSnapshot = tuple[int, int, str]
-_CLI_SNAPSHOT_UNSET = object()
 OFFICIAL_INSTALLER_COMMAND = (
     "bash <(curl -fsSL "
     "https://raw.githubusercontent.com/baileyh8/"
     "hermes-feishu-streaming-card/main/install.sh)"
 )
-
-
-class _CliTargetBinding:
-    def __init__(
-        self,
-        path: Path,
-        parent_fd: int,
-        parent_identity: _RestoreIdentity,
-        initial_snapshot: _RestoreEvidenceSnapshot | None,
-        initial_bytes: bytes | None,
-        initial_mode: int | None,
-    ) -> None:
-        self.path = path
-        self.parent_fd = parent_fd
-        self.parent_identity = parent_identity
-        self.initial_snapshot = initial_snapshot
-        self.initial_bytes = initial_bytes
-        self.initial_mode = initial_mode
-
-    @property
-    def basename(self) -> str:
-        return self.path.name
-
-    def close(self) -> None:
-        if self.parent_fd >= 0:
-            os.close(self.parent_fd)
-            self.parent_fd = -1
-
-
-class _CliStagedText:
-    def __init__(
-        self,
-        basename: str,
-        identity: _RestoreIdentity,
-        digest: str,
-        mode: int,
-    ) -> None:
-        self.basename = basename
-        self.identity = identity
-        self.digest = digest
-        self.mode = mode
-        self.consumed = False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -256,6 +228,8 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_output = doctor.add_mutually_exclusive_group()
     doctor_output.add_argument("--json", action="store_true", dest="json_output")
     doctor_output.add_argument("--explain", action="store_true")
+    doctor_output.add_argument("--support-report", action="store_true", help="preview a bounded report with private values removed; no upload")
+    doctor_output.add_argument("--export-report", metavar="NEW_FILE", help="preview and explicitly save a private support report to a new file; no upload")
 
     card_config = subparsers.add_parser(
         "card-config", help="explain effective reading options without changing configuration",
@@ -263,7 +237,10 @@ def _build_parser() -> argparse.ArgumentParser:
     card_config.add_argument("--config", required=True)
     card_config.add_argument("--profile-id")
     card_config.add_argument("--bot-id")
-    card_config.add_argument("--json", action="store_true", dest="json_output")
+    card_config_output = card_config.add_mutually_exclusive_group()
+    card_config_output.add_argument("--json", action="store_true", dest="json_output")
+    card_config_output.add_argument("--minimal-yaml", action="store_true", help="print minimal reading settings for the selected scope; no file changes")
+    card_config.add_argument("--running", action="store_true", help="compare next-load values with the matching sidecar's loaded defaults; no restart")
     card_config.add_argument("--preview-dir", help="write offline sample cards and an HTML comparison to a new directory")
 
     setup = subparsers.add_parser(
@@ -863,7 +840,7 @@ def _ensure_setup_config(config_path: Path) -> bool:
     if config_path.exists():
         return False
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(config_path, _default_setup_config_text())
+    posix_transaction._atomic_write_text(config_path, _default_setup_config_text())
     return True
 
 
@@ -926,23 +903,39 @@ card:
 def _run_card_config(args: argparse.Namespace) -> int:
     from .reading import explain_reading_config
 
+    if getattr(args, "minimal_yaml", False) and getattr(args, "running", False):
+        print("Use --running separately; --minimal-yaml describes the selected YAML scope.", file=sys.stderr)
+        return 2
     try:
         path = Path(args.config).expanduser()
         # Validate using the runtime loader; read raw scopes to distinguish
         # explicit YAML values from the defaults injected by that loader.
-        load_config(path)
+        config = load_config(path)
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, ValueError, yaml.YAMLError):
         print("Unable to read valid card configuration.", file=sys.stderr)
         return 2
     try:
         report = explain_reading_config(
-            raw, profile_id=args.profile_id, bot_id=args.bot_id,
+            raw, profile_id=args.profile_id, bot_id=args.bot_id, include_scope=True,
         )
     except ValueError as exc:
         # Selection errors contain fixed messages, never YAML values.
         print(str(exc), file=sys.stderr)
         return 2
+    scope = report.pop("_selected_scope")
+    if getattr(args, "running", False):
+        from .config_snapshot import compare_reading_values
+        from .process import fetch_loaded_card_config
+
+        running = fetch_loaded_card_config(path, config, **scope)
+        report["running_config"] = running["status"]
+        report["running"] = running
+        if running["status"] == "verified":
+            report["differences"] = compare_reading_values(report["values"], running["values"])
+            report["note"] = "Read-only. Running values are verified loaded defaults for new turns. Existing cards and per-event overrides are excluded. Restart the sidecar to apply YAML changes."
+        else:
+            report["note"] = "Read-only. The running configuration could not be verified; only next-load values are shown. No restart or configuration change was performed."
     if args.preview_dir:
         from .preview import write_preview
         try:
@@ -954,12 +947,33 @@ def _run_card_config(args: argparse.Namespace) -> int:
             print("Unable to create a safe offline preview.", file=sys.stderr)
             return 2
         report["preview"] = {"files": ["index.html", "cards.json"], "mode": "offline_samples", "sends_messages": False}
-    if args.json_output:
+    if getattr(args, "minimal_yaml", False):
+        from .config_snapshot import minimal_reading_config
+        try:
+            scope_kind, snippet = minimal_reading_config(
+                raw, profile_id=args.profile_id, bot_id=args.bot_id,
+            )
+        except (KeyError, TypeError, ValueError):
+            print("Unable to create a safe reading configuration snippet.", file=sys.stderr)
+            return 2
+        print(f"# Replace reading fields in the selected {scope_kind} card block.")
+        print("# Keep other fields and parent scopes unchanged. No files were edited.")
+        print(yaml.safe_dump(snippet, allow_unicode=True, sort_keys=False).rstrip())
+    elif args.json_output:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         for key, value in report["values"].items():
             print(f"{key}: {json.dumps(value, ensure_ascii=False)}  [{report['sources'][key]}]")
         print(report["note"])
+        if "running" in report:
+            print(f"running_config: {report['running_config']}")
+            if report["running_config"] == "verified":
+                for change in report["differences"]:
+                    print(f"{change['field']}: loaded={json.dumps(change['loaded'], ensure_ascii=False)} next_load={json.dumps(change['next_load'], ensure_ascii=False)}")
+                if not report["differences"]:
+                    print("No differences in the selected reading options.")
+            else:
+                print(f"reason: {report['running']['reason']}")
         if args.preview_dir:
             print("Preview created: index.html and cards.json. Sample data only; no messages sent.")
     return 0
@@ -967,6 +981,7 @@ def _run_card_config(args: argparse.Namespace) -> int:
 
 def _run_doctor(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser()
+    support_report = bool(getattr(args, "support_report", False) or getattr(args, "export_report", None))
     try:
         route_settings = _resolve_route_settings(args, config_path)
         args._profile_id = route_settings["profile_id"]
@@ -977,6 +992,8 @@ def _run_doctor(args: argparse.Namespace) -> int:
             selected_home = setup_hermes_home(Path(args.hermes_dir), config, args.hermes_home)
             config.setdefault("service", {})["hermes_home"] = str(selected_home)
     except Exception as exc:
+        if support_report:
+            return _output_support_report(_doctor_error_report(config_path, exc), args)
         if args.json_output:
             print(
                 json.dumps(
@@ -992,6 +1009,11 @@ def _run_doctor(args: argparse.Namespace) -> int:
             return 1
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    if support_report:
+        report = _build_doctor_report(config_path, config, args)
+        payload = report.to_dict() if isinstance(report, DiagnosticReport) else report
+        return _output_support_report(payload, args)
 
     if args.json_output or args.explain:
         report = _build_doctor_report(config_path, config, args)
@@ -1051,6 +1073,24 @@ def _run_doctor(args: argparse.Namespace) -> int:
         return 0 if detection.supported else 1
     print("hermes: not checked")
     return 0
+
+
+def _output_support_report(payload: dict[str, Any], args: argparse.Namespace) -> int:
+    from .support_report import build_support_report, serialize_support_report, write_support_report
+
+    try:
+        print(serialize_support_report(build_support_report(payload)), end="", flush=True)
+        destination = getattr(args, "export_report", None)
+        if destination:
+            write_support_report(Path(destination).expanduser(), payload)
+            print("Support report saved locally. Nothing was uploaded.", file=sys.stderr)
+    except FileExistsError:
+        print("Report file already exists; choose a new file.", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
+        print("Unable to create a bounded support report; no existing file was replaced.", file=sys.stderr)
+        return 2
+    return _doctor_exit_code(payload)
 
 
 def _doctor_json_output_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1544,46 +1584,6 @@ def _attach_route_diagnostics(
     return report
 
 
-def _format_route_chain(report: DiagnosticReport | dict[str, Any]) -> str:
-    if isinstance(report, DiagnosticReport):
-        routing = report.routing
-        finding_codes = [finding.code for finding in report.findings]
-    else:
-        routing = report.get("routing", {})
-        recommendations = report.get("recommendations", [])
-        finding_codes = [
-            str(item.get("code") or "")
-            for item in recommendations
-            if isinstance(item, dict)
-        ]
-    profile_id = str(routing.get("profile_id") or "")
-    profile_exists = bool(routing.get("profile_exists"))
-    endpoint = safe_event_endpoint_for_output(
-        str(routing.get("event_endpoint") or "")
-    )
-    lines = [
-        "Route Chain",
-        f"- identity_source: {routing.get('profile_source') or 'unknown'}",
-        f"- profile_id: {profile_id or 'missing'}",
-        f"- event_endpoint: {endpoint or 'missing'}",
-        f"- config_profile: {profile_id if profile_exists else 'missing'}",
-        f"- bot_id: {routing.get('bot_id') or 'missing'}",
-        f"- route_reason: {routing.get('route_reason') or 'missing'}",
-    ]
-    route_codes = {
-        "profile_identity_missing",
-        "profile_unknown",
-        "profile_credentials_missing",
-        "event_endpoint_mismatch",
-        "bot_unknown",
-        "route_fallback",
-    }
-    findings = [code for code in finding_codes if code in route_codes]
-    if findings:
-        lines.append(f"- findings: {', '.join(findings)}")
-    return "\n".join(lines)
-
-
 def _doctor_profile_count(config: dict[str, Any]) -> int:
     profiles = config.get("profiles")
     if not isinstance(profiles, dict):
@@ -1621,14 +1621,6 @@ def _doctor_hermes_report(detection: HermesDetection) -> dict[str, Any]:
         ),
         "suggestion_reason": detection.suggestion_reason,
     }
-
-
-def _exact_delivery_contract_status(detection: HermesDetection) -> str:
-    if not detection.base_required:
-        return "not_required"
-    if detection.capabilities.get("exact_base_delivery") is True:
-        return "ready"
-    return "missing_or_unsupported"
 
 
 def _doctor_streaming_report(hermes_root: Path, *, hermes_home: Path | None = None) -> dict[str, str]:
@@ -2220,16 +2212,17 @@ def _summarize_process_output(result: subprocess.CompletedProcess[str]) -> str:
 
 
 def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
-    from .install import decomposed
-    if detection.decomposed or decomposed.is_managed(detection.root):
-        plan = decomposed.plan(detection)
+    from .install import decomposed_ownership
+    from .install import recovery as recovery_owner
+    if detection.decomposed or decomposed_ownership.is_managed(detection.root):
+        plan = recovery_owner._plan_decomposed_recovery(detection)
         report = {"checked": True, "status": plan.state,
                 "manifest_exists": (detection.root / MANIFEST_NAME).exists(),
-                "manual_action_required": plan.state in {"refused", *decomposed.EXPLICIT_UPGRADE_STATES},
+                "manual_action_required": plan.state in {"refused", *decomposed_ownership.EXPLICIT_UPGRADE_STATES},
                 "automatic_repair_available": plan.executable,
                 "message": "Decomposed ownership: " + plan.state}
-        if plan.state in decomposed.EXPLICIT_UPGRADE_STATES:
-            accepted = decomposed.plan(detection, accept_hermes_upgrade=True)
+        if plan.state in decomposed_ownership.EXPLICIT_UPGRADE_STATES:
+            accepted = recovery_owner._plan_decomposed_recovery(detection, accept_hermes_upgrade=True)
             if accepted.executable:
                 report["message"] = (
                     "Hermes source changed and HFC hooks need reinstalling; an updater/autostash "
@@ -2519,121 +2512,6 @@ def _finalize_doctor_report(report: dict[str, Any]) -> dict[str, Any]:
     else:
         report["status"] = "ok"
     return report
-
-
-def _doctor_exit_code(report: dict[str, Any]) -> int:
-    return 1 if report.get("status") == "error" else 0
-
-
-def _format_doctor_explanation(report: dict[str, Any]) -> str:
-    config = report["config"]
-    lines = ["Doctor Summary"]
-    if config.get("loaded"):
-        lines.append(f"- Config: OK ({config['path']})")
-        lines.append(f"- Sidecar: {report['sidecar']['address']}")
-    else:
-        lines.append(f"- Config: ERROR ({config['path']})")
-        lines.append(f"- Error: {config.get('error', 'unknown')}")
-
-    hermes = report["hermes"]
-    hermes_status = hermes["status"]
-    if hermes.get("checked"):
-        details = []
-        if hermes.get("version"):
-            details.append(str(hermes["version"]))
-        if hermes.get("hook_strategy"):
-            details.append(str(hermes["hook_strategy"]))
-        if hermes.get("compatibility"):
-            details.append(f"compatibility {hermes['compatibility']}")
-        suffix = f" ({', '.join(details)})" if details else ""
-        lines.append(f"- Hermes: {hermes_status}{suffix}")
-        exact_contract = hermes.get("exact_delivery_contract")
-        if exact_contract:
-            lines.append(f"- Exact delivery contract: {exact_contract}")
-    else:
-        lines.append(f"- Hermes: {hermes_status}")
-
-    runtime_import = report.get("runtime_import", {})
-    if runtime_import.get("status"):
-        lines.append(
-            f"- Runtime import: {runtime_import['status']} - "
-            f"{runtime_import.get('message', '')}"
-        )
-
-    feishu_sdk = report.get("feishu_sdk", {})
-    if isinstance(feishu_sdk, dict) and feishu_sdk.get("status"):
-        lines.append(
-            f"- Feishu SDK: {feishu_sdk['status']} - "
-            f"{feishu_sdk.get('message', '')}"
-        )
-
-    streaming = report["streaming"]
-    if streaming.get("status"):
-        lines.append(
-            f"- Streaming: {streaming['status']} - {streaming.get('message', '')}"
-        )
-
-    install_state = report["install_state"]
-    if install_state.get("status"):
-        lines.append(
-            f"- Install state: {install_state['status']} - "
-            f"{install_state.get('message', '')}"
-        )
-
-    lines.append("")
-    lines.append("Next steps")
-    recommendations = report.get("recommendations", [])
-    if not recommendations:
-        lines.append("- No action required.")
-        return "\n".join(lines)
-    for item in recommendations:
-        severity = item.get("severity", "info")
-        message = item.get("message", "")
-        next_step = item.get("next_step", "")
-        lines.append(f"- [{severity}] {message}")
-        if next_step:
-            lines.append(f"  Next: {next_step}")
-    return "\n".join(lines)
-
-
-def _format_hermes_detection(detection: HermesDetection) -> str:
-    status = "supported" if detection.supported else "unsupported"
-    run_py_exists = "yes" if detection.run_py_exists else "no"
-    version = detection.version
-    if (
-        detection.supported
-        and version == "unknown"
-        and detection.version_source == "gateway anchors"
-    ):
-        version = "unknown (source-stripped metadata)"
-    lines = [
-        f"hermes: {status}",
-        f"hermes_root: {detection.root}",
-        f"run_py: {detection.run_py}",
-        f"run_py_exists: {run_py_exists}",
-        f"cron_py: {detection.cron_py}",
-        f"cron_py_exists: {'yes' if detection.cron_py_exists else 'no'}",
-        f"version_source: {detection.version_source}",
-        f"version: {version}",
-        f"minimum_supported_version: {detection.minimum_version}",
-        f"hook_strategy: {detection.hook_strategy}",
-        f"cron_hook_strategy: {detection.cron_hook_strategy}",
-        f"base_py: {detection.base_py}",
-        f"base_py_exists: {'yes' if detection.base_py_exists else 'no'}",
-        f"base_required: {'yes' if detection.base_required else 'no'}",
-        f"base_hook_strategy: {detection.base_hook_strategy}",
-        f"exact_delivery_contract: {_exact_delivery_contract_status(detection)}",
-        f"compatibility: {detection.compatibility}",
-        f"suggested_root: {detection.suggested_root or ''}",
-        f"suggestion_reason: {detection.suggestion_reason}",
-        "anchors:",
-    ]
-    for capability, found in detection.capabilities.items():
-        anchor_status = "found" if found else "missing"
-        locations = ", ".join(detection.capability_locations.get(capability, ()))
-        lines.append(f"  {capability}: {anchor_status}" + (f" ({locations})" if locations else ""))
-    lines.append(f"reason: {detection.reason}")
-    return "\n".join(lines)
 
 
 def _print_hermes_streaming_guidance(hermes_root: Path, *, hermes_home: Path | None = None) -> None:
@@ -3124,18 +3002,18 @@ def _run_integrity(args: argparse.Namespace) -> int:
         else config_path.parent / ".env"
     )
     manifest_path = detection.root / MANIFEST_NAME
-    bindings: list[_CliTargetBinding] = []
+    bindings: list[posix_transaction._CliTargetBinding] = []
     try:
-        if not _cli_dirfd_binding_supported():
+        if not posix_transaction._cli_dirfd_binding_supported():
             raise ValueError(
                 "secure integrity migration requires directory-relative "
                 "filesystem operations on this platform"
             )
-        manifest_binding = _bind_cli_target(manifest_path)
+        manifest_binding = posix_transaction._bind_cli_target(manifest_path)
         bindings.append(manifest_binding)
         if manifest_binding.initial_snapshot is None:
             raise ValueError("integrity migration requires a manifest")
-        env_binding = _bind_cli_target(env_path)
+        env_binding = posix_transaction._bind_cli_target(env_path)
         bindings.append(env_binding)
         manifest_text = (manifest_binding.initial_bytes or b"").decode("utf-8")
         _provenance, manifest_contents = render_integrity_manifest_migration(
@@ -3155,7 +3033,7 @@ def _run_integrity(args: argparse.Namespace) -> int:
             if render_integrity_manifest_migration(detection, manifest_contents) != (_provenance, manifest_contents):
                 raise ValueError("integrity evidence changed; rerun diagnosis")
 
-        _write_targets_transactionally(
+        posix_transaction._write_targets_transactionally(
             [
                 (manifest_path, manifest_contents),
                 (env_path, env_contents),
@@ -3707,7 +3585,7 @@ def _read_local_yaml(path: str | Path) -> dict:
 def _write_local_yaml(path: str | Path, data: dict) -> None:
     config_path = Path(path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(
+    posix_transaction._atomic_write_text(
         config_path,
         yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
     )
@@ -3880,7 +3758,7 @@ def _run_install(args: argparse.Namespace) -> int:
         return fixed_tag_result
 
     if detection.decomposed:
-        from .install.decomposed import install as install_decomposed
+        from .install.recovery import install_decomposed
         try:
             changed = install_decomposed(
                 detection, no_repair=bool(getattr(args, "no_repair", False)),
@@ -3981,7 +3859,7 @@ def _run_install(args: argparse.Namespace) -> int:
     cron_backup_existed = False
     base_backup_existed = False
     gateway_restart_required = False
-    transactional_install = _cli_dirfd_binding_supported()
+    transactional_install = posix_transaction._cli_dirfd_binding_supported()
 
     try:
         install_paths = {
@@ -4137,7 +4015,7 @@ def _run_install(args: argparse.Namespace) -> int:
             changes.append((cron_py, cron_patched))
         changes.append((manifest_path, manifest_contents))
         if transactional_install:
-            _write_targets_transactionally(
+            posix_transaction._write_targets_transactionally(
                 changes,
                 expected_identities=install_identities,
                 expected_directories=install_directory_identities,
@@ -4458,10 +4336,11 @@ def _repair_action_message(action: str) -> str:
 
 
 def _restore(hermes_root: Path) -> None:
-    from .install import decomposed
+    from .install import decomposed_ownership
+    from .install import recovery as recovery_owner
     detection = detect_hermes(hermes_root)
-    if detection.decomposed or decomposed.is_managed(hermes_root):
-        decomposed.restore(detection)
+    if detection.decomposed or decomposed_ownership.is_managed(hermes_root):
+        recovery_owner.restore_decomposed(detection)
         return
     run_py = hermes_root / "gateway" / "run.py"
     cron_py = hermes_root / "cron" / "scheduler.py"
@@ -4555,7 +4434,7 @@ def _restore(hermes_root: Path) -> None:
             try:
                 if run_py.exists() and remove_patch(current) == backup_text:
                     _assert_restore_evidence_set_unchanged(restore_identities)
-                    _write_targets_transactionally(
+                    posix_transaction._write_targets_transactionally(
                         [(run_py, backup_text)],
                         expected_identities=restore_identities,
                         expected_directories=restore_directory_identities,
@@ -4576,7 +4455,7 @@ def _restore(hermes_root: Path) -> None:
                 raise ValueError("run.py changed since install; refusing to restore")
 
             _assert_restore_evidence_set_unchanged(restore_identities)
-            _write_targets_transactionally(
+            posix_transaction._write_targets_transactionally(
                 [(run_py, backup_text)],
                 expected_identities=restore_identities,
                 expected_directories=restore_directory_identities,
@@ -4619,7 +4498,7 @@ def _restore(hermes_root: Path) -> None:
         if cron_backup_text is not None:
             target_changes.append((cron_py, cron_backup_text))
         _assert_restore_evidence_set_unchanged(restore_identities)
-        _write_targets_transactionally(
+        posix_transaction._write_targets_transactionally(
             target_changes,
             expected_identities=restore_identities,
             expected_directories=restore_directory_identities,
@@ -4694,7 +4573,7 @@ def _restore(hermes_root: Path) -> None:
     restored = restored_contents != current
     if restored:
         _assert_restore_evidence_set_unchanged(restore_identities)
-        _write_targets_transactionally(
+        posix_transaction._write_targets_transactionally(
             [(run_py, restored_contents)],
             expected_identities=restore_identities,
             expected_directories=restore_directory_identities,
@@ -4711,105 +4590,6 @@ def _restore(hermes_root: Path) -> None:
 
 def _backup_path(run_py: Path) -> Path:
     return run_py.with_name(f"{run_py.name}{BACKUP_SUFFIX}")
-
-
-def _snapshot_restore_evidence(
-    hermes_root: Path, evidence: dict[str, Path]
-) -> tuple[
-    dict[Path, _RestoreEvidenceSnapshot | None],
-    dict[Path, _RestoreIdentity | None],
-]:
-    directory_identities: dict[Path, _RestoreIdentity | None] = {}
-    for label, path in (
-        ("Hermes directory", hermes_root),
-        ("gateway directory", hermes_root / "gateway"),
-        ("cron directory", hermes_root / "cron"),
-        ("gateway/platforms directory", hermes_root / "gateway" / "platforms"),
-    ):
-        try:
-            snapshot = path.lstat()
-        except FileNotFoundError:
-            directory_identities[path] = None
-            continue
-        if stat.S_ISLNK(snapshot.st_mode):
-            raise ValueError(f"{label} must not be a symlink")
-        if not stat.S_ISDIR(snapshot.st_mode):
-            raise ValueError(f"{label} must be a directory")
-        directory_identities[path] = (snapshot.st_dev, snapshot.st_ino)
-
-    identities: dict[Path, _RestoreEvidenceSnapshot | None] = {}
-    for label, path in evidence.items():
-        try:
-            snapshot = path.lstat()
-        except FileNotFoundError:
-            identities[path] = None
-            continue
-        if stat.S_ISLNK(snapshot.st_mode):
-            raise ValueError(f"{label} must not be a symlink")
-        if not stat.S_ISREG(snapshot.st_mode):
-            raise ValueError(f"{label} must be a regular file")
-        identity = (snapshot.st_dev, snapshot.st_ino)
-        contents = _read_restore_text(path, identity)
-        identities[path] = (
-            snapshot.st_dev,
-            snapshot.st_ino,
-            _restore_text_sha256(contents),
-        )
-    return identities, directory_identities
-
-
-def _restore_text_sha256(contents: str) -> str:
-    return hashlib.sha256(contents.encode("utf-8")).hexdigest()
-
-
-def _read_restore_text(
-    path: Path,
-    expected_snapshot: _RestoreIdentity | _RestoreEvidenceSnapshot | None,
-) -> str:
-    if expected_snapshot is None:
-        raise ValueError(f"{path.name} is missing; refusing to restore")
-    expected_identity = expected_snapshot[:2]
-    expected_digest = expected_snapshot[2] if len(expected_snapshot) == 3 else None
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    fd: int | None = None
-    try:
-        fd = os.open(path, os.O_RDONLY | nofollow)
-        opened = os.fstat(fd)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != expected_identity
-        ):
-            raise ValueError(f"{path.name} changed during restore; refusing to restore")
-        if not nofollow:
-            current = path.lstat()
-            if (
-                stat.S_ISLNK(current.st_mode)
-                or (current.st_dev, current.st_ino) != expected_identity
-            ):
-                raise ValueError(
-                    f"{path.name} changed during restore; refusing to restore"
-                )
-        with os.fdopen(fd, "r", encoding="utf-8", newline="") as handle:
-            fd = None
-            contents = handle.read()
-        if not nofollow:
-            current = path.lstat()
-            if (
-                stat.S_ISLNK(current.st_mode)
-                or (current.st_dev, current.st_ino) != expected_identity
-            ):
-                raise ValueError(
-                    f"{path.name} changed during restore; refusing to restore"
-                )
-        if (
-            expected_digest is not None
-            and _restore_text_sha256(contents) != expected_digest
-        ):
-            raise ValueError(f"{path.name} changed during restore; refusing to restore")
-        return contents
-    finally:
-        if fd is not None:
-            os.close(fd)
 
 
 def _read_restore_manifest(
@@ -4911,331 +4691,9 @@ def _clear_install_state(
         for path in paths_to_remove:
             path.unlink(missing_ok=True)
         return
-    if not _cli_dirfd_binding_supported():
-        raise ValueError(
-            "secure restore cleanup requires directory-relative filesystem "
-            "operations on this platform"
-        )
-    bindings: dict[Path, _CliTargetBinding] = {}
-    try:
-        for path in paths_to_remove:
-            if restore_directory_identities is not None:
-                _assert_restore_directory_ancestry_unchanged(
-                    path, restore_directory_identities
-                )
-            binding = _bind_cli_target(path)
-            bindings[path] = binding
-            expected_snapshot = restore_identities.get(path)
-            if binding.initial_snapshot != expected_snapshot:
-                raise ValueError(
-                    f"{path.name} changed during restore; refusing to clean up"
-                )
-            if restore_directory_identities is not None:
-                _assert_restore_directory_ancestry_unchanged(
-                    path, restore_directory_identities
-                )
-                expected_parent = restore_directory_identities.get(path.parent)
-                if (
-                    expected_parent is not None
-                    and binding.parent_identity != expected_parent
-                ):
-                    raise ValueError(
-                        f"{path.parent.name} directory changed during restore; "
-                        "refusing to restore"
-                    )
-        for path in paths_to_remove:
-            _safe_unlink_restore_evidence(
-                bindings[path], restore_identities.get(path)
-            )
-    finally:
-        for binding in bindings.values():
-            try:
-                binding.close()
-            except OSError:
-                pass
-
-
-def _assert_restore_evidence_unchanged(
-    path: Path, expected_snapshot: _RestoreEvidenceSnapshot | None
-) -> None:
-    if expected_snapshot is not None:
-        try:
-            _read_restore_text(path, expected_snapshot)
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ValueError(
-                f"{path.name} changed during restore; refusing to clean up"
-            ) from exc
-        return
-    try:
-        current = path.lstat()
-    except FileNotFoundError:
-        if expected_snapshot is None:
-            return
-        raise ValueError(f"{path.name} changed during restore; refusing to clean up")
-    if (
-        expected_snapshot is None
-        or stat.S_ISLNK(current.st_mode)
-        or not stat.S_ISREG(current.st_mode)
-    ):
-        raise ValueError(f"{path.name} changed during restore; refusing to clean up")
-
-
-def _assert_restore_evidence_set_unchanged(
-    restore_identities: dict[Path, _RestoreEvidenceSnapshot | None]
-) -> None:
-    for path, expected_snapshot in restore_identities.items():
-        _assert_restore_evidence_unchanged(path, expected_snapshot)
-
-
-def _safe_unlink_restore_evidence(
-    binding: _CliTargetBinding,
-    expected_snapshot: _RestoreEvidenceSnapshot | None,
-) -> None:
-    if expected_snapshot is not None:
-        _unlink_bound_cli_target(binding, expected_snapshot)
-    elif _read_bound_cli_target(binding.parent_fd, binding.basename) is not None:
-        raise ValueError(
-            f"{binding.basename} changed during restore; refusing to clean up"
-        )
-
-
-def _assert_restore_directory_ancestry_unchanged(
-    path: Path,
-    expected_directories: dict[Path, _RestoreIdentity | None],
-) -> None:
-    for directory, expected_identity in expected_directories.items():
-        if directory != path and directory not in path.parents:
-            continue
-        try:
-            current = directory.lstat()
-        except FileNotFoundError:
-            if expected_identity is None:
-                continue
-            raise ValueError(
-                f"{directory.name} directory changed during restore; "
-                "refusing to restore"
-            )
-        if (
-            expected_identity is None
-            or not stat.S_ISDIR(current.st_mode)
-            or (current.st_dev, current.st_ino) != expected_identity
-        ):
-            raise ValueError(
-                f"{directory.name} directory changed during restore; "
-                "refusing to restore"
-            )
-
-
-def _write_targets_transactionally(
-    changes: list[tuple[Path, str]],
-    *,
-    expected_identities: dict[Path, _RestoreEvidenceSnapshot | None] | None = None,
-    expected_directories: dict[Path, _RestoreIdentity | None] | None = None,
-    preserve_earlier_writes_on_rollback_failure: bool = False,
-    pre_commit_validate: Callable[[], None] | None = None,
-    validate: Callable[[], None] | None = None,
-) -> None:
-    if not _cli_dirfd_binding_supported():
-        raise ValueError(
-            "secure restore transaction requires directory-relative "
-            "filesystem operations on this platform"
-        )
-    bindings: dict[Path, _CliTargetBinding] = {}
-    snapshots: list[tuple[Path, str | None]] = []
-    try:
-        for path, _contents in changes:
-            if expected_directories is not None:
-                _assert_restore_directory_ancestry_unchanged(
-                    path, expected_directories
-                )
-            binding = _bind_cli_target(path)
-            bindings[path] = binding
-            if expected_directories is not None:
-                _assert_restore_directory_ancestry_unchanged(
-                    path, expected_directories
-                )
-                expected_parent = expected_directories.get(path.parent)
-                if (
-                    expected_parent is not None
-                    and binding.parent_identity != expected_parent
-                ):
-                    raise ValueError(
-                        f"{path.parent.name} directory changed during restore; "
-                        "refusing to restore"
-                    )
-            if expected_identities is not None:
-                expected_snapshot = expected_identities.get(path)
-                if binding.initial_snapshot != expected_snapshot:
-                    raise ValueError(
-                        f"{path.name} changed during restore; refusing to clean up"
-                    )
-            snapshots.append(
-                (
-                    path,
-                    binding.initial_bytes.decode("utf-8")
-                    if binding.initial_bytes is not None
-                    else None,
-                )
-            )
-
-        if pre_commit_validate is not None:
-            pre_commit_validate()
-        written: list[Path] = []
-        post_write_snapshots: dict[Path, _RestoreEvidenceSnapshot] = {}
-        try:
-            for path, contents in changes:
-                binding = bindings[path]
-                post_write_snapshots[path] = _atomic_write_text(
-                    path,
-                    contents,
-                    _binding=binding,
-                    _expected_before=binding.initial_snapshot,
-                )
-                written.append(path)
-            for path in written:
-                if expected_directories is not None:
-                    _assert_restore_directory_ancestry_unchanged(
-                        path, expected_directories
-                    )
-                binding = bindings[path]
-                _assert_cli_path_parent_bound(binding)
-                if (
-                    _read_bound_cli_target(binding.parent_fd, binding.basename)
-                    != post_write_snapshots[path]
-                ):
-                    raise ValueError("restore transaction lost write ownership")
-            if validate is not None:
-                validate()
-        except (OSError, UnicodeError, ValueError) as exc:
-            rollback_failed = False
-            snapshot_by_path = dict(snapshots)
-            for path in reversed(written):
-                previous = snapshot_by_path[path]
-                try:
-                    post_write_snapshot = post_write_snapshots.get(path)
-                    if post_write_snapshot is None:
-                        raise ValueError("restore transaction lost write ownership")
-                    binding = bindings[path]
-                    if previous is None:
-                        _unlink_bound_cli_target(binding, post_write_snapshot)
-                    else:
-                        _atomic_write_text(
-                            path,
-                            previous,
-                            _binding=binding,
-                            _expected_before=post_write_snapshot,
-                            _enforce_path_parent=False,
-                        )
-                except (OSError, UnicodeError, ValueError):
-                    rollback_failed = True
-                    if preserve_earlier_writes_on_rollback_failure:
-                        break
-            if rollback_failed:
-                raise ValueError(
-                    "restore transaction rollback failed; manual review required"
-                ) from exc
-            raise
-    finally:
-        for binding in bindings.values():
-            try:
-                binding.close()
-            except OSError:
-                pass
-
-
-def _portable_target_state(
-    path: Path,
-) -> tuple[_RestoreEvidenceSnapshot | None, str | None, int | None]:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return None, None, None
-    if stat.S_ISLNK(metadata.st_mode):
-        raise ValueError("refusing to replace a symbolic link")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError("refusing to replace a non-regular file")
-    identity = (metadata.st_dev, metadata.st_ino)
-    contents = _read_restore_text(path, identity)
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        _restore_text_sha256(contents),
-    ), contents, stat.S_IMODE(metadata.st_mode)
-
-
-def _write_targets_portably(
-    changes: list[tuple[Path, str]],
-    *,
-    expected_identities: dict[Path, _RestoreEvidenceSnapshot | None],
-    expected_directories: dict[Path, _RestoreIdentity | None],
-    preserve_earlier_writes_on_rollback_failure: bool = False,
-) -> None:
-    current_identities = dict(expected_identities)
-    previous_states: dict[Path, tuple[str | None, int | None]] = {}
-
-    def assert_directories_unchanged(path: Path) -> None:
-        _assert_restore_directory_ancestry_unchanged(
-            path, expected_directories
-        )
-
-    _assert_restore_evidence_set_unchanged(current_identities)
-    for path, _contents in changes:
-        assert_directories_unchanged(path)
-        snapshot, previous, previous_mode = _portable_target_state(path)
-        if snapshot != current_identities.get(path):
-            raise ValueError("refusing to replace a changed target")
-        previous_states[path] = previous, previous_mode
-
-    written: list[Path] = []
-    post_write_snapshots: dict[Path, _RestoreEvidenceSnapshot] = {}
-    try:
-        for path, contents in changes:
-            _assert_restore_evidence_set_unchanged(current_identities)
-            assert_directories_unchanged(path)
-            post_write = _atomic_write_text_portable(
-                path,
-                contents,
-                expected_before=current_identities.get(path),
-            )
-            current_identities[path] = post_write
-            post_write_snapshots[path] = post_write
-            written.append(path)
-            assert_directories_unchanged(path)
-        _assert_restore_evidence_set_unchanged(current_identities)
-    except (OSError, UnicodeError, ValueError) as exc:
-        rollback_failed = False
-        for path in reversed(written):
-            previous, previous_mode = previous_states[path]
-            post_write = post_write_snapshots[path]
-            try:
-                assert_directories_unchanged(path)
-                if previous is None:
-                    _assert_restore_evidence_unchanged(path, post_write)
-                    # Without directory-relative handles, deleting a newly
-                    # created path cannot be bound to the verified inode.
-                    # Preserve owned evidence for manual recovery instead of
-                    # risking deletion of a concurrent replacement.
-                    raise ValueError(
-                        "portable rollback preserved newly created evidence"
-                    )
-                else:
-                    restored = _atomic_write_text_portable(
-                        path,
-                        previous,
-                        mode=previous_mode,
-                        expected_before=post_write,
-                    )
-                    current_identities[path] = restored
-                assert_directories_unchanged(path)
-            except (OSError, UnicodeError, ValueError):
-                rollback_failed = True
-                if preserve_earlier_writes_on_rollback_failure:
-                    break
-        if rollback_failed:
-            raise ValueError(
-                "restore transaction rollback failed; manual review required"
-            ) from exc
-        raise
+    posix_transaction._remove_verified_restore_evidence(
+        paths_to_remove, restore_identities, restore_directory_identities
+    )
 
 
 def _snapshot_transaction_write(
@@ -5307,7 +4765,7 @@ def _write_manifest(
         base_backup_path=base_backup_path,
         base_source=base_source,
     )
-    _atomic_write_text(manifest_path, rendered)
+    posix_transaction._atomic_write_text(manifest_path, rendered)
 
 
 def _render_install_manifest(
@@ -5398,7 +4856,7 @@ def _rollback_install(
     base_original: str | None = None,
     base_backup_path: Path | None = None,
     base_backup_existed: bool = False,
-    created_evidence_bindings: dict[Path, _CliTargetBinding] | None = None,
+    created_evidence_bindings: dict[Path, posix_transaction._CliTargetBinding] | None = None,
     created_evidence_snapshots: dict[Path, _RestoreEvidenceSnapshot] | None = None,
 ) -> None:
     rollback_failures: list[tuple[str, Exception]] = []
@@ -5412,7 +4870,7 @@ def _rollback_install(
         except (OSError, UnicodeError):
             pass
         try:
-            _atomic_write_text(path, contents)
+            posix_transaction._atomic_write_text(path, contents)
         except (OSError, UnicodeError, ValueError) as exc:
             rollback_failures.append((label, exc))
 
@@ -5439,7 +4897,7 @@ def _rollback_install(
     def remove_created_evidence(label: str, path: Path | None, existed: bool) -> None:
         if path is None or existed:
             return
-        if not _cli_dirfd_binding_supported():
+        if not posix_transaction._cli_dirfd_binding_supported():
             try:
                 path.unlink(missing_ok=True)
             except (OSError, UnicodeError, ValueError) as exc:
@@ -5459,7 +4917,7 @@ def _rollback_install(
                 )
             return
         try:
-            _unlink_bound_cli_target(binding, expected_snapshot)
+            posix_transaction._unlink_bound_cli_target(binding, expected_snapshot)
         except (OSError, UnicodeError, ValueError) as exc:
             cleanup_failures.append((label, exc))
 
@@ -5987,524 +5445,6 @@ def _file_state_differs(path: Path, contents: str, mode: int) -> bool:
     except (OSError, UnicodeError):
         return True
 
-
-_CLI_DIRFD_BINDING_SUPPORTED = (
-    os.name != "nt"
-    and hasattr(os, "O_DIRECTORY")
-    and hasattr(os, "O_NOFOLLOW")
-    and hasattr(os, "fchmod")
-    and all(
-        operation in getattr(os, "supports_dir_fd", set())
-        for operation in (os.open, os.stat, os.unlink, os.rename)
-    )
-)
-
-
-def _cli_dirfd_binding_supported() -> bool:
-    return _CLI_DIRFD_BINDING_SUPPORTED
-
-
-def _atomic_write_text(
-    path: Path,
-    contents: str,
-    *,
-    mode: int | None = None,
-    _binding: _CliTargetBinding | None = None,
-    _expected_before: _RestoreEvidenceSnapshot | None | object = _CLI_SNAPSHOT_UNSET,
-    _enforce_path_parent: bool = True,
-) -> _RestoreEvidenceSnapshot:
-    if not _cli_dirfd_binding_supported():
-        if _binding is not None:
-            raise ValueError(
-                "secure bound write requires directory-relative filesystem "
-                "operations on this platform"
-            )
-        return _atomic_write_text_portable(
-            path,
-            contents,
-            mode=mode,
-            expected_before=_expected_before,
-        )
-    owns_binding = _binding is None
-    binding = _binding if _binding is not None else _bind_cli_target(path)
-    if binding.path != path:
-        if owns_binding:
-            binding.close()
-        raise ValueError("atomic write binding does not match target")
-    expected_before = (
-        binding.initial_snapshot
-        if _expected_before is _CLI_SNAPSHOT_UNSET
-        else _expected_before
-    )
-    rollback_stage: _CliStagedText | None = None
-    write_stage: _CliStagedText | None = None
-    try:
-        _assert_bound_cli_parent(binding)
-        current_snapshot, current_bytes, current_mode = _read_bound_cli_target_state(
-            binding.parent_fd, binding.basename
-        )
-        if current_snapshot != expected_before:
-            raise ValueError("refusing to replace a changed target")
-        if current_bytes is not None:
-            rollback_stage = _stage_bound_cli_bytes(
-                binding,
-                current_bytes,
-                current_mode if current_mode is not None else 0o600,
-            )
-        selected_mode = mode if mode is not None else current_mode
-        write_stage = _stage_bound_cli_bytes(
-            binding,
-            contents.encode("utf-8"),
-            selected_mode if selected_mode is not None else 0o600,
-        )
-        committed = _replace_bound_cli_stage(
-            binding,
-            write_stage,
-            expected_before=current_snapshot,
-        )
-        if _enforce_path_parent:
-            try:
-                _assert_cli_path_parent_bound(binding)
-            except (OSError, ValueError) as exc:
-                try:
-                    if current_snapshot is None:
-                        _unlink_bound_cli_target(binding, committed)
-                    else:
-                        if rollback_stage is None:
-                            raise ValueError("atomic write lost rollback stage")
-                        restored = _replace_bound_cli_stage(
-                            binding,
-                            rollback_stage,
-                            expected_before=committed,
-                        )
-                        if restored[2] != current_snapshot[2]:
-                            raise ValueError("atomic write rollback verification failed")
-                except (OSError, ValueError) as rollback_exc:
-                    raise ValueError(
-                        "atomic write rollback failed; manual review required"
-                    ) from rollback_exc
-                raise ValueError("directory changed during write") from exc
-        return committed
-    finally:
-        for staged in (write_stage, rollback_stage):
-            if staged is not None:
-                _cleanup_bound_cli_stage(binding, staged)
-        if owns_binding:
-            binding.close()
-
-
-def _atomic_write_text_portable(
-    path: Path,
-    contents: str,
-    *,
-    mode: int | None = None,
-    expected_before: _RestoreEvidenceSnapshot | None | object = _CLI_SNAPSHOT_UNSET,
-) -> _RestoreEvidenceSnapshot:
-    current_snapshot, _current_contents, preserved_mode = _portable_target_state(path)
-    selected_expected = (
-        current_snapshot
-        if expected_before is _CLI_SNAPSHOT_UNSET
-        else expected_before
-    )
-    if current_snapshot != selected_expected:
-        raise ValueError("refusing to replace a changed target")
-
-    create = selected_expected is None
-    fd = _open_portable_exclusive_fd(path, create=create)
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError("refusing to replace a non-regular file")
-        opened_identity = (opened.st_dev, opened.st_ino)
-        current_path = path.lstat()
-        if (
-            stat.S_ISLNK(current_path.st_mode)
-            or not stat.S_ISREG(current_path.st_mode)
-            or (current_path.st_dev, current_path.st_ino) != opened_identity
-        ):
-            raise ValueError("refusing to replace a changed target")
-
-        if create:
-            opened_snapshot = None
-            original_payload = None
-        else:
-            os.lseek(fd, 0, os.SEEK_SET)
-            original_bytes = bytearray()
-            while True:
-                chunk = os.read(fd, 1024 * 1024)
-                if not chunk:
-                    break
-                original_bytes.extend(chunk)
-            original_payload = bytes(original_bytes)
-            original_text = original_payload.decode("utf-8")
-            opened_snapshot = (
-                opened.st_dev,
-                opened.st_ino,
-                _restore_text_sha256(original_text),
-            )
-        if opened_snapshot != selected_expected:
-            raise ValueError("refusing to replace a changed target")
-
-        encoded = contents.encode("utf-8")
-        selected_mode = mode if mode is not None else preserved_mode
-        try:
-            _write_portable_exclusive_bytes(fd, encoded, selected_mode)
-            committed = _verify_portable_exclusive_bytes(
-                fd, path, opened_identity, encoded
-            )
-        except (OSError, UnicodeError, ValueError) as exc:
-            if original_payload is None:
-                raise ValueError(
-                    "restore transaction rollback failed; manual review required"
-                ) from exc
-            try:
-                _write_portable_exclusive_bytes(
-                    fd, original_payload, preserved_mode
-                )
-                _verify_portable_exclusive_bytes(
-                    fd, path, opened_identity, original_payload
-                )
-            except (OSError, UnicodeError, ValueError) as rollback_exc:
-                raise ValueError(
-                    "restore transaction rollback failed; manual review required"
-                ) from rollback_exc
-            raise
-        return (
-            committed.st_dev,
-            committed.st_ino,
-            _restore_text_sha256(contents),
-        )
-    finally:
-        os.close(fd)
-
-
-def _write_portable_exclusive_bytes(
-    fd: int, payload: bytes, mode: int | None
-) -> None:
-    os.lseek(fd, 0, os.SEEK_SET)
-    written = 0
-    while written < len(payload):
-        count = os.write(fd, payload[written:])
-        if count <= 0:
-            raise OSError("portable write made no progress")
-        written += count
-    os.ftruncate(fd, len(payload))
-    if mode is not None and hasattr(os, "fchmod"):
-        os.fchmod(fd, mode)
-    os.fsync(fd)
-
-
-def _verify_portable_exclusive_bytes(
-    fd: int,
-    path: Path,
-    expected_identity: _RestoreIdentity,
-    expected_payload: bytes,
-) -> os.stat_result:
-    committed = os.fstat(fd)
-    if (
-        not stat.S_ISREG(committed.st_mode)
-        or (committed.st_dev, committed.st_ino) != expected_identity
-    ):
-        raise ValueError("portable write lost target ownership")
-    os.lseek(fd, 0, os.SEEK_SET)
-    committed_bytes = bytearray()
-    while True:
-        chunk = os.read(fd, 1024 * 1024)
-        if not chunk:
-            break
-        committed_bytes.extend(chunk)
-    if bytes(committed_bytes) != expected_payload:
-        raise ValueError("portable write verification failed")
-    committed_path = path.lstat()
-    if (
-        stat.S_ISLNK(committed_path.st_mode)
-        or not stat.S_ISREG(committed_path.st_mode)
-        or (committed_path.st_dev, committed_path.st_ino) != expected_identity
-    ):
-        raise ValueError("portable write lost target ownership")
-    return committed
-
-
-def _open_portable_exclusive_fd(path: Path, *, create: bool) -> int:
-    if os.name == "nt":
-        import ctypes
-        import msvcrt
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        create_file = kernel32.CreateFileW
-        create_file.argtypes = (
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        )
-        create_file.restype = wintypes.HANDLE
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-
-        generic_read = 0x80000000
-        generic_write = 0x40000000
-        create_new = 1
-        open_existing = 3
-        file_attribute_normal = 0x00000080
-        file_flag_open_reparse_point = 0x00200000
-        handle = create_file(
-            str(path),
-            generic_read | generic_write,
-            0,
-            None,
-            create_new if create else open_existing,
-            file_attribute_normal | file_flag_open_reparse_point,
-            None,
-        )
-        if handle == ctypes.c_void_p(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            return msvcrt.open_osfhandle(
-                handle,
-                os.O_RDWR | getattr(os, "O_BINARY", 0),
-            )
-        except Exception:
-            close_handle(handle)
-            raise
-
-    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    if create:
-        flags |= os.O_CREAT | os.O_EXCL
-    fd = os.open(path, flags, 0o600)
-    try:
-        try:
-            import fcntl
-        except ImportError:
-            return fd
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd
-    except Exception:
-        os.close(fd)
-        raise
-
-
-def _bind_cli_target(path: Path) -> _CliTargetBinding:
-    parent_fd = -1
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = os.open(path.parent, flags)
-        opened_parent = os.fstat(parent_fd)
-        current_parent = path.parent.lstat()
-        if (
-            not stat.S_ISDIR(opened_parent.st_mode)
-            or not stat.S_ISDIR(current_parent.st_mode)
-            or (opened_parent.st_dev, opened_parent.st_ino)
-            != (current_parent.st_dev, current_parent.st_ino)
-        ):
-            raise ValueError("refusing to stage through a changed directory")
-        snapshot, payload, file_mode = _read_bound_cli_target_state(
-            parent_fd, path.name
-        )
-        binding = _CliTargetBinding(
-            path,
-            parent_fd,
-            (opened_parent.st_dev, opened_parent.st_ino),
-            snapshot,
-            payload,
-            file_mode,
-        )
-        parent_fd = -1
-        return binding
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-
-
-def _assert_bound_cli_parent(binding: _CliTargetBinding) -> None:
-    current = os.fstat(binding.parent_fd)
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or (current.st_dev, current.st_ino) != binding.parent_identity
-    ):
-        raise ValueError("bound target directory changed during write")
-
-
-def _assert_cli_path_parent_bound(binding: _CliTargetBinding) -> None:
-    try:
-        current = binding.path.parent.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError("directory changed during write") from exc
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or (current.st_dev, current.st_ino) != binding.parent_identity
-    ):
-        raise ValueError("directory changed during write")
-
-
-def _stage_bound_cli_bytes(
-    binding: _CliTargetBinding,
-    payload: bytes,
-    mode: int,
-) -> _CliStagedText:
-    _assert_bound_cli_parent(binding)
-    basename = f".{binding.basename}.{uuid4().hex}.tmp"
-    descriptor = -1
-    staged: _CliStagedText | None = None
-    try:
-        descriptor = os.open(
-            basename,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-            dir_fd=binding.parent_fd,
-        )
-        snapshot = os.fstat(descriptor)
-        staged = _CliStagedText(
-            basename,
-            (snapshot.st_dev, snapshot.st_ino),
-            hashlib.sha256(payload).hexdigest(),
-            mode,
-        )
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(descriptor, payload[offset:])
-        os.fchmod(descriptor, mode)
-        os.close(descriptor)
-        descriptor = -1
-        return staged
-    except Exception:
-        if staged is not None:
-            _cleanup_bound_cli_stage(binding, staged)
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _replace_bound_cli_stage(
-    binding: _CliTargetBinding,
-    staged: _CliStagedText,
-    *,
-    expected_before: _RestoreEvidenceSnapshot | None,
-) -> _RestoreEvidenceSnapshot:
-    _assert_bound_cli_parent(binding)
-    if _read_bound_cli_target(binding.parent_fd, binding.basename) != expected_before:
-        raise ValueError("refusing to replace a changed target")
-    current_stage = os.stat(
-        staged.basename,
-        dir_fd=binding.parent_fd,
-        follow_symlinks=False,
-    )
-    if (
-        not stat.S_ISREG(current_stage.st_mode)
-        or (current_stage.st_dev, current_stage.st_ino) != staged.identity
-    ):
-        raise ValueError("refusing to replace a changed staged file")
-    os.replace(
-        staged.basename,
-        binding.basename,
-        src_dir_fd=binding.parent_fd,
-        dst_dir_fd=binding.parent_fd,
-    )
-    staged.consumed = True
-    committed = _read_bound_cli_target(binding.parent_fd, binding.basename)
-    expected_committed = (*staged.identity, staged.digest)
-    if committed != expected_committed:
-        raise ValueError("could not verify committed target")
-    return expected_committed
-
-
-def _unlink_bound_cli_target(
-    binding: _CliTargetBinding,
-    expected_snapshot: _RestoreEvidenceSnapshot,
-) -> None:
-    _assert_bound_cli_parent(binding)
-    if _read_bound_cli_target(binding.parent_fd, binding.basename) != expected_snapshot:
-        raise ValueError("refusing to unlink a changed target")
-    os.unlink(binding.basename, dir_fd=binding.parent_fd)
-    if _read_bound_cli_target(binding.parent_fd, binding.basename) is not None:
-        raise ValueError("could not verify removed target")
-
-
-def _cleanup_bound_cli_stage(
-    binding: _CliTargetBinding,
-    staged: _CliStagedText,
-) -> None:
-    if staged.consumed or binding.parent_fd < 0:
-        return
-    try:
-        current = os.stat(
-            staged.basename,
-            dir_fd=binding.parent_fd,
-            follow_symlinks=False,
-        )
-        if (
-            stat.S_ISREG(current.st_mode)
-            and (current.st_dev, current.st_ino) == staged.identity
-        ):
-            os.unlink(staged.basename, dir_fd=binding.parent_fd)
-            staged.consumed = True
-    except OSError:
-        pass
-
-
-def _read_bound_cli_target(
-    parent_fd: int, basename: str
-) -> tuple[int, int, str] | None:
-    snapshot, _payload, _mode = _read_bound_cli_target_state(parent_fd, basename)
-    return snapshot
-
-
-def _read_bound_cli_target_state(
-    parent_fd: int, basename: str
-) -> tuple[_RestoreEvidenceSnapshot | None, bytes | None, int | None]:
-    try:
-        before = os.stat(
-            basename,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return None, None, None
-    if not stat.S_ISREG(before.st_mode):
-        raise ValueError("refusing to use a non-regular target")
-    identity = (before.st_dev, before.st_ino)
-    descriptor = -1
-    chunks: list[bytes] = []
-    try:
-        descriptor = os.open(
-            basename,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_fd,
-        )
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != identity
-        ):
-            raise ValueError("target changed while being verified")
-        while chunk := os.read(descriptor, 64 * 1024):
-            chunks.append(chunk)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    after = os.stat(
-        basename,
-        dir_fd=parent_fd,
-        follow_symlinks=False,
-    )
-    if (
-        not stat.S_ISREG(after.st_mode)
-        or (after.st_dev, after.st_ino) != identity
-    ):
-        raise ValueError("target changed while being verified")
-    payload = b"".join(chunks)
-    return (
-        (before.st_dev, before.st_ino, hashlib.sha256(payload).hexdigest()),
-        payload,
-        stat.S_IMODE(before.st_mode),
-    )
 
 if __name__ == "__main__":
     raise SystemExit(main())

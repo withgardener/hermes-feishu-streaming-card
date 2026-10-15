@@ -1,0 +1,148 @@
+{
+  "baseline_head": "48b82d905e41078f5d8eb8aa82ea96448d722a8b",
+  "baseline_render_sha256": "1f22417e753c9d9fcf7d384d03846371bd2b727d6226781c257ae3070c929049",
+  "redaction": [
+    {
+      "input": "",
+      "expected": ""
+    },
+    {
+      "input": "普通 English123",
+      "expected": "普通 English123"
+    },
+    {
+      "input": "0",
+      "expected": "0"
+    },
+    {
+      "input": "null",
+      "expected": "null"
+    },
+    {
+      "input": "\"--password synthetic-nested-string\"",
+      "expected": "\"--password synthetic-nested-string\""
+    },
+    {
+      "input": "{\"safe\": \"中文\", \"password\": \"synthetic-value\", \"list\": [{\"app_secret\": \"synthetic-key\"}, 3]}",
+      "expected": "{\"safe\": \"中文\", \"password\": \"[REDACTED]\", \"list\": [{\"app_secret\": \"[REDACTED]\"}, 3]}"
+    },
+    {
+      "input": "{'safe': ('中文', {'open_id': 'synthetic-open'}), 1: ['keep', {'token_count': 5}]}",
+      "expected": "{'safe': ('中文', {'open_id': '[REDACTED]'}), 1: ['keep', {'token_count': '[REDACTED]'}]}"
+    },
+    {
+      "input": "[{\"message_id\":\"synthetic-message\"}, [true, null, \"token=synthetic-string\"]]",
+      "expected": "[{\"message_id\": \"[REDACTED]\"}, [true, null, \"token=synthetic-string\"]]"
+    },
+    {
+      "input": "run --token synthetic-flag --password=synthetic-password --api-key synthetic-api",
+      "expected": "run --token [REDACTED] --password=[REDACTED] --api-key [REDACTED]"
+    },
+    {
+      "input": "GET https://example.test/path?token=synthetic-query&safe=ok&app_secret=synthetic-key",
+      "expected": "GET https://example.test/path?token=[REDACTED]&safe=ok&app_secret=[REDACTED]"
+    },
+    {
+      "input": "password=\"synthetic quoted value\" chat_id=synthetic-chat public=value",
+      "expected": "password=[REDACTED]]\" chat_id=[REDACTED] public=value"
+    },
+    {
+      "input": "{\"password\": \"synthetic-invalid-json\"",
+      "expected": "{\"password\": [REDACTED]]\""
+    },
+    {
+      "input": "deploy --SECRET synthetic-case --token=synthetic-token",
+      "expected": "deploy --SECRET [REDACTED] --token=[REDACTED]"
+    },
+    {
+      "input": "value password:synthetic-value; after",
+      "expected": "value password:[REDACTED]; after"
+    },
+    {
+      "input": "('safe', {'app_secret': 'synthetic-tuple-key'})",
+      "expected": "('safe', {'app_secret': '[REDACTED]'})"
+    }
+  ],
+  "header": [
+    {
+      "input": "```bash\njob --password synthetic-password\n```",
+      "expected": "job --password [REDACTED]"
+    },
+    {
+      "input": "curl https://example.test?token=synthetic-query&ok=1",
+      "expected": "curl https://example.test?token=[REDACTED]&ok=1"
+    },
+    {
+      "input": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --token synthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-valuesynthetic-long-value",
+      "expected": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --token [REDA…"
+    }
+  ],
+  "approval": [
+    {
+      "input": "export APP_SECRET=synthetic-value; run --password synthetic-password",
+      "expected": "export APP_SECRET=[REDACTED]]; run --password [REDACTED]"
+    },
+    {
+      "input": "curl https://user:synthetic-password@example.test?token=synthetic-query",
+      "expected": "curl https://user:[REDACTED]@example.test?token=[REDACTED]]"
+    },
+    {
+      "input": "Authorization: Bearer synthetic-bearer-value-123456",
+      "expected": "Authorization: Bearer [REDACTED]"
+    },
+    {
+      "input": "safe command --dry-run",
+      "expected": "safe command --dry-run"
+    }
+  ],
+  "process": [
+    {
+      "args": {
+        "command": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --password synthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-headsynthetic-cross-head trailing"
+      },
+      "result": {
+        "session_id": "proc_123456abcdef",
+        "output": "leading synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe  token=synthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tailsynthetic-cross-tail"
+      },
+      "expected": {
+        "id": "proc_123456abcdef",
+        "action": "spawn",
+        "command": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --password [REDACTE",
+        "output": "nthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe synthetic-safe  token=[REDACTED]",
+        "status": "running"
+      }
+    },
+    {
+      "args": {
+        "command": "safe command"
+      },
+      "result": {
+        "session_id": "proc_123456abcdef",
+        "output": "password=\"synthetic quoted value\"\nEND"
+      },
+      "expected": {
+        "id": "proc_123456abcdef",
+        "action": "spawn",
+        "command": "safe command",
+        "output": "password=[REDACTED]]\"\nEND",
+        "status": "running"
+      }
+    },
+    {
+      "args": {
+        "command": "{\"password\":\"synthetic-json-key\",\"safe\":\"keep\"}"
+      },
+      "result": {
+        "session_id": "proc_123456abcdef",
+        "output": "{'open_id': 'synthetic-open', 'safe': ('a', 'b')}"
+      },
+      "expected": {
+        "id": "proc_123456abcdef",
+        "action": "spawn",
+        "command": "{\"password\": \"[REDACTED]\", \"safe\": \"keep\"}",
+        "output": "{'open_id': '[REDACTED]', 'safe': ('a', 'b')}",
+        "status": "running"
+      }
+    }
+  ]
+}

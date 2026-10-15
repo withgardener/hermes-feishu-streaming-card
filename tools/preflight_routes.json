@@ -1,0 +1,610 @@
+{
+  "schema_version": 1,
+  "groups": {
+    "runtime": [
+      "tests/unit/test_hook_runtime.py",
+      "tests/integration/test_server.py"
+    ],
+    "render": [
+      "tests/unit/test_render.py",
+      "tests/unit/test_session.py",
+      "tests/unit/test_native_tables.py",
+      "tests/unit/test_text.py",
+      "tests/unit/test_card_limits.py",
+      "tests/unit/test_flush.py",
+      "tests/unit/test_status.py",
+      "tests/unit/test_process_activity.py",
+      "tests/unit/test_timeline_reading.py",
+      "tests/unit/test_content_plan.py",
+      "tests/unit/test_observations.py",
+      "tests/unit/test_display_redaction.py",
+      "tests/unit/test_existing_owner_projection.py",
+      "tests/unit/test_plugin_turn_metrics.py"
+    ],
+    "config": [
+      "tests/unit/test_config.py",
+      "tests/unit/test_package_metadata.py",
+      "tests/unit/test_minimal_reading_config.py",
+      "tests/unit/test_config_rules.py"
+    ],
+    "install": [
+      "tests/unit/test_patcher.py",
+      "tests/unit/test_gateway_contracts.py",
+      "tests/unit/test_stale_interrupted_turn.py",
+      "tests/unit/test_cron_contracts.py",
+      "tests/integration/test_cli_install.py",
+      "tests/unit/test_installer_family_boundaries.py"
+    ],
+    "process": [
+      "tests/unit/test_process.py",
+      "tests/integration/test_cli_process.py",
+      "tests/unit/test_runner.py",
+      "tests/unit/test_process_identity.py",
+      "tests/unit/test_persistent_service.py",
+      "tests/unit/test_persistent_service_platform.py",
+      "tests/unit/test_lifecycle.py",
+      "tests/unit/test_sidecar_runtime_selection.py",
+      "tests/unit/test_control_token_file.py",
+      "tests/unit/test_python_identity.py"
+    ],
+    "docs": [
+      "tests/unit/test_docs.py",
+      "tests/unit/test_package_metadata.py"
+    ],
+    "preflight": [
+      "tests/unit/test_preflight.py",
+      "tests/unit/test_installer_family_boundaries.py"
+    ],
+    "appearance": [
+      "tests/unit/test_presentation.py",
+      "tests/unit/test_card_preview.py",
+      "tests/unit/test_reading_presets.py",
+      "tests/unit/test_render.py",
+      "tests/unit/test_session_store.py",
+      "tests/unit/test_legacy_owner_checkpoint.py",
+      "tests/integration/test_reading_presets_http.py",
+      "tests/integration/test_combined_stability.py",
+      "tests/unit/test_message_navigation.py",
+      "tests/unit/test_display_redaction.py",
+      "tests/unit/test_config_rules.py",
+      "tests/unit/test_existing_owner_projection.py"
+    ],
+    "quota": [
+      "tests/unit/test_subscription_usage.py",
+      "tests/unit/test_render.py",
+      "tests/integration/test_server.py"
+    ],
+    "client": [
+      "tests/unit/test_feishu_client.py",
+      "tests/unit/test_cardkit.py",
+      "tests/integration/test_feishu_client_http.py",
+      "tests/unit/test_message_navigation.py",
+      "tests/integration/test_message_navigation_http.py",
+      "tests/unit/test_transport_error_contract.py"
+    ],
+    "events": [
+      "tests/unit/test_events.py",
+      "tests/unit/test_event_auth.py",
+      "tests/unit/test_async_turn_ownership.py",
+      "tests/integration/test_combined_stability.py",
+      "tests/unit/test_event_rules.py"
+    ],
+    "delivery": [
+      "tests/unit/test_delivery_policy.py",
+      "tests/unit/test_native_handoff.py",
+      "tests/unit/test_terminal_delivery_retry.py",
+      "tests/unit/test_topic_anchor_for_send.py",
+      "tests/integration/test_reopened_delivery_identity.py",
+      "tests/integration/test_legacy_owner_fallback.py",
+      "tests/unit/test_terminal_delivery.py",
+      "tests/unit/test_terminal_transport.py",
+      "tests/unit/test_native_admission.py",
+      "tests/unit/test_existing_owner_projection.py"
+    ],
+    "interaction": [
+      "tests/unit/test_card_action_admission.py",
+      "tests/unit/test_runtime_interaction_transport.py",
+      "tests/unit/test_cold_start_card_callbacks.py",
+      "tests/unit/test_interaction_confirmation_grace.py",
+      "tests/integration/test_interaction_confirmation_transport.py",
+      "tests/integration/test_interaction_continuation.py",
+      "tests/integration/test_card_freeze.py",
+      "tests/unit/test_paused_approval_delivery.py",
+      "tests/unit/test_interaction_rules.py",
+      "tests/unit/test_owner_display_policy.py",
+      "tests/unit/test_interaction_preflight.py",
+      "tests/unit/test_interaction_resolver.py",
+      "tests/unit/test_interaction_receipts.py",
+      "tests/unit/test_message_navigation.py",
+      "tests/unit/test_existing_owner_projection.py"
+    ],
+    "notices": [
+      "tests/unit/test_notice_lifecycle.py",
+      "tests/unit/test_notice_producers.py",
+      "tests/unit/test_notice_store.py",
+      "tests/unit/test_notice_routing_regressions.py",
+      "tests/integration/test_server_notice_lifecycle.py"
+    ],
+    "ownership": [
+      "tests/unit/test_runtime_ownership.py",
+      "tests/unit/test_runtime_control.py",
+      "tests/unit/test_split_hermes_home.py",
+      "tests/integration/test_runtime_control_server.py",
+      "tests/integration/test_sidecar_runtime_replacement.py"
+    ],
+    "operations": [
+      "tests/unit/test_operations.py",
+      "tests/unit/test_operations_transport.py",
+      "tests/unit/test_maintenance_update.py",
+      "tests/unit/test_maintenance_store.py",
+      "tests/unit/test_maintenance_card.py",
+      "tests/unit/test_maintenance_process.py",
+      "tests/integration/test_maintenance_runner.py",
+      "tests/unit/test_maintenance_evidence.py"
+    ],
+    "plugin": [
+      "tests/unit/test_hermes_plugin.py",
+      "tests/unit/test_hermes_plugin_runtime.py",
+      "tests/unit/test_plugin_profile_routing.py",
+      "tests/unit/test_approval_tool_status.py",
+      "tests/unit/test_hybrid_gateway_ownership.py",
+      "tests/unit/test_install_plugin.py",
+      "tests/unit/test_native_hook_capabilities.py",
+      "tests/unit/test_native_probe_diagnostics.py",
+      "tests/unit/test_clarify_delivery_admission.py",
+      "tests/unit/test_plugin_turn_metrics.py",
+      "tests/unit/test_clarify_timeout_status.py",
+      "tests/unit/test_clarify_timeout_admission.py"
+    ],
+    "storage": [
+      "tests/unit/test_session_store.py",
+      "tests/unit/test_legacy_owner_checkpoint.py",
+      "tests/unit/test_approval_card_reissue_and_audit.py",
+      "tests/unit/test_paused_approval_card_reuse.py",
+      "tests/integration/test_interaction_display_recovery.py"
+    ],
+    "diagnostics": [
+      "tests/unit/test_diagnostics.py",
+      "tests/unit/test_integrity.py",
+      "tests/unit/test_integrity_coordinator.py",
+      "tests/integration/test_cli_integrity.py",
+      "tests/unit/test_support_report.py",
+      "tests/integration/test_cli_support_report.py",
+      "tests/unit/test_observations.py",
+      "tests/integration/test_health_observations.py"
+    ],
+    "cli": [
+      "tests/integration/test_cli.py",
+      "tests/integration/test_cli_install.py",
+      "tests/integration/test_cli_process.py"
+    ],
+    "routing": [
+      "tests/unit/test_bots.py",
+      "tests/unit/test_profile_sources.py",
+      "tests/unit/test_multiplex_adapters.py",
+      "tests/integration/test_multiplex_zero_events.py",
+      "tests/unit/test_config_rules.py"
+    ],
+    "sdk": [
+      "tests/unit/test_cold_start_card_callbacks.py",
+      "tests/unit/test_slash_confirm_callback_repair.py",
+      "tests/integration/test_feishu_sdk_compat.py"
+    ],
+    "commands": [
+      "tests/unit/test_native_commands.py",
+      "tests/unit/test_hook_runtime.py",
+      "tests/integration/test_feishu_sdk_compat.py"
+    ],
+    "upstream": [
+      "tests/integration/test_upstream_hermes_compat.py"
+    ],
+    "install_transactions": [
+      "tests/integration/test_cli_install.py",
+      "tests/unit/test_decomposed_patcher.py",
+      "tests/unit/test_install_v3_transaction.py",
+      "tests/unit/test_hybrid_gateway_ownership.py",
+      "tests/unit/test_bound_recovery_io.py",
+      "tests/unit/test_recovery.py",
+      "tests/unit/test_clarify_delivery_admission.py"
+    ],
+    "loaded_config": [
+      "tests/unit/test_config_snapshot.py",
+      "tests/integration/test_running_card_config.py"
+    ]
+  },
+  "sources": {
+    "hermes_feishu_card/__init__.py": [
+      "config"
+    ],
+    "hermes_feishu_card/approval_receipts.py": [
+      "storage",
+      "appearance"
+    ],
+    "hermes_feishu_card/bots.py": [
+      "routing"
+    ],
+    "hermes_feishu_card/card_limits.py": [
+      "render"
+    ],
+    "hermes_feishu_card/card_timeline.py": [
+      "render"
+    ],
+    "hermes_feishu_card/cardkit.py": [
+      "client"
+    ],
+    "hermes_feishu_card/cli.py": [
+      "cli"
+    ],
+    "hermes_feishu_card/config_rules.py": [
+      "config",
+      "appearance",
+      "routing"
+    ],
+    "hermes_feishu_card/config.py": [
+      "config"
+    ],
+    "hermes_feishu_card/delivery_policy.py": [
+      "delivery"
+    ],
+    "hermes_feishu_card/diagnostics.py": [
+      "diagnostics"
+    ],
+    "hermes_feishu_card/display_segments.py": [
+      "storage",
+      "appearance"
+    ],
+    "hermes_feishu_card/event_auth.py": [
+      "events"
+    ],
+    "hermes_feishu_card/events.py": [
+      "events"
+    ],
+    "hermes_feishu_card/feishu_client.py": [
+      "client"
+    ],
+    "hermes_feishu_card/feishu_ws_compat.py": [
+      "sdk"
+    ],
+    "hermes_feishu_card/flush.py": [
+      "render"
+    ],
+    "hermes_feishu_card/hermes_plugin.py": [
+      "plugin"
+    ],
+    "hermes_feishu_card/turn_metrics.py": [
+      "plugin",
+      "render"
+    ],
+    "hermes_feishu_card/turn_events.py": [
+      "plugin",
+      "ownership"
+    ],
+    "hermes_feishu_card/hermes_plugin_runtime.py": [
+      "plugin"
+    ],
+    "hermes_feishu_card/hook_runtime.py": [
+      "runtime"
+    ],
+    "hermes_feishu_card/install/__init__.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/decomposed.py": [
+      "install_transactions",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/detect.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/envfile.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/hybrid_renderers.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/integrity.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/manifest.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/native_hooks.py": [
+      "install",
+      "plugin"
+    ],
+    "hermes_feishu_card/install/patch_descriptors.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/patcher.py": [
+      "install",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/plugin.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/provider_route.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/recovery.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/runtime_python.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/stop_cancellation.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/v3.py": [
+      "install"
+    ],
+    "hermes_feishu_card/instance_binding.py": [
+      "ownership"
+    ],
+    "hermes_feishu_card/integration.py": [
+      "diagnostics"
+    ],
+    "hermes_feishu_card/integrity.py": [
+      "diagnostics"
+    ],
+    "hermes_feishu_card/legacy_owner.py": [
+      "storage",
+      "appearance"
+    ],
+    "hermes_feishu_card/lifecycle.py": [
+      "process",
+      "runtime",
+      "render"
+    ],
+    "hermes_feishu_card/maintenance_card.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/maintenance_process.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/maintenance_runner.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/maintenance_store.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/maintenance_evidence.py": [
+      "operations",
+      "ownership"
+    ],
+    "hermes_feishu_card/maintenance_update.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/metrics.py": [
+      "runtime"
+    ],
+    "hermes_feishu_card/native_commands.py": [
+      "commands"
+    ],
+    "hermes_feishu_card/native_handoff.py": [
+      "delivery"
+    ],
+    "hermes_feishu_card/native_tables.py": [
+      "render"
+    ],
+    "hermes_feishu_card/notice_lifecycle.py": [
+      "notices"
+    ],
+    "hermes_feishu_card/notice_producers.py": [
+      "notices"
+    ],
+    "hermes_feishu_card/operations.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/operations_transport.py": [
+      "operations"
+    ],
+    "hermes_feishu_card/persistent_service.py": [
+      "process"
+    ],
+    "hermes_feishu_card/presentation.py": [
+      "appearance"
+    ],
+    "hermes_feishu_card/preview.py": [
+      "appearance"
+    ],
+    "hermes_feishu_card/preview_template.html": [
+      "appearance"
+    ],
+    "hermes_feishu_card/process.py": [
+      "process"
+    ],
+    "hermes_feishu_card/display_redaction.py": [
+      "render",
+      "appearance"
+    ],
+    "hermes_feishu_card/process_activity.py": [
+      "render"
+    ],
+    "hermes_feishu_card/process_identity.py": [
+      "process"
+    ],
+    "hermes_feishu_card/profile_sources.py": [
+      "routing"
+    ],
+    "hermes_feishu_card/reading.py": [
+      "appearance"
+    ],
+    "hermes_feishu_card/render.py": [
+      "render"
+    ],
+    "hermes_feishu_card/render_options.py": [
+      "appearance",
+      "runtime"
+    ],
+    "hermes_feishu_card/runner.py": [
+      "process"
+    ],
+    "hermes_feishu_card/runtime_control.py": [
+      "ownership"
+    ],
+    "hermes_feishu_card/runtime_interaction_transport.py": [
+      "interaction"
+    ],
+    "hermes_feishu_card/runtime_ownership.py": [
+      "ownership",
+      "process",
+      "operations"
+    ],
+    "hermes_feishu_card/server.py": [
+      "runtime"
+    ],
+    "hermes_feishu_card/session.py": [
+      "render",
+      "appearance"
+    ],
+    "hermes_feishu_card/session_store.py": [
+      "render",
+      "appearance"
+    ],
+    "hermes_feishu_card/status.py": [
+      "render"
+    ],
+    "hermes_feishu_card/subscription_usage.py": [
+      "quota"
+    ],
+    "hermes_feishu_card/text.py": [
+      "render"
+    ],
+    "hermes_feishu_card/cli_reports.py": [
+      "cli"
+    ],
+    "hermes_feishu_card/delivery.py": [
+      "delivery",
+      "runtime"
+    ],
+    "hermes_feishu_card/terminal_delivery.py": [
+      "delivery",
+      "runtime"
+    ],
+    "hermes_feishu_card/card_view.py": [
+      "appearance",
+      "render"
+    ],
+    "hermes_feishu_card/native_admission.py": [
+      "runtime",
+      "delivery"
+    ],
+    "hermes_feishu_card/event_rules.py": [
+      "events",
+      "runtime",
+      "routing"
+    ],
+    "hermes_feishu_card/interaction_input.py": [
+      "interaction",
+      "runtime",
+      "sdk"
+    ],
+    "hermes_feishu_card/command_cards.py": [
+      "commands"
+    ],
+    "hermes_feishu_card/support_report.py": [
+      "diagnostics",
+      "cli"
+    ],
+    "hermes_feishu_card/config_snapshot.py": [
+      "appearance",
+      "config",
+      "process",
+      "runtime",
+      "loaded_config"
+    ],
+    "hermes_feishu_card/content_plan.py": [
+      "render",
+      "appearance",
+      "delivery"
+    ],
+    "hermes_feishu_card/install/ast_contracts.py": [
+      "install"
+    ],
+    "hermes_feishu_card/install/cron_contracts.py": [
+      "install",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/gateway_contracts.py": [
+      "install",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/base_contracts.py": [
+      "install",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/file_transaction.py": [
+      "install_transactions"
+    ],
+    "hermes_feishu_card/observations.py": [
+      "render",
+      "runtime",
+      "storage",
+      "diagnostics"
+    ],
+    "hermes_feishu_card/interaction_receipts.py": [
+      "interaction",
+      "storage",
+      "render"
+    ],
+    "hermes_feishu_card/interaction_resolver.py": [
+      "interaction",
+      "runtime"
+    ],
+    "hermes_feishu_card/message_navigation.py": [
+      "client",
+      "interaction",
+      "appearance"
+    ],
+    "hermes_feishu_card/owner_display_policy.py": [
+      "interaction",
+      "appearance"
+    ],
+    "hermes_feishu_card/interaction_rules.py": [
+      "interaction",
+      "runtime"
+    ],
+    "hermes_feishu_card/install/posix_transaction.py": [
+      "install_transactions",
+      "install",
+      "diagnostics"
+    ],
+    "tests/unit/test_message_navigation.py": [
+      "client",
+      "interaction",
+      "appearance"
+    ],
+    "tests/integration/test_message_navigation_http.py": [
+      "client"
+    ],
+    "hermes_feishu_card/install/source_layout.py": [
+      "install_transactions",
+      "diagnostics",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/errors.py": [
+      "install_transactions",
+      "diagnostics",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/git_evidence.py": [
+      "install_transactions",
+      "diagnostics",
+      "upstream"
+    ],
+    "hermes_feishu_card/install/decomposed_ownership.py": [
+      "install_transactions",
+      "diagnostics",
+      "upstream"
+    ],
+    "hermes_feishu_card/existing_owner_projection.py": [
+      "appearance",
+      "delivery",
+      "storage",
+      "interaction"
+    ],
+    "hermes_feishu_card/canonical_turn.py": [
+      "runtime",
+      "plugin"
+    ]
+  }
+}

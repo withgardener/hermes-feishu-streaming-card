@@ -20,7 +20,7 @@ MAX_RECORDS = 128
 RETENTION_SECONDS = 24 * 3600
 _EXCLUDED = {'tools', 'timeline', 'thinking_normalizer', 'answer_normalizer',
              'active_interaction', 'approval_retirements', 'terminal_handoff_record', 'route_profile_id', '_process_activity',
-             'presentation_state'}
+             'presentation_state', 'observation'}
 _FIELDS = {f.name for f in fields(CardSession)} - _EXCLUDED
 
 

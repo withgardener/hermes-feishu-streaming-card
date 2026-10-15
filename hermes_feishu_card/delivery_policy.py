@@ -5,47 +5,17 @@ from pathlib import Path
 import threading
 from typing import Any, Mapping
 
+from .config_rules import normalize_native_chats as normalize_native_chats
+
 
 CARD_DISPOSITION = "card"
 NATIVE_DISPOSITION = "native"
-_MAX_CHAT_ID_CHARS = 512
-_WILDCARD_MARKERS = ("*", "?", "[", "]")
 
 
 @dataclass(frozen=True)
 class ChatDeliveryDecision:
     disposition: str
     reason: str
-
-
-def normalize_native_chats(
-    value: object,
-    *,
-    path: str = "bindings.native_chats",
-) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"{path} must be an array of exact chat ids")
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for index, raw_chat_id in enumerate(value):
-        item_path = f"{path}[{index}]"
-        if not isinstance(raw_chat_id, str):
-            raise ValueError(f"{item_path} must be a non-empty exact chat id")
-        chat_id = raw_chat_id.strip()
-        if (
-            not chat_id
-            or len(chat_id) > _MAX_CHAT_ID_CHARS
-            or any(ord(character) < 32 or ord(character) == 127 for character in chat_id)
-            or any(marker in chat_id for marker in _WILDCARD_MARKERS)
-            or chat_id.lower().startswith("re:")
-        ):
-            raise ValueError(f"{item_path} must be a non-empty exact chat id")
-        if chat_id not in seen:
-            seen.add(chat_id)
-            normalized.append(chat_id)
-    return normalized
 
 
 class ChatDeliveryPolicy:

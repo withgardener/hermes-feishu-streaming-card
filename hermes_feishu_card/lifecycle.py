@@ -5,6 +5,31 @@ import hashlib
 from typing import Any
 
 from .session import CardSession
+from .metrics import SidecarMetrics
+
+
+@dataclass(frozen=True, repr=False)
+class CleanupState:
+    """Borrow only cleanup-owned views of the coordinator's live registries.
+
+    No registry is copied or independently persisted. The synchronous cleanup
+    pass retains identity fences and never owns HTTP or application keys.
+    """
+
+    sessions: dict[str, CardSession]
+    aliases: dict[str, str]
+    message_locks: dict[str, Any]
+    lock_users: dict[str, int]
+    controllers: dict[str, Any]
+    message_ids: dict[str, str]
+    bot_ids: dict[str, str]
+    card_configs: dict[str, Any]
+    summary_owners: dict[str, str]
+    summaries: dict[str, Any]
+    interaction_owners: dict[str, str]
+    interaction_results: dict[str, Any]
+    metrics: SidecarMetrics
+    diagnostics: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -59,15 +84,13 @@ def session_cleanup_reason(
     return "zombie_grace_expired"
 
 
-def cleanup_runtime_state(app: Any, now: float) -> CleanupResult:
-    from . import server
-
+def cleanup_runtime_state(state: CleanupState, now: float) -> CleanupResult:
     policy = CleanupPolicy()
-    sessions = app[server.SESSIONS_KEY]
-    aliases = app[server.SESSION_ALIASES_KEY]
-    message_locks = app[server.MESSAGE_LOCKS_KEY]
-    lock_users = app[server.MESSAGE_LOCK_USERS_KEY]
-    controllers = app[server.FLUSH_CONTROLLERS_KEY]
+    sessions = state.sessions
+    aliases = state.aliases
+    message_locks = state.message_locks
+    lock_users = state.lock_users
+    controllers = state.controllers
     collected_keys: list[str] = []
     reasons: list[str] = []
     controllers_collected = 0
@@ -88,7 +111,7 @@ def cleanup_runtime_state(app: Any, now: float) -> CleanupResult:
         reason = session_cleanup_reason(
             session,
             now=now,
-            has_card=session_key in app[server.FEISHU_MESSAGE_IDS_KEY],
+            has_card=session_key in state.message_ids,
             has_inflight_send=has_inflight_send,
             controller_closed=controller is None or controller_closed,
             policy=policy,
@@ -105,40 +128,40 @@ def cleanup_runtime_state(app: Any, now: float) -> CleanupResult:
         for key in related_keys:
             message_locks.pop(key, None)
             lock_users.pop(key, None)
-        summary_owners = app[server.CARD_SUMMARY_SESSION_KEYS_KEY]
+        summary_owners = state.summary_owners
         for feishu_message_id, owner_key in tuple(summary_owners.items()):
             if owner_key == session_key:
-                app[server.CARD_SUMMARIES_KEY].pop(feishu_message_id, None)
+                state.summaries.pop(feishu_message_id, None)
                 summary_owners.pop(feishu_message_id, None)
-        interaction_owners = app[server.INTERACTION_RESULT_SESSION_KEYS_KEY]
+        interaction_owners = state.interaction_owners
         for interaction_id, owner_key in tuple(interaction_owners.items()):
             if owner_key == session_key:
-                app[server.INTERACTION_RESULTS_KEY].pop(interaction_id, None)
+                state.interaction_results.pop(interaction_id, None)
                 interaction_owners.pop(interaction_id, None)
-        app[server.FEISHU_MESSAGE_IDS_KEY].pop(session_key, None)
-        app[server.MESSAGE_BOT_IDS_KEY].pop(session_key, None)
-        app[server.SESSION_CARD_CONFIGS_KEY].pop(session_key, None)
+        state.message_ids.pop(session_key, None)
+        state.bot_ids.pop(session_key, None)
+        state.card_configs.pop(session_key, None)
         if controllers.get(session_key) is controller and controller is not None:
             # Pending send/update and last-flush state are owned by the controller.
             controller.close()
             controllers.pop(session_key, None)
             controllers_collected += 1
-            app[server.METRICS_KEY].flush_controllers_collected += 1
+            state.metrics.flush_controllers_collected += 1
 
         collected_keys.append(session_key)
         reasons.append(reason)
-        metrics = app[server.METRICS_KEY]
+        metrics = state.metrics
         metrics.sessions_collected += 1
         if reason == "zombie_grace_expired":
             metrics.zombie_sessions_collected += 1
-        _record_cleanup(app, session_key, reason, now, policy)
+        _record_cleanup(state, session_key, reason, now, policy)
 
     for session_key, controller in tuple(controllers.items()):
-        if cleanup_closed_controller(app, session_key, controller, now=now):
+        if cleanup_closed_controller(state, session_key, controller, now=now):
             controllers_collected += 1
 
     for lock_key, lock in tuple(message_locks.items()):
-        cleanup_orphan_message_lock(app, lock_key, lock)
+        cleanup_orphan_message_lock(state, lock_key, lock)
 
     return CleanupResult(
         session_keys=tuple(collected_keys),
@@ -147,21 +170,19 @@ def cleanup_runtime_state(app: Any, now: float) -> CleanupResult:
     )
 
 
-def cleanup_orphan_message_lock(app: Any, lock_key: str, lock: Any) -> bool:
-    from . import server
-
-    message_locks = app[server.MESSAGE_LOCKS_KEY]
+def cleanup_orphan_message_lock(state: CleanupState, lock_key: str, lock: Any) -> bool:
+    message_locks = state.message_locks
     if message_locks.get(lock_key) is not lock:
         return False
-    if _lock_is_locked(lock) or app[server.MESSAGE_LOCK_USERS_KEY].get(lock_key, 0) > 0:
+    if _lock_is_locked(lock) or state.lock_users.get(lock_key, 0) > 0:
         return False
 
-    canonical_key = app[server.SESSION_ALIASES_KEY].get(lock_key, lock_key)
-    sessions = app[server.SESSIONS_KEY]
+    canonical_key = state.aliases.get(lock_key, lock_key)
+    sessions = state.sessions
     if lock_key in sessions or canonical_key in sessions:
         return False
     for controller_key in {lock_key, canonical_key}:
-        controller = app[server.FLUSH_CONTROLLERS_KEY].get(controller_key)
+        controller = state.controllers.get(controller_key)
         if controller is not None and _controller_state(controller)[1]:
             return False
 
@@ -172,24 +193,22 @@ def cleanup_orphan_message_lock(app: Any, lock_key: str, lock: Any) -> bool:
 
 
 def cleanup_closed_controller(
-    app: Any,
+    state: CleanupState,
     session_key: str,
     controller: Any,
     *,
     now: float,
 ) -> bool:
-    from . import server
-
-    controllers = app[server.FLUSH_CONTROLLERS_KEY]
+    controllers = state.controllers
     if controllers.get(session_key) is not controller:
         return False
     closed, active = _controller_state(controller)
     if not closed or active:
         return False
     controllers.pop(session_key, None)
-    app[server.METRICS_KEY].flush_controllers_collected += 1
+    state.metrics.flush_controllers_collected += 1
     _record_cleanup(
-        app,
+        state,
         session_key,
         "closed_flush_controller",
         now,
@@ -210,15 +229,13 @@ def _lock_is_locked(lock: Any) -> bool:
 
 
 def _record_cleanup(
-    app: Any,
+    state: CleanupState,
     session_key: str,
     reason: str,
     now: float,
     policy: CleanupPolicy,
 ) -> None:
-    from . import server
-
-    history = app[server.DIAGNOSTICS_KEY].setdefault("cleanup_history", [])
+    history = state.diagnostics.setdefault("cleanup_history", [])
     history.append(
         {
             "session_key_hash": hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:12],

@@ -9,7 +9,7 @@ load the new protocol. See the [runtime configuration guide](docs/user-guide.en.
 
 [中文](README.md) | [English](README.en.md)
 
-**Release version: v4.7.7.** The default `latest` installer selects the published stable release. Supports explicitly bound split source/HOME layouts and preserves instance ownership; see [release notes](docs/release-notes-v4.7.7.en.md).
+**Release version: v5.0.0.** The default `latest` installer selects the published stable release. Supports explicitly bound split source/HOME layouts and preserves instance ownership; see [release notes](docs/release-notes-v5.0.0.en.md).
 
 This package contains lightweight installers for `hermes-feishu-streaming-card`.
 They install the Python package, configure Feishu credentials, install the Hermes
@@ -358,7 +358,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.7.7
+export HFC_VERSION=v5.0.0
 bash install-docker.sh
 ```
 

@@ -13,3 +13,6 @@ build/
 .superpowers/
 .worktrees/
 .codegraph/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/

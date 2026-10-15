@@ -289,6 +289,16 @@ def execute_fixed_tag_hybrid_install(
 
     try:
         ownership = plugin_install.enable_plugin(binding, preimage)
+    except plugin_install.PluginConfigRefused as exc:
+        # These fixed reasons distinguish a config ownership refusal from an
+        # official command failure. Never expose arbitrary exception content.
+        reason = str(exc)
+        if reason not in {
+            "Hermes config changed after preimage",
+            "official plugin enable changed unrelated config",
+        }:
+            reason = "official plugin enable failed"
+        raise FixedTagInstallRefused(reason) from exc
     except Exception as exc:
         raise FixedTagInstallRefused("official plugin enable failed") from exc
     plugin_enabled_manifest = _render_phase_manifest(
@@ -447,17 +457,20 @@ def inspect_fixed_tag_hybrid_install(
         installed[target] = current.contents
         backups[target] = backup.contents
     patch_groups = frozenset(integration["patch_groups"])
-    expected_matrix = HYBRID_PATCH_REGISTRY.target_fragments(patch_groups)
+    registry = _installed_patch_registry(installed, backups, patch_groups)
+    expected_matrix = registry.target_fragments(patch_groups)
     try:
         detected = detect_patch_groups_by_target(
             installed,
             expected_groups=patch_groups,
             expected_fragment_matrix=expected_matrix,
+            registry=registry,
         )
         restored = remove_patch_snapshots(
             installed,
             expected_groups=patch_groups,
             expected_fragment_matrix=expected_matrix,
+            registry=registry,
         )
     except Exception as exc:
         raise FixedTagInstallRefused("installed Hybrid patch is invalid") from exc
@@ -467,11 +480,54 @@ def inspect_fixed_tag_hybrid_install(
     }
     if detected != expected_targets or restored != backups:
         raise FixedTagInstallRefused("installed Hybrid patch ownership is inconsistent")
+    if registry is not HYBRID_PATCH_REGISTRY:
+        raise FixedTagInstallRefused(
+            "verified historical Hybrid revision requires official restore --yes "
+            "with the same --hermes-dir and --hermes-home, then install"
+        )
     return FixedTagInstallResult(
         status="installed",
         manifest_path=manifest_path,
         gateway_restart_required=False,
     )
+
+
+def _installed_patch_registry(installed, backups, patch_groups):
+    """Select only an exact known rendering after callers verify manifest hashes."""
+    from .hybrid_renderers import (
+        historical_clarify_registry, historical_publish_registry, historical_terminal_registry,
+        historical_clarify_wait_registry,
+    )
+
+    provenance = load_fixed_tag_native_hook_provenance(FIXED_TAG_PROVENANCE_PATH)
+    canonical = {
+        source.relative_path: source.sha256.removeprefix("sha256:")
+        for source in provenance.sources
+        if source.relative_path in HYBRID_PATCH_TARGET_ORDER
+    }
+    # Only complete revisions that have actually shipped as candidates are
+    # eligible. Never synthesize arbitrary mixtures of historical fragments.
+    pre_metrics = historical_clarify_registry(
+        historical_publish_registry(HYBRID_PATCH_REGISTRY)
+    )
+    for registry in (
+        HYBRID_PATCH_REGISTRY,
+        historical_clarify_wait_registry(HYBRID_PATCH_REGISTRY),
+        pre_metrics,
+        historical_terminal_registry(pre_metrics),
+    ):
+        matrix = registry.target_fragments(patch_groups)
+        try:
+            rendered = render_patch_snapshots_from_verified_originals(
+                backups, verified_original_sha256=canonical,
+                integration_mode="hybrid", required_patch_groups=patch_groups,
+                expected_fragment_matrix=matrix, registry=registry,
+            )
+        except (TypeError, ValueError):
+            continue
+        if rendered == installed:
+            return registry
+    raise FixedTagInstallRefused("installed Hybrid patch is not an exact known revision")
 
 
 def restore_fixed_tag_hybrid_install(
@@ -529,17 +585,20 @@ def restore_fixed_tag_hybrid_install(
         backups[target] = backup_snapshot.contents
     if phase == "installed":
         patch_groups = frozenset(integration["patch_groups"])
-        expected_matrix = HYBRID_PATCH_REGISTRY.target_fragments(patch_groups)
+        registry = _installed_patch_registry(installed, backups, patch_groups)
+        expected_matrix = registry.target_fragments(patch_groups)
         try:
             detected = detect_patch_groups_by_target(
                 installed,
                 expected_groups=patch_groups,
                 expected_fragment_matrix=expected_matrix,
+                registry=registry,
             )
             restored = remove_patch_snapshots(
                 installed,
                 expected_groups=patch_groups,
                 expected_fragment_matrix=expected_matrix,
+                registry=registry,
             )
         except Exception as exc:
             raise FixedTagInstallRefused("installed Hybrid patch is invalid") from exc

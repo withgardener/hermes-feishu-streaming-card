@@ -24,6 +24,32 @@ def test_focused_preset_does_not_inherit_injected_classic_defaults(tmp_path):
     assert config["card"]["hide_completed_tool_activity"] is False
 
 
+@pytest.mark.parametrize("preset,expanded,hide_success", [
+    ("task", True, True), ("focused", False, True),
+    ("detailed", True, False), ("classic", False, False),
+])
+def test_approved_task_direction_does_not_change_other_preset_defaults(tmp_path, preset, expanded, hide_success):
+    _, config = load_yaml(tmp_path, {"card": {"reading_preset": preset}})
+    assert config["card"]["timeline_expanded"] is expanded
+    assert config["card"]["_hide_successful_tool_activity"] is hide_success
+
+
+@pytest.mark.parametrize("hidden", [True, False])
+@pytest.mark.parametrize("scope", ["global", "profile", "bot"])
+def test_task_explicit_closed_process_and_legacy_hide_survive_all_scopes(tmp_path, scope, hidden):
+    card = {"reading_preset": "task", "timeline_expanded": False, "hide_completed_tool_activity": hidden}
+    data = {"card": card} if scope == "global" else {"card": {"reading_preset": "task"}}
+    if scope == "profile":
+        data["profiles"] = {"work": {"card": card}}
+    elif scope == "bot":
+        data["bots"] = {"items": {"default": {"card": card}}}
+    _, config = load_yaml(tmp_path, data)
+    effective = resolve_card_config(config["card"], config.get("profiles", {}).get("work", {}).get("card", {}), config.get("bots", {}).get("items", {}).get("default", {}).get("card", {}))
+    assert effective["timeline_expanded"] is False
+    assert effective["hide_completed_tool_activity"] is hidden
+    assert effective["_hide_successful_tool_activity"] is False
+
+
 def test_reading_preset_scope_precedence_and_explicit_legacy_overrides(tmp_path):
     _, config = load_yaml(tmp_path, {
         "card": {"reading_preset": "focused", "show_reasoning": False},

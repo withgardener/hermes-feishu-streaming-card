@@ -515,6 +515,14 @@ def _report_dict(report: DiagnosticReport) -> dict[str, object]:
     }
 
 
+def redacted_diagnostic_snapshot(data: dict[str, object]) -> dict[str, object]:
+    """Apply the existing allowlist to both modern and legacy doctor reports."""
+    normalized = dict(data)
+    if "findings" not in normalized:
+        normalized["findings"] = normalized.get("recommendations", [])
+    return _card_safe_report(normalized)
+
+
 def _card_safe_report(data: dict[str, object]) -> dict[str, object]:
     findings = _card_safe_findings(data.get("findings"))
     result: dict[str, object] = {
@@ -930,6 +938,9 @@ def _build_runtime(
         metrics = _mapping(health.get("metrics"))
         if metrics:
             runtime["metrics"] = dict(metrics)
+        timing = _mapping(health.get("timing"))
+        if timing:
+            runtime["timing"] = dict(timing)
         readiness = _runtime_readiness(health.get("readiness"))
         if readiness:
             runtime["readiness"] = readiness
@@ -1449,6 +1460,16 @@ def _card_safe_runtime(value: object) -> dict[str, object]:
         _copy_nonnegative_int(safe_metrics, metrics, key)
     if safe_metrics:
         result["metrics"] = safe_metrics
+    timing = _mapping(data.get("timing"))
+    if timing.get("scope") == "sidecar_accepted_events" and timing.get("window") == "retained_session_memory":
+        safe_timing: dict[str, object] = {
+            "scope": "sidecar_accepted_events", "window": "retained_session_memory",
+            "clock": "monotonic", "token_rate_status": "unavailable",
+            "token_rate_reason": "model_invocation_scope_missing",
+        }
+        for key in ("started_samples", "first_answer_samples", "first_answer_total_ms", "completed_samples", "observed_turn_total_ms"):
+            _copy_nonnegative_int(safe_timing, timing, key)
+        result["timing"] = safe_timing
     return result
 
 

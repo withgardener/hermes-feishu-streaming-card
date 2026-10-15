@@ -1049,3 +1049,83 @@ def test_home_binding_refusal_runs_no_gateway_or_source_commands(maintenance_fix
         fixture.config.write_text('service:\n  shared_source: true\n')
     result=run_job(fixture.job.path,run=lambda *a,**k:pytest.fail('refused binding must not invoke any command'))
     assert result.phase=='failed' and result.result['error_code']==expected
+
+
+@pytest.mark.parametrize("observation", ["active", "stale", "unknown", "conflict", "idle"])
+def test_real_supervisor_drain_evidence_controls_gateway_stop(maintenance_fixture, observation):
+    from hermes_feishu_card.runtime_control import (
+        RUNTIME_HOOK_GENERATION,
+        RuntimeControlEvent,
+        RuntimeIntegritySupervisor,
+    )
+
+    commands = CommandHarness(maintenance_fixture)
+    clock = [0.0]
+    supervisor = RuntimeIntegritySupervisor(
+        mode="safe", expected_package_version="4.2.0",
+        expected_target_identity="a" * 64, now=lambda: clock[0],
+    )
+    sequence = [0]
+    observed = []
+
+    def record(role, runtime, seq, *, active=0, complete=True):
+        assert supervisor.record(RuntimeControlEvent.from_dict({
+            "schema_version": "3", "event": "runtime.hello" if seq == 1 else "runtime.heartbeat",
+            "runtime_id": runtime, "sequence": seq, "created_at": clock[0],
+            "hook_generation": RUNTIME_HOOK_GENERATION, "package_version": "4.2.0",
+            "active_sessions": active, "active_work_count_complete": complete,
+            "admission_draining": commands.external_drain_active,
+            "drain_home_verified": role == "gateway", "runtime_role": role,
+            "target_identity": "a" * 64 if role == "gateway" else "",
+        }))
+
+    record("gateway", "gateway-runtime-0001", 1)
+    record("observer", "observer-runtime-0001", 1,
+           active=int(observation == "active"), complete=observation != "unknown")
+    if observation == "stale":
+        clock[0] = 46.0
+    if observation == "conflict":
+        record("gateway", "gateway-runtime-0002", 1)
+    harness = HealthHarness(commands.runtime_python, commands)
+
+    def fetch():
+        sequence[0] += 1
+        record("gateway", "gateway-runtime-0001", sequence[0] + 1)
+        if observation == "idle":
+            record("observer", "observer-runtime-0001", sequence[0] + 1)
+        sample = harness()
+        readiness = supervisor.snapshot()
+        sample["readiness"] = readiness
+        sample["gateway_active_sessions"] = readiness["active_sessions"]
+        observed.append(readiness)
+        return sample
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    # Start at the persisted draining phase so busy work reaches the actual
+    # drain poller rather than being rejected by the earlier update inspection.
+    transition_job(maintenance_fixture.job.path, phase="draining",
+                   expected_phase="locking")
+    result = run_job(
+        maintenance_fixture.job.path, run=commands, fetch_health=fetch,
+        sleep=sleep, monotonic=lambda: clock[0], drain_timeout_seconds=3,
+        maintenance_python=Path("/maintenance/bin/python"),
+    )
+    if observation == "idle":
+        assert result.phase == "succeeded"
+        assert commands.mutations[0] == "gateway-stop"
+        assert len(observed) >= 2
+        assert observed[1]["last_sequence"] > observed[0]["last_sequence"]
+        assert all(row["active_work_count_complete"] for row in observed[:2])
+    else:
+        assert result.phase == "failed"
+        assert result.result["error_code"] == "active_sessions_timeout"
+        assert commands.mutations == []
+        assert len(observed) >= 2
+        if observation == "active":
+            assert observed[0]["active_sessions"] == 1
+        elif observation == "conflict":
+            assert observed[0]["owner_conflict"] is True
+        else:
+            assert observed[0]["active_work_count_complete"] is False

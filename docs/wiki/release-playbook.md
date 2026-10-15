@@ -48,7 +48,7 @@ git diff --check
 
 PR 与 tag gate 还必须等待以下仓库门禁全部通过：
 
-- Ubuntu 上 Python 3.9、3.10、3.11、3.12 全量 pytest。
+- Ubuntu 上 Python 3.9、3.10、3.11、3.12、3.13、3.14 全量 pytest；SDK 专项通过不能代替对应解释器的完整运行回归。
 - macOS 3.12 全量 pytest；Windows 3.12 固定 portable runtime/server 套件。
 - Windows PowerShell installer 与 manifestless/portable migration 契约；POSIX-only 安全事务、mode bit、systemd 与 bash 测试由 Ubuntu/macOS 门禁承担。
 - Feishu SDK compatibility、PowerShell installer 与 Docker Compose runtime smoke。

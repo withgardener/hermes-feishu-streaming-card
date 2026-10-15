@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .config import merge_card_config, normalize_text_sizes
+from .config_rules import merge_card_config, normalize_text_sizes
 from .delivery_policy import ChatDeliveryPolicy
 from .feishu_client import FeishuClient, FeishuClientConfig
 

@@ -319,7 +319,8 @@ async def test_task_handoff_has_one_honest_note_and_retains_tool_details(show_re
         await post(http, "answer.delta", 4, {"text": "NEW_RESULT"})
         await asyncio.sleep(.03)
         retired = next(card for mid, card in reversed(client.updated) if mid == old_id)
-        assert "本段已转入续答" in str(retired["header"])
+        assert retired["header"]["template"] == "blue"
+        assert retired["header"]["title"]["content"] == "已转入续答"
         assert str(retired["body"]).count("本段已转入续答") == 0
         assert "执行中" not in str(retired) and "已中断" not in str(retired)
         assert session.tools["live"].status == "running"
@@ -531,3 +532,283 @@ async def test_resolved_receipts_keep_dialect_choices_and_live_turn(start_first,
             assert app[SESSIONS_KEY]['turn_fixture'].status not in {'completed','failed'}
         await post(http, 'message.completed', 6, {'answer':'FINAL_AFTER_TWO'})
         assert 'FINAL_AFTER_TWO' in str(client.updated[-1][1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['callback', 'text'])
+@pytest.mark.parametrize('legacy_owner', [False, True])
+async def test_failed_receipt_render_is_read_only_before_owner_policy_selection(monkeypatch, mode, legacy_owner):
+    """A pre-render snapshot is valid only while the real renderer preserves it."""
+    from hermes_feishu_card import server as sidecar
+    from hermes_feishu_card.owner_display_policy import OwnerRefreshState
+    client = Client()
+    app = create_app(client, card_config={'flush_interval_ms': 0, 'interaction_mode': mode})
+    trace = []
+    original_render = sidecar._render_session_card_for_app
+    original_source = OwnerRefreshState.card_source
+
+    def stored_state(session):
+        return copy.deepcopy({
+            key: vars(value) if key in {'thinking_normalizer', 'answer_normalizer'} else value
+            for key, value in vars(session).items()
+        })
+
+    def render(app, session, **kwargs):
+        before = stored_state(session)
+        interaction = session.active_interaction
+        tracked = interaction is not None and interaction.status == 'failed' and bool(interaction.receipt_fingerprint)
+        card = original_render(app, session, **kwargs)
+        if tracked:
+            assert stored_state(session) == before, 'failed receipt render changed the accepted owner'
+            trace.append('failed-render')
+        return card
+
+    def select(snapshot, supplier):
+        if snapshot.refresh_failed_receipt_first:
+            assert trace and trace[-1] == 'failed-render'
+            owner = app[SESSIONS_KEY]['turn_fixture']
+            interaction = owner.active_interaction
+            assert snapshot.owner_message_id == app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']
+            assert snapshot.interaction_status == interaction.status
+            assert snapshot.interaction_message_id == interaction.feishu_message_id
+            assert snapshot.has_legacy_owner_receipt == bool(owner.legacy_owner_receipt)
+            assert snapshot.has_receipt_fingerprint == bool(interaction.receipt_fingerprint)
+            trace.append('policy-selection')
+        return original_source(snapshot, supplier)
+
+    monkeypatch.setattr(sidecar, '_render_session_card_for_app', render)
+    monkeypatch.setattr(OwnerRefreshState, 'card_source', select)
+    async with TestClient(TestServer(app)) as http:
+        if legacy_owner:
+            await interact(http, 1, 'first-owner')
+            sequence = 3
+        else:
+            await post(http, 'message.started', 0)
+            sequence = 1
+        await post(http, 'interaction.requested', sequence, {
+            'interaction_id': 'failed-receipt', 'kind': 'clarify', 'prompt': 'Choose fixture',
+            'options': [{'label': 'Continue', 'value': 'once'}],
+            'reply_to_message_id': 'om_fixture_anchor', 'reply_in_thread': True,
+        })
+        owner = app[SESSIONS_KEY]['turn_fixture']
+        original_owner_id = app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']
+        receipt_id = owner.active_interaction.feishu_message_id
+        assert receipt_id != original_owner_id
+        await post(http, 'interaction.failed', sequence + 1, {
+            'interaction_id': 'failed-receipt', 'error': 'synthetic failure',
+        })
+        for _ in range(100):
+            if 'policy-selection' in trace:
+                break
+            await asyncio.sleep(.01)
+        assert 'policy-selection' in trace
+        assert app[SESSIONS_KEY]['turn_fixture'] is owner
+        assert app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture'] == original_owner_id
+        assert owner.active_interaction.status == 'failed' and owner.active_interaction.receipt_fingerprint
+        assert not client.cross_dialect
+
+
+class NavigationClient(Client):
+    def __init__(self, *, include_link=True, fail_new=False, fail_old_patch=False):
+        super().__init__()
+        self.include_link = include_link
+        self.fail_new = fail_new
+        self.fail_old_patch = fail_old_patch
+
+    async def send_card_delivery(self, chat_id, card, **kwargs):
+        from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuSendResult
+        from hermes_feishu_card.message_navigation import navigation_from_response
+        if self.fail_new and len(self.sent) >= 2:
+            raise FeishuAPIError('synthetic ambiguous create', outcome='unknown')
+        mid = await self.send_card(chat_id, card, **kwargs)
+        nav = None
+        if self.include_link and len(self.sent) >= 3:
+            thread = 'omt_navigation_fixture'
+            link = ('https://applink.feishu.cn/client/thread/open?'
+                    f'openchatid={chat_id}&openthreadid={thread}&thread_position=12')
+            nav = navigation_from_response({'message_id':mid,'chat_id':chat_id,'thread_id':thread,
+                'message_app_link':link,'thread_message_position':'12'},
+                api_base_url='https://open.feishu.cn/open-apis',chat_id=chat_id,
+                thread_id=kwargs.get('thread_id'),reply_in_thread=kwargs.get('reply_in_thread',False))
+        return FeishuSendResult(mid, navigation=nav)
+
+    async def update_card_message(self, mid, card):
+        if self.fail_old_patch and any(e.get('element_id')=='continuation_link'
+                                      for e in card.get('body',{}).get('elements',[])):
+            raise RuntimeError('synthetic predecessor patch failure')
+        return await super().update_card_message(mid,card)
+
+
+def continuation_buttons(card):
+    return [e for e in card.get('body',{}).get('elements',[])
+            if e.get('element_id')=='continuation_link']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('include_link',[False,True])
+async def test_confirmed_continuation_navigation_is_optional_and_checkpoint_free(tmp_path,include_link):
+    import json
+    client=NavigationClient(include_link=include_link)
+    app=create_app(client,card_config={'flush_interval_ms':0},session_store_directory=tmp_path)
+    async with TestClient(TestServer(app)) as http:
+        await post(http,'message.started',0)
+        await post(http,'answer.delta',1,{'text':'KEEP_PREVIOUS_CONTENT'})
+        await interact(http,2,'navigation_question')
+        await post(http,'answer.delta',4,{'text':'KEEP_NEW_CONTENT'})
+        await asyncio.sleep(.02)
+        assert app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']=='om_segment_3'
+        retired=next(c for mid,c in reversed(client.updated) if mid=='om_segment_1')
+        buttons=continuation_buttons(retired)
+        assert len(buttons)==int(include_link)
+        if include_link:
+            assert buttons[0]['behaviors'][0]['type']=='open_url'
+            assert 'hfc_action' not in str(buttons[0])
+        assert 'KEEP_PREVIOUS_CONTENT' in str(retired)
+        assert not client.cross_dialect
+        await post(http,'message.completed',5,{'answer':'FINAL_NEW_CONTENT'})
+        assert client.updated[-1][0]=='om_segment_3'
+        assert 'FINAL_NEW_CONTENT' in str(client.updated[-1][1])
+    checkpoints=list(tmp_path.rglob('*.json'))
+    assert checkpoints
+    for path in checkpoints:
+        assert 'continuation_link' not in path.read_text()
+        assert 'applink.feishu.cn' not in path.read_text()
+    # Navigation is delivery-time metadata, never a new CardSession registry.
+    from dataclasses import fields
+    from hermes_feishu_card.session import CardSession
+    assert not any('navigation' in f.name for f in fields(CardSession))
+
+
+@pytest.mark.asyncio
+async def test_unknown_continuation_create_never_installs_navigation_or_owner():
+    client=NavigationClient(fail_new=True)
+    app=create_app(client,card_config={'flush_interval_ms':0})
+    async with TestClient(TestServer(app)) as http:
+        await post(http,'message.started',0)
+        await post(http,'answer.delta',1,{'text':'KEEP_BEFORE'})
+        await interact(http,2,'unknown_navigation')
+        await post(http,'answer.delta',4,{'text':'KEEP_AFTER'})
+        await post(http,'answer.delta',5,{'text':'KEEP_TAIL'})
+        assert app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']=='om_segment_1'
+        assert len(client.sent)==2
+        assert not any(continuation_buttons(c) for _,c in client.updated)
+        assert 'KEEP_AFTER' in str(client.updated[-1][1])
+
+
+@pytest.mark.asyncio
+async def test_navigation_predecessor_patch_failure_does_not_undo_new_owner():
+    client=NavigationClient(fail_old_patch=True)
+    app=create_app(client,card_config={'flush_interval_ms':0})
+    async with TestClient(TestServer(app)) as http:
+        await post(http,'message.started',0)
+        await interact(http,1,'failed_navigation_patch')
+        await post(http,'answer.delta',3,{'text':'NEW_OWNER_BODY'})
+        assert app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']=='om_segment_3'
+        await post(http,'message.completed',4,{'answer':'FINAL_STILL_DELIVERED'})
+        assert client.updated[-1][0]=='om_segment_3'
+        assert 'FINAL_STILL_DELIVERED' in str(client.updated[-1][1])
+
+
+@pytest.mark.asyncio
+async def test_old_string_send_interface_remains_navigation_free():
+    client=Client()
+    app=create_app(client,card_config={'flush_interval_ms':0})
+    async with TestClient(TestServer(app)) as http:
+        await post(http,'message.started',0)
+        await interact(http,1,'legacy_string_send')
+        await post(http,'answer.delta',3,{'text':'NEW_BODY'})
+        assert app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']=='om_segment_3'
+        assert not any(continuation_buttons(c) for _,c in client.updated)
+
+
+@pytest.mark.asyncio
+async def test_receipt_pruning_preserves_navigation_without_restoring_controls(monkeypatch):
+    from hermes_feishu_card import server
+    from hermes_feishu_card.session import CardSession, InteractionState
+    from hermes_feishu_card.message_navigation import MessageNavigation
+    owner=CardSession('fixture','turn_fixture','chat_fixture')
+    snapshot=copy.deepcopy(owner)
+    snapshot.active_interaction=InteractionState('receipt_fixture','approval','KEEP_SCOPE',
+        status='completed',feishu_message_id='om_receipt_fixture')
+    app=create_app(Client())
+    app[SESSIONS_KEY]['turn_fixture']=owner
+    app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture']='om_new_fixture'
+    rendered={'schema':'2.0','body':{'elements':[
+        {'tag':'markdown','element_id':'main_content','content':'KEEP_PREVIOUS_BODY'},
+        {'tag':'markdown','element_id':'interaction_review_scope','content':'KEEP_SCOPE'},
+        {'tag':'markdown','element_id':'interaction_result','content':'COMPLETED_RECEIPT'}]}}
+    monkeypatch.setattr(server,'_render_static_display_card',lambda *args,**kwargs:copy.deepcopy(rendered))
+    updated=[]
+    async def update(app,mid,card,bot_id):
+        updated.append(copy.deepcopy(card))
+        return True
+    monkeypatch.setattr(server,'_update_card_for_app',update)
+    link='https://applink.feishu.cn/client/chat/open?openChatId=chat_fixture&position=12'
+    nav=MessageNavigation('om_new_fixture','chat_fixture',link)
+    assert await server._retire_continuation_predecessor(app,'turn_fixture','om_old_fixture',snapshot,
+                                                      bot_id=None,navigation=nav)
+    assert len(continuation_buttons(updated[-1]))==1
+    assert len(owner.approval_retirements)==1
+    cleaned=owner.approval_retirements[0]['card']
+    assert len(continuation_buttons(cleaned))==1
+    assert 'KEEP_PREVIOUS_BODY' in str(cleaned)
+    assert 'interaction_review_scope' not in str(cleaned)
+    assert 'interaction_result' not in str(cleaned)
+    assert not owner.approval_retirements[0]['interaction'].callback_token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [False, True])
+async def test_continuation_queries_only_confirmed_new_owner(failure):
+    from hermes_feishu_card.message_navigation import MessageNavigation
+
+    class LookupClient(NavigationClient):
+        def __init__(self):
+            super().__init__(include_link=False)
+            self.lookups = []
+
+        async def lookup_message_navigation(self, mid, chat, **route):
+            self.lookups.append((mid, chat, route))
+            assert len(self.sent) == 3
+            if failure:
+                raise RuntimeError('synthetic lookup failure')
+            return MessageNavigation(mid, chat,
+                'https://applink.feishu.cn/client/thread/open?openchatid=chat_fixture&openthreadid=omt_fixture&thread_position=12')
+
+    client = LookupClient()
+    app = create_app(client, card_config={'flush_interval_ms': 0})
+    async with TestClient(TestServer(app)) as http:
+        await post(http, 'message.started', 0)
+        await post(http, 'answer.delta', 1, {'text': 'KEEP_PREVIOUS'})
+        await interact(http, 2, 'lookup_question')
+        assert not client.lookups
+        await post(http, 'answer.delta', 4, {'text': 'KEEP_NEW'})
+        await asyncio.sleep(.02)
+        assert len(client.lookups) == 1
+        mid, chat, route = client.lookups[0]
+        assert mid == app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture'] == 'om_segment_3'
+        assert chat == 'chat_fixture' and route['reply_in_thread'] is True
+        retired = next(c for m, c in reversed(client.updated) if m == 'om_segment_1')
+        assert len(continuation_buttons(retired)) == int(not failure)
+        assert 'KEEP_PREVIOUS' in str(retired)
+        assert len(client.sent) == 3
+
+
+@pytest.mark.asyncio
+async def test_navigation_lookup_owner_change_does_not_patch_predecessor(monkeypatch):
+    from hermes_feishu_card import server
+    from hermes_feishu_card.session import CardSession
+    client = Client()
+    app = create_app(client)
+    owner = CardSession('fixture', 'turn_fixture', 'chat_fixture')
+    app[SESSIONS_KEY]['turn_fixture'] = owner
+    app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture'] = 'om_new_fixture'
+    async def lookup(*args, **kwargs):
+        app[FEISHU_MESSAGE_IDS_KEY]['turn_fixture'] = 'om_replaced_fixture'
+        return None
+    monkeypatch.setattr(client, 'lookup_message_navigation', lookup, raising=False)
+    monkeypatch.setattr(server, '_render_static_display_card', lambda *args, **kwargs:
+        {'schema': '2.0', 'body': {'elements': [{'tag': 'markdown', 'content': 'KEEP'}]}})
+    assert not await server._retire_continuation_predecessor(
+        app, 'turn_fixture', 'om_old_fixture', copy.deepcopy(owner), bot_id=None)
+    assert not client.updated

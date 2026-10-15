@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 
 from hermes_feishu_card import cli
+from hermes_feishu_card.install import posix_transaction
 from hermes_feishu_card.install import decomposed
 from hermes_feishu_card.install.detect import detect_hermes
 
@@ -29,7 +30,7 @@ def test_migrate_safe_rolls_back_metadata_after_both_writes_and_preserves_user_s
     user_source = source_before + b"\n# concurrent operator source change\n"
     metadata_before = {path: path.read_bytes() for path in (manifest_path, env_path)}
     backups_before = {path: path.read_bytes() for path in root.rglob("*.hermes_feishu_card.bak")}
-    atomic_write = cli._atomic_write_text
+    atomic_write = posix_transaction._atomic_write_text
     writes = []
     injected = False
 
@@ -46,7 +47,7 @@ def test_migrate_safe_rolls_back_metadata_after_both_writes_and_preserves_user_s
             source.write_bytes(user_source)
         return result
 
-    monkeypatch.setattr(cli, "_atomic_write_text", drift_after_env_commit)
+    monkeypatch.setattr(posix_transaction, "_atomic_write_text", drift_after_env_commit)
     result = cli.main([
         "integrity", "migrate-safe", "--config", str(config_path),
         "--hermes-dir", str(root), "--yes",

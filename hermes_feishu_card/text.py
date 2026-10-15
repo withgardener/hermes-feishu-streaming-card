@@ -95,7 +95,12 @@ def should_flush_text(
 
 def count_markdown_tables(text: str) -> int:
     """Count real Markdown tables outside fenced code blocks."""
-    return sum(block.kind == "table" for block in scan_markdown_blocks(text or ""))
+    source = text or ""
+    # The row parser requires a literal pipe delimiter. Avoid allocating and
+    # scanning block/row objects for the common plain-text and code-only case.
+    if "|" not in source:
+        return 0
+    return sum(block.kind == "table" for block in scan_markdown_blocks(source))
 
 
 def scan_markdown_blocks(text: str) -> list[MarkdownBlock]:
@@ -483,7 +488,7 @@ def _split_oversized_table_row(row: str, max_row_size: int) -> list[str] | None:
 
 def _parse_markdown_row(row: str) -> list[str] | None:
     stripped = row.strip()
-    if not stripped:
+    if not stripped or "|" not in stripped:
         return None
     cells: list[str] = []
     current: list[str] = []

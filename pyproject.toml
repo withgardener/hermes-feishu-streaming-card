@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-feishu-streaming-card"
-version = "4.7.7"
+version = "5.0.0"
 description = "Hermes Gateway Feishu streaming card sidecar plugin"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +31,10 @@ test = [
   "pytest-asyncio>=0.23",
   "tomli>=1.1.0; python_version < '3.11'",
 ]
+quality = [
+  "ruff==0.17.0; python_version >= '3.10'",
+  "mypy==2.4.0; python_version >= '3.10'",
+]
 
 [project.scripts]
 hermes-feishu-card = "hermes_feishu_card.cli:main"
@@ -56,3 +60,90 @@ include = ["hermes_feishu_card*"]
   "provenance.json",
   "slices/*.py",
 ]
+
+# Incremental checks cover extracted boundaries, not the archived or legacy
+# coordinators. The runtime Python floor remains >=3.9; CI tests it separately.
+[tool.ruff]
+target-version = "py39"
+include = [
+  "hermes_feishu_card/cli_reports.py",
+  "hermes_feishu_card/card_view.py",
+  "hermes_feishu_card/display_redaction.py",
+  "hermes_feishu_card/event_rules.py",
+  "hermes_feishu_card/native_admission.py",
+  "hermes_feishu_card/turn_events.py",
+  "hermes_feishu_card/turn_metrics.py",
+  "hermes_feishu_card/canonical_turn.py",
+  "hermes_feishu_card/interaction_input.py",
+  "hermes_feishu_card/interaction_rules.py",
+  "hermes_feishu_card/interaction_resolver.py",
+  "hermes_feishu_card/interaction_receipts.py",
+  "hermes_feishu_card/command_cards.py",
+  "hermes_feishu_card/support_report.py",
+  "hermes_feishu_card/config_snapshot.py",
+  "hermes_feishu_card/config_rules.py",
+  "hermes_feishu_card/content_plan.py",
+  "hermes_feishu_card/observations.py",
+  "hermes_feishu_card/maintenance_evidence.py",
+  "hermes_feishu_card/lifecycle.py",
+  "hermes_feishu_card/owner_display_policy.py",
+  "hermes_feishu_card/existing_owner_projection.py",
+  "hermes_feishu_card/message_navigation.py",
+  "hermes_feishu_card/install/ast_contracts.py",
+  "hermes_feishu_card/install/base_contracts.py",
+  "hermes_feishu_card/install/gateway_contracts.py",
+  "hermes_feishu_card/install/cron_contracts.py",
+  "hermes_feishu_card/install/file_transaction.py",
+  "hermes_feishu_card/install/posix_transaction.py",
+  "hermes_feishu_card/install/source_layout.py",
+  "hermes_feishu_card/install/errors.py",
+  "hermes_feishu_card/install/git_evidence.py",
+  "hermes_feishu_card/install/decomposed_ownership.py",
+  "hermes_feishu_card/delivery.py",
+  "hermes_feishu_card/terminal_delivery.py",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = [
+  "hermes_feishu_card/cli_reports.py",
+  "hermes_feishu_card/card_view.py",
+  "hermes_feishu_card/display_redaction.py",
+  "hermes_feishu_card/event_rules.py",
+  "hermes_feishu_card/native_admission.py",
+  "hermes_feishu_card/turn_events.py",
+  "hermes_feishu_card/turn_metrics.py",
+  "hermes_feishu_card/canonical_turn.py",
+  "hermes_feishu_card/interaction_input.py",
+  "hermes_feishu_card/interaction_rules.py",
+  "hermes_feishu_card/interaction_resolver.py",
+  "hermes_feishu_card/interaction_receipts.py",
+  "hermes_feishu_card/command_cards.py",
+  "hermes_feishu_card/support_report.py",
+  "hermes_feishu_card/config_snapshot.py",
+  "hermes_feishu_card/config_rules.py",
+  "hermes_feishu_card/content_plan.py",
+  "hermes_feishu_card/observations.py",
+  "hermes_feishu_card/maintenance_evidence.py",
+  "hermes_feishu_card/lifecycle.py",
+  "hermes_feishu_card/owner_display_policy.py",
+  "hermes_feishu_card/existing_owner_projection.py",
+  "hermes_feishu_card/message_navigation.py",
+  "hermes_feishu_card/install/ast_contracts.py",
+  "hermes_feishu_card/install/base_contracts.py",
+  "hermes_feishu_card/install/gateway_contracts.py",
+  "hermes_feishu_card/install/cron_contracts.py",
+  "hermes_feishu_card/install/file_transaction.py",
+  "hermes_feishu_card/install/posix_transaction.py",
+  "hermes_feishu_card/install/source_layout.py",
+  "hermes_feishu_card/install/errors.py",
+  "hermes_feishu_card/install/git_evidence.py",
+  "hermes_feishu_card/install/decomposed_ownership.py",
+  "hermes_feishu_card/delivery.py",
+  "hermes_feishu_card/terminal_delivery.py",
+]
+strict = true
+follow_imports = "silent"

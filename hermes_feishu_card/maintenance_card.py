@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
-from .config import card_width_config
+from .config_rules import card_width_config
 from .feishu_client import FeishuAPIError
 from .maintenance_store import UpdateJob
 from .maintenance_update import UpdateInspection

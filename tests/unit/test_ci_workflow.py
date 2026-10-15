@@ -16,7 +16,10 @@ def test_github_actions_runs_full_pytest_matrix():
 
     assert "pull_request:" in text
     assert "push:" in text
-    assert 'python-version: ["3.9", "3.10", "3.11", "3.12"]' in text
+    full_job = yaml.safe_load(text)["jobs"]["pytest"]
+    assert full_job["strategy"]["matrix"]["python-version"] == [
+        "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"
+    ]
     assert 'python -m pip install -e ".[test]"' in text
     assert "python -m pytest -q" in text
     assert "powershell-installer:" in text

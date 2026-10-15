@@ -320,6 +320,7 @@ def _run_installed_probe(
     *,
     swap_runtime_after_binding: bool = False,
     rebind_descriptor_paths_during_fork: bool = False,
+    omit_post_api_evidence: bool = False,
 ) -> dict[str, object]:
     parent_cache = Path(tempfile.mkdtemp(
         prefix="parent-pycache-", dir=runtime.parents[2]
@@ -360,16 +361,25 @@ def _run_with_rebound_descriptor_paths(**kwargs):
         home_held.rename(home)
 native_hooks._run_forked_plugin_probe = _run_with_rebound_descriptor_paths
 ''' if rebind_descriptor_paths_during_fork else ""
+    evidence_fault = "True" if omit_post_api_evidence else "False"
     code = '''
 import json
 from hermes_feishu_card.install import native_hooks
 _captured_probe_payload = {}
+_observed_registered_hooks = []
 _real_validate_payload = native_hooks._validate_plugin_manager_payload
 def _capture_probe_payload(payload, **kwargs):
+    _observed_registered_hooks[:] = payload["registered_hooks"]
+    if OMIT_POST_API_EVIDENCE:
+        payload = dict(payload)
+        payload["registered_hooks"] = [name for name in payload["registered_hooks"] if name != "post_api_request"]
+        unsigned = dict(payload)
+        del unsigned["attestation_sha256"]
+        payload["attestation_sha256"] = native_hooks._sha256(json.dumps(unsigned, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii"))
     _captured_probe_payload.update(payload)
     return _real_validate_payload(payload, **kwargs)
 native_hooks._validate_plugin_manager_payload = _capture_probe_payload
-''' + swap_setup + descriptor_setup + '''
+'''.replace("OMIT_POST_API_EVIDENCE", evidence_fault) + swap_setup + descriptor_setup + '''
 try:
     result = native_hooks.probe_native_hook_capabilities(
         __import__("sys").argv[1],
@@ -395,6 +405,8 @@ print(json.dumps({
     "pycache_prefix": _captured_probe_payload.get("pycache_prefix", ""),
     "child_sys_path": _captured_probe_payload.get("child_sys_path", []),
     "loaded_modules": _captured_probe_payload.get("loaded_modules", []),
+    "observed_registered_hooks": _observed_registered_hooks,
+    "reported_registered_hooks": _captured_probe_payload.get("registered_hooks", []),
 }, sort_keys=True, separators=(",", ":")))
 '''
     completed = subprocess.run(
@@ -415,7 +427,15 @@ print(json.dumps({
         timeout=90,
         env={"HOME": str(runtime.parents[2])},
     )
-    return json.loads(completed.stdout)
+    result = json.loads(completed.stdout)
+    # Preserve only the runtime's bounded reason categories, never raw child
+    # stderr, exception text, command arguments or local source paths.
+    result["source_probe_failures"] = re.findall(
+        r"native source probe failed: stage=(git_head|git_status|snapshot|unknown) "
+        r"kind=(timeout|command_failed|unavailable|io_error|invalid_archive|invalid_evidence)(?=\s|$)",
+        completed.stderr,
+    )[:8]
+    return result
 
 
 def test_fixed_tag_provenance_is_one_canonical_manifest_with_24_slices():
@@ -444,7 +464,21 @@ def test_real_regular_wheel_plugin_manager_probe_reports_exactly_four_capabiliti
         "stable_tool_lifecycle",
         "approval_observe",
     }
-    assert result["reason_code"] == "verified"
+    if result["reason_code"] != "verified":
+        reason = result["reason_code"]
+        source_commit = result.get("source_commit")
+        # Avoid pytest assert rewriting appending the unfiltered child value.
+        raise AssertionError({
+            "reason_code": (
+                reason if isinstance(reason, str) and reason in native_hooks._REASON_CODES
+                else "unavailable"
+            ),
+            "source_commit": (
+                source_commit if isinstance(source_commit, str)
+                and re.fullmatch(r"[0-9a-f]{40}", source_commit) else "unavailable"
+            ),
+            "source_probe_failures": result["source_probe_failures"],
+        })
     assert set(result["available"]) == expected
     assert result["plugin_evidence_sha256"].startswith("sha256:")
     assert len(result["source_digests"]) == 9
@@ -1098,3 +1132,83 @@ def test_second_review_real_ignored_unchecked_pyc_cannot_influence_probe(
         "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
         "approval_observe",
     }
+
+
+def test_installed_probe_helper_bounds_and_redacts_child_stderr(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime" / "bin" / "python"
+    allowed = "native source probe failed: stage=snapshot kind=timeout"
+    stderr = "\n".join([
+        "PRIVATE_COMMAND PRIVATE_PATH PRIVATE_SECRET",
+        "native source probe failed: stage=PRIVATE_STAGE kind=timeout",
+        "native source probe failed: stage=git_head kind=PRIVATE_KIND",
+        "native source probe failed: stage=git_head kind=timeoutPRIVATE_SECRET",
+        *[allowed + " PRIVATE_EXCEPTION_BODY" for _ in range(12)],
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: SimpleNamespace(
+        stdout=json.dumps({"reason_code": "source_commit_mismatch", "source_commit": ""}),
+        stderr=stderr,
+    ))
+
+    result = _run_installed_probe(runtime, tmp_path / "PRIVATE_SOURCE_ROOT")
+
+    assert result["source_probe_failures"] == [("snapshot", "timeout")] * 8
+    assert "PRIVATE_" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("source_commit", ["a" * 40, "PRIVATE_COMMIT_PATH"], ids=["valid-sha", "invalid-sha"])
+@pytest.mark.parametrize("reason_code", ["source_commit_mismatch", "PRIVATE_REASON"], ids=["valid-reason", "invalid-reason"])
+def test_installed_probe_failure_assertion_has_only_safe_context(
+    tmp_path, monkeypatch, source_commit, reason_code,
+):
+    runtime = tmp_path / "runtime" / "bin" / "python"
+    monkeypatch.setitem(globals(), "FIXED_SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: SimpleNamespace(
+        stdout=json.dumps({
+            "reason_code": reason_code, "source_commit": source_commit,
+            "module_origin": "PRIVATE_MODULE_PATH", "home_root": "PRIVATE_HOME",
+        }),
+        stderr="native source probe failed: stage=git_head kind=timeout\nPRIVATE_RAW_STDERR",
+    ))
+
+    with pytest.raises(AssertionError) as failure:
+        test_real_regular_wheel_plugin_manager_probe_reports_exactly_four_capabilities(runtime)
+
+    rendered = str(failure.value)
+    assert (reason_code if reason_code == "source_commit_mismatch" else "unavailable") in rendered
+    assert "git_head" in rendered and "timeout" in rendered
+    assert (source_commit if source_commit == "a" * 40 else "unavailable") in rendered
+    assert "PRIVATE_" not in rendered
+
+
+def test_installed_probe_success_keeps_payload_without_raw_stderr(tmp_path, monkeypatch):
+    payload = {"reason_code": "verified", "source_commit": "b" * 40, "available": ["turn_start"]}
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: SimpleNamespace(
+        stdout=json.dumps(payload), stderr="PRIVATE_UNRELATED_WARNING",
+    ))
+
+    result = _run_installed_probe(tmp_path / "runtime/bin/python", tmp_path)
+
+    assert result == {**payload, "source_probe_failures": []}
+
+
+def test_real_plugin_manager_registration_includes_official_api_observer(installed_fixed_runtime):
+    result = _run_installed_probe(installed_fixed_runtime, FIXED_SOURCE_ROOT)
+    assert result["observed_registered_hooks"] == sorted({
+        "pre_llm_call", "post_llm_call", "post_api_request", "on_session_end",
+        "on_session_reset", "on_session_finalize", "pre_tool_call", "post_tool_call",
+        "pre_approval_request", "post_approval_response", "subagent_start", "subagent_stop",
+    })
+    assert result["reason_code"] == "verified"
+    assert set(result["available"]) == {
+        "turn_start", "turn_terminal_result", "stable_tool_lifecycle", "approval_observe",
+    }
+
+
+def test_real_manager_evidence_missing_api_observer_remains_rejected(installed_fixed_runtime):
+    result = _run_installed_probe(
+        installed_fixed_runtime, FIXED_SOURCE_ROOT, omit_post_api_evidence=True,
+    )
+    assert "post_api_request" in result["observed_registered_hooks"]
+    assert "post_api_request" not in result["reported_registered_hooks"]
+    assert result["reason_code"] == "registration_incomplete"
+    assert result["available"] == []

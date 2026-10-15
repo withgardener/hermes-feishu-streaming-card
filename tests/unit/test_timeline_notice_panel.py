@@ -6,6 +6,8 @@ panel headed "思考与工具 · 0 次工具调用": a panel advertising zero of
 while displaying something unrelated. Notices render standalone in that case instead, so the hint
 stays visible.
 """
+import pytest
+
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.render import render_card
 from hermes_feishu_card.session import CardSession
@@ -72,10 +74,9 @@ def test_a_timeline_with_tool_work_still_uses_the_panel():
     panels = _panels(card)
 
     assert len(panels) == 1
-    # Maintainer note (contract change): the header used to be the bare word "思考过程", which the
-    # user could not tell was tappable. It now carries a triangle + an explicit hint; the panel
-    # identity/behaviour is unchanged.
-    assert panels[0]["header"]["title"]["content"] == "▸ 思考过程（点开查看）"
+    # Android confirmed that a static direction arrow and "open" hint mislead
+    # while expanded. The same neutral action hint survives local toggles.
+    assert panels[0]["header"]["title"]["content"] == "思考过程（点按展开/收起）"
     assert "上下文压缩已推迟" in str(panels[0])
 
 
@@ -95,17 +96,40 @@ def test_a_session_with_nothing_to_show_has_no_panel():
     assert _panels(render_card(_session())) == []
 
 
-def test_panel_header_says_it_can_be_opened():
-    """User report: "思考过程这几个字目前看不出来 可以点开折叠" — the header gave no affordance.
+@pytest.mark.parametrize("presentation, label", [("classic", "思考过程"), ("task", "执行过程")])
+@pytest.mark.parametrize("expanded", [True, False])
+def test_panel_header_describes_both_toggle_states_without_changing_content(presentation, label, expanded):
+    session = _session(
+        _tool_event(),
+        {"event": "message.completed", "data": {"answer": "正文保留 BODY_END"}},
+    )
+    card = render_card(session, presentation=presentation, timeline_expanded=expanded)
+    other = render_card(session, presentation=presentation, timeline_expanded=not expanded)
+    panel = _panels(card)[0]
+    other_panel = _panels(other)[0]
+    assert panel["expanded"] is expanded
+    assert other_panel["expanded"] is not expanded
+    assert panel["header"]["title"] == {"tag": "plain_text", "content": label + "（点按展开/收起）"}
+    assert panel["header"] == other_panel["header"]
+    assert panel["elements"] == other_panel["elements"]
+    assert [e for e in card["body"]["elements"] if e.get("tag") != "collapsible_panel"] == [
+        e for e in other["body"]["elements"] if e.get("tag") != "collapsible_panel"
+    ]
+    assert "BODY_END" in str(card)
+    assert "点开查看" not in str(card)
+    assert "▸" not in panel["header"]["title"]["content"]
 
-    The panel IS collapsible, so its header must say so; a bare noun reads as a static heading.
-    This test pins the affordance (a leading triangle + an explicit hint) so a later copy tweak
-    cannot silently drop it back to prose.
-    """
-    panels = _panels(render_card(_session(_tool_event())))
 
-    assert len(panels) == 1
-    title = panels[0]["header"]["title"]
-    assert title["tag"] == "plain_text"
-    assert title["content"].startswith("▸")
-    assert "点开" in title["content"]
+def test_task_reading_preset_honors_explicit_collapsed_override():
+    from hermes_feishu_card.reading import expand_reading_preset
+    from hermes_feishu_card.render_options import card_render_options
+
+    session = _session(_tool_event())
+    options = card_render_options(expand_reading_preset({
+        "reading_preset": "task", "timeline_expanded": False,
+    }))
+    assert options["presentation"] == "task"
+    assert options["timeline_expanded"] is False
+    panel = _panels(render_card(session, **options))[0]
+    assert panel["expanded"] is False
+    assert panel["header"]["title"]["content"] == "执行过程（点按展开/收起）"

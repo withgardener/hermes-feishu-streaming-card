@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_feishu_card.install import posix_transaction as bound_io
+
 from hermes_feishu_card import cli
 from hermes_feishu_card.install.detect import detect_hermes
 from hermes_feishu_card.install import patcher, recovery
@@ -309,16 +311,16 @@ def test_recovery_commit_mutation_uses_bound_target_parent(
         injected = True
 
     if contents is None:
-        original_unlink = recovery.os.unlink
+        original_unlink = bound_io.os.unlink
 
         def interposed_unlink(path, *args, **kwargs):
             if Path(path).name == target.name and not injected:
                 swap_parent()
             return original_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(recovery.os, "unlink", interposed_unlink)
+        monkeypatch.setattr(bound_io.os, "unlink", interposed_unlink)
     else:
-        original_replace = recovery.os.replace
+        original_replace = bound_io.os.replace
 
         def interposed_replace(source, destination, *args, **kwargs):
             if not injected:
@@ -327,7 +329,7 @@ def test_recovery_commit_mutation_uses_bound_target_parent(
                 (parent / source_name).write_text(contents, encoding="utf-8")
             return original_replace(source, destination, *args, **kwargs)
 
-        monkeypatch.setattr(recovery.os, "replace", interposed_replace)
+        monkeypatch.setattr(bound_io.os, "replace", interposed_replace)
 
     try:
         recovery._commit_recovery_changes(
@@ -376,7 +378,7 @@ def test_recovery_rollback_mutation_uses_bound_target_parent(
         injected = True
 
     if first_existed:
-        original_replace = recovery.os.replace
+        original_replace = bound_io.os.replace
         replacements = 0
 
         def interposed_replace(source, destination, *args, **kwargs):
@@ -390,16 +392,16 @@ def test_recovery_rollback_mutation_uses_bound_target_parent(
                 )
             return original_replace(source, destination, *args, **kwargs)
 
-        monkeypatch.setattr(recovery.os, "replace", interposed_replace)
+        monkeypatch.setattr(bound_io.os, "replace", interposed_replace)
     else:
-        original_unlink = recovery.os.unlink
+        original_unlink = bound_io.os.unlink
 
         def interposed_unlink(path, *args, **kwargs):
             if Path(path).name == first.name and not injected:
                 swap_parent()
             return original_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(recovery.os, "unlink", interposed_unlink)
+        monkeypatch.setattr(bound_io.os, "unlink", interposed_unlink)
 
     with pytest.raises(OSError, match="second target unavailable"):
         recovery._commit_recovery_changes(
@@ -777,14 +779,14 @@ def test_execute_recovery_does_not_mutate_when_staging_manifest_fails(
 ):
     detection, corrupt, manifest_path = _corrupt_gateway_completion(installed_state)
     original_manifest = manifest_path.read_text(encoding="utf-8")
-    real_stage = recovery._stage_text
+    real_stage = bound_io.stage_file
 
     def fail_manifest_stage(target, contents, **kwargs):
         if target == manifest_path:
             raise OSError("injected manifest stage failure")
         return real_stage(target, contents, **kwargs)
 
-    monkeypatch.setattr(recovery, "_stage_text", fail_manifest_stage)
+    monkeypatch.setattr(bound_io, "stage_file", fail_manifest_stage)
 
     with pytest.raises(OSError, match="injected manifest stage failure"):
         execute_recovery(detection)
@@ -889,7 +891,7 @@ def test_execute_recovery_commits_cron_restore_before_deleting_evidence_and_roll
     tracked_deletions = {gateway_backup, cron_backup, manifest_path}
     tracked_deletions_by_name = {path.name: path for path in tracked_deletions}
     real_atomic_replace = recovery._atomic_replace
-    real_unlink = recovery.os.unlink
+    real_unlink = bound_io.os.unlink
 
     def record_replace(staged, target):
         if target == detection.cron_py:
@@ -905,7 +907,7 @@ def test_execute_recovery_commits_cron_restore_before_deleting_evidence_and_roll
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(recovery, "_atomic_replace", record_replace)
-    monkeypatch.setattr(recovery.os, "unlink", record_unlink)
+    monkeypatch.setattr(bound_io.os, "unlink", record_unlink)
 
     with pytest.raises(OSError, match="injected evidence deletion failure"):
         execute_recovery(detection)

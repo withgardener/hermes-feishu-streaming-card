@@ -17,7 +17,8 @@ from .config import load_config, resolve_operations_hermes_root
 from .delivery_policy import ReloadingDeliveryPolicyProvider
 from .event_auth import is_loopback_host
 from .feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
-from .server import create_app, python_executable_identity
+from .server import create_app
+from .runtime_ownership import python_executable_identity
 from .operations_transport import (
     ensure_transport_root_secret,
     transport_root_privacy_verified,
