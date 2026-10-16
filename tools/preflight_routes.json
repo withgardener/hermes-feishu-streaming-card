@@ -33,7 +33,10 @@
       "tests/unit/test_stale_interrupted_turn.py",
       "tests/unit/test_cron_contracts.py",
       "tests/integration/test_cli_install.py",
-      "tests/unit/test_installer_family_boundaries.py"
+      "tests/unit/test_installer_family_boundaries.py",
+      "tests/unit/test_pm_dependency.py",
+      "tests/unit/test_decomposed_patcher.py",
+      "tests/unit/test_extracted_clarify_patcher.py"
     ],
     "process": [
       "tests/unit/test_process.py",
@@ -605,6 +608,9 @@
     "hermes_feishu_card/canonical_turn.py": [
       "runtime",
       "plugin"
+    ],
+    "hermes_feishu_card/install/pm_dependency.py": [
+      "install"
     ]
   }
 }

@@ -2032,11 +2032,33 @@ def _hermes_runtime_cwd(runtime_python: Path) -> Path | None:
     return root if root.exists() else None
 
 
-def _ensure_hermes_runtime_package(detection: HermesDetection, *, hermes_home: Path | None = None) -> None:
+def _ensure_hermes_runtime_package(detection: HermesDetection, *, hermes_home: Path | None = None):
     runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
     if runtime_python is None:
         print("runtime package: skipped (Hermes venv Python not found)")
         return
+    from .install import pm_dependency
+    if pm_dependency.available(detection.root):
+        registration = pm_dependency.ensure(detection.root, runtime_python, home=hermes_home,
+                                            spec=_runtime_install_spec(), version=PACKAGE_VERSION)
+        # Admission publishes a new generation; the old interpreter is stale.
+        try:
+            selected = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+            if selected is None:
+                raise ValueError("PM dependency admission did not select a runtime")
+            report = _check_runtime_hook_import(selected)
+            if (report["status"] != "ok" or report.get("version") != PACKAGE_VERSION
+                    or not _runtime_report_uses_installed_package(report, selected)):
+                raise ValueError("PM selected runtime did not import the expected ordinary HFC wheel")
+            probe = pm_dependency._call(detection.root, selected, hermes_home, {"operation": "probe"})
+            if not pm_dependency.verify_installed(Path(probe['home']) / 'plugins' / pm_dependency.NAME, selected):
+                raise ValueError("PM installed package does not match the cached exact HFC wheel")
+        except (OSError, ValueError):
+            if registration is not None:
+                registration.rollback()
+            raise
+        print(f"runtime package: {PACKAGE_VERSION} registered with Hermes PM ({selected})")
+        return registration
     report = _check_runtime_hook_import(runtime_python)
     if report["status"] == "ok" and report.get("version") == PACKAGE_VERSION:
         print(f"runtime package: {PACKAGE_VERSION} import ok ({runtime_python})")
@@ -3730,6 +3752,26 @@ def _secret_values(config: dict | None) -> list[str]:
 
 
 def _run_install(args: argparse.Namespace) -> int:
+    registrations = []
+    try:
+        result = _run_install_core(args, registrations)
+    except BaseException:
+        for registration in registrations:
+            registration.rollback()
+        raise
+    try:
+        for registration in registrations:
+            if result == 0:
+                registration.finish()
+            else:
+                registration.rollback()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return result
+
+
+def _run_install_core(args: argparse.Namespace, registrations) -> int:
     detection = detect_hermes(args.hermes_dir)
     if not detection.supported:
         print(_format_hermes_detection(detection), file=sys.stderr)
@@ -3747,7 +3789,9 @@ def _run_install(args: argparse.Namespace) -> int:
             home_options["hermes_home"] = configured_hermes_home(
                 detection.root, {"service": {"hermes_home": str(args.hermes_home)}},
             )
-        _ensure_hermes_runtime_package(detection, **home_options)
+        registration = _ensure_hermes_runtime_package(detection, **home_options)
+        if registration is not None:
+            registrations.append(registration)
         _ensure_hermes_feishu_sdk(detection, **home_options)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -4222,6 +4266,18 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    from .install import pm_dependency
+    root = Path(args.hermes_dir).expanduser()
+    try:
+        if pm_dependency.available(root):
+            home = getattr(args, "hermes_home", None)
+            python = _detect_hermes_runtime_python(root, **({"hermes_home": Path(home)} if home else {}))
+            if python is None:
+                raise ValueError("PM runtime unavailable; owned dependency retained")
+            pm_dependency.remove(root, python, home=Path(home) if home else None)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print("uninstall ok")
     return 0
 

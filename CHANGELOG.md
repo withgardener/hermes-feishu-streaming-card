@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.0.1 — 2026-10-16
+
+- Support verified inherited completion and approval-renderer seams in the two reported Hermes 0.22.x revisions (#428), retaining strict source checks, original interaction authority and exact restore. Optional split progress/provider capture remains outside this patch.
+- Register the exact HFC wheel through official PM plugin admission so future generations retain it (#431); re-resolve the selected runtime and verify source bytes, with owned rollback and uninstall.
+- Thanks to lanx214 and za8209 for issue evidence, and Lite-G for the independent compatibility analysis in PR #432 (code not incorporated). Earlier credits and authorship remain intact.
+
+See [Chinese release notes](docs/release-notes-v5.0.1.md) and [English release notes](docs/release-notes-v5.0.1.en.md) for compatibility, upgrade and verification boundaries.
+
 ## v5.0.0 — 2026-10-15
 
 - Add opt-in task reading, continuation history folding, and verified continuation navigation. Resolve missing IM positions with one bounded exact-message lookup after confirmed delivery.

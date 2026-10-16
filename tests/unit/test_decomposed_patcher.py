@@ -40,7 +40,7 @@ def test_decomposed_cli_install_doctor_repeat_remove_roundtrip(hermes, monkeypat
     assert detection.supported and detection.compatibility == "full"
     assert cli.main(["install", "--hermes-dir", str(hermes), "--yes"]) == 0
     installed = sources(hermes)
-    assert {name for name in before if before[name] != installed[name]} == set(patcher.DECOMPOSED_TARGETS)
+    assert {name for name in before if before[name] != installed[name]} == {name for name in patcher.DECOMPOSED_TARGETS if (FIXTURE / name).exists()}
     assert cli.main(["install", "--hermes-dir", str(hermes), "--yes"]) == 0
     assert installed == sources(hermes)
     detection = detect_hermes(hermes)
@@ -105,7 +105,7 @@ def test_decomposed_accepts_record_delivery_kwarg_end_to_end(hermes):
     assert sources(hermes) == before
 
 
-@pytest.mark.parametrize("target", patcher.DECOMPOSED_TARGETS)
+@pytest.mark.parametrize("target", [name for name in patcher.DECOMPOSED_TARGETS if (FIXTURE / name).exists()])
 def test_each_owned_file_is_required_for_restore(hermes, target):
     detection = detect_hermes(hermes)
     decomposed.install(detection)
@@ -665,3 +665,127 @@ def test_decomposed_migration_rechecks_sibling_before_manifest_commit(hermes, mo
         integrity.migrate_integrity_manifest(detect_hermes(hermes))
     assert manifest_path.read_bytes() == before
     assert (hermes / "gateway/run_turn.py").read_bytes().endswith(b"# concurrent user edit\n")
+
+
+def extract_persistence(hermes):
+    """The exact upstream extraction: inherited persistence, handler stays put."""
+    path = hermes / 'gateway/run_turn.py'
+    text = path.read_text()
+    start = text.index('    async def _hmwa_post_turn_hooks')
+    end = text.index('    async def _run_agent', start)
+    methods = text[start:end]
+    path.write_text('from gateway.run_turn_persistence import GatewayTurnPersistenceMixin\n\n'
+                    + text[:start].replace('class GatewayTurnMixin:',
+                        'class GatewayTurnMixin(GatewayTurnPersistenceMixin):') + text[end:])
+    (hermes / 'gateway/run_turn_persistence.py').write_text(
+        'class GatewayTurnPersistenceMixin:\n' + methods)
+    return hermes
+
+
+@pytest.fixture
+def persistence_hermes(hermes):
+    return extract_persistence(hermes)
+
+
+def test_inherited_persistence_install_restore(persistence_hermes):
+    root = persistence_hermes
+    detection = detect_hermes(root)
+    assert detection.supported, detection.reason
+    assert detection.capability_locations['completion_return'] == ('gateway/run_turn_persistence.py',)
+    before = sources(root)
+    decomposed.install(detection)
+    installed = sources(root)
+    assert patcher.TURN_TIMING_PATCH_BEGIN.encode() in installed['gateway/run_turn.py']
+    assert patcher.COMPLETE_PATCH_BEGIN.encode() in installed['gateway/run_turn_persistence.py']
+    decomposed.install(detect_hermes(root))
+    assert sources(root) == installed
+    decomposed.restore(detect_hermes(root))
+    assert sources(root) == before
+
+
+@pytest.mark.parametrize('target,old,new', [
+    ('gateway/run_turn.py', 'GatewayTurnMixin(GatewayTurnPersistenceMixin)', 'GatewayTurnMixin(object)'),
+    ('gateway/run_turn.py', 'from gateway.run_turn_persistence import', 'from gateway.other import'),
+    ('gateway/run_turn.py', 'await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)',
+        'await self._hmwa_post_turn_hooks(hook_ctx, agent_result, "wrong")'),
+    ('gateway/run_turn_persistence.py', '"agent:end"', '"agent:other"'),
+    ('gateway/run_turn_persistence.py', 'self, event, source, session_entry', 'self, event, wrong, session_entry'),
+])
+def test_inherited_persistence_drift_refused(persistence_hermes, target, old, new):
+    path = persistence_hermes / target
+    text = path.read_text()
+    assert old in text
+    path.write_text(text.replace(old, new))
+    assert not detect_hermes(persistence_hermes).supported
+
+
+@pytest.mark.parametrize('extra', [
+    'GatewayTurnPersistenceMixin = object\n',
+    'from other import GatewayTurnPersistenceMixin\n',
+    'GatewayTurnPersistenceMixin._hmwa_deliver_turn_response = other\n',
+])
+def test_inherited_persistence_rebinding_refused(persistence_hermes, extra):
+    path = persistence_hermes / 'gateway/run_turn.py'
+    path.write_text(path.read_text() + '\n' + extra)
+    assert not detect_hermes(persistence_hermes).supported
+
+
+def test_inherited_persistence_earlier_mro_shadow_refused(persistence_hermes):
+    root = persistence_hermes
+    path = root / 'gateway/run_turn.py'
+    path.write_text('from gateway.run_turn_prepare import GatewayTurnPrepareMixin\n'
+                    'from gateway.run_turn_hygiene import GatewayTurnHygieneMixin\n'
+                    + path.read_text().replace('GatewayTurnMixin(GatewayTurnPersistenceMixin)',
+                      'GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin)'))
+    prepare = root / 'gateway/run_turn_prepare.py'
+    prepare.write_text('class GatewayTurnPrepareMixin:\n    pass\n')
+    (root / 'gateway/run_turn_hygiene.py').write_text('class GatewayTurnHygieneMixin:\n    pass\n')
+    assert detect_hermes(root).supported
+    prepare.write_text('class GatewayTurnPrepareMixin:\n    async def _hmwa_deliver_turn_response(self):\n        pass\n')
+    assert not detect_hermes(root).supported
+
+
+def test_v4_owned_target_extension_requires_explicit_upgrade_and_restores(hermes):
+    decomposed.install(detect_hermes(hermes))
+    target = hermes / 'gateway/run_turn.py'
+    target.write_text(patcher.remove_patch(target.read_text()))
+    extract_persistence(hermes)
+    expected = {name: decomposed_ownership._remove_target(name, raw) for name, raw in sources(hermes).items()}
+    assert recovery.plan_recovery(detect_hermes(hermes)).state == 'stale_unpatched'
+    with pytest.raises(ValueError, match='accept-hermes-upgrade'):
+        decomposed.install(detect_hermes(hermes))
+    decomposed.install(detect_hermes(hermes), accept_hermes_upgrade=True)
+    assert recovery.plan_recovery(detect_hermes(hermes)).state == 'installed'
+    decomposed.restore(detect_hermes(hermes))
+    assert sources(hermes) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('accepted', [True, False, 'error'])
+async def test_inherited_completion_executes_after_post_turn_with_original_timing(persistence_hermes, monkeypatch, accepted):
+    import ast
+    events = []
+    async def post_turn(*args):
+        events.append('agent:end')
+    async def completed(payload, *, event_name):
+        events.append((event_name, payload['answer'], payload['duration']))
+        if accepted == 'error':
+            raise OSError('fixture sidecar unavailable')
+        return accepted
+    monkeypatch.setattr(hook_runtime, 'emit_from_hermes_locals', lambda *a, **k: False)
+    monkeypatch.setattr(hook_runtime, 'can_stage_exact_base_completion', lambda payload: False)
+    monkeypatch.setattr(hook_runtime, 'build_event', lambda *a, **k: {'data': {}})
+    monkeypatch.setattr(hook_runtime, 'emit_from_hermes_locals_async', completed)
+    original = sources(persistence_hermes)
+    rendered = decomposed_ownership.render(original)
+    namespace = {}
+    exec(rendered['gateway/run_turn_persistence.py'], namespace)
+    tree = ast.parse(rendered['gateway/run_turn.py'])
+    tree.body = [node for node in tree.body if not isinstance(node, ast.ImportFrom)]
+    exec(compile(tree, 'inherited-handler', 'exec'), namespace)
+    runner = namespace['GatewayTurnMixin']()
+    runner.hooks = SimpleNamespace(emit=post_turn)
+    source = SimpleNamespace(platform='feishu')
+    event = SimpleNamespace(source=source, message_id='fixture-message', reply_to_message_id='fixture-parent')
+    assert await runner._handle_message_with_agent(event, source, 'fixture-session', 1) == (None if accepted is True else 'answer')
+    assert events == ['agent:end', ('message.completed', 'answer', 1.25)]

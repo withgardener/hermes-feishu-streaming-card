@@ -116,5 +116,49 @@
       "hermes_cli/__init__.py": "6a4ab05b8621ec1cd66a5abbe30fa32ed5bddddea95903036da01f0af1af94ce",
       "gateway/authz_mixin.py": "3eb8d398b8b2848cd5b20cca448791fc375e5961c7c42450e795931cd3c6a5c1"
     }
+  },
+  "issue428_297552": {
+    "commit": "297552a9d646119871391d202509822cd86330df",
+    "source": "https://github.com/NousResearch/hermes-agent",
+    "version": "unknown",
+    "decomposed": true,
+    "sha256": {
+      "gateway/run.py": "b06201243d8750ee5b2391826f90d4f2a9d98100701fba0b53f358141c6ce8f9",
+      "gateway/run_turn.py": "3855ac88e923d798b6c6e10dc1e59959a2102fcf4c1bf29625ea452f0abacc72",
+      "gateway/run_turn_persistence.py": "617527f602d640d3ef51c1a510d9f9cb72d81c389dd5a446bf1b64d9761fc8ad",
+      "gateway/run_turn_prepare.py": "fc988f5d1f903cd58f7bf99113d03332addb7be2dd9c985e498152dc3d13dd1d",
+      "gateway/run_turn_hygiene.py": "d62ce3a9295d1f77e8a170862be2a85f873d2229779c18847044675b0b70f8c7",
+      "gateway/run_turn_runner.py": "b0b5ea1f583a350695108c47f3f8a2c7201700d8a2dde1e56e0a73858979802c",
+      "gateway/run_inbound.py": "128542421478a3db945030f2e677d51146bd3bfd5a951e6c9d228f0fac175a6a",
+      "gateway/run_busy.py": "5bd1fcf4a6f1a397fcd103f9d747289a3498fab08f6987c71fb0eaa7eda4bd1b",
+      "gateway/run_startup.py": "c4a7b2e2ee51af0e67c2e9c9923b9c9e595d72e914b94173c236c27a49ac9458",
+      "gateway/run_notifications.py": "a6d6790cea3dae1fba2c352d03edd30a6fb04bd2891a3da4a331dff83b06e2c1",
+      "cron/scheduler.py": "d72052adb3fd3944886e75066267fd6c6cdb4c8ece68e2aa20145cfcb564fffd",
+      "cron/scheduler_delivery.py": "98ef294e8af8dbcac9ed165480fc880e2736ce5e3b4ff2834e9788439caec91a",
+      "gateway/platforms/base.py": "ba558db13e29bd29b7b7ecb7e39c2830972104839f9fa6798ace32c722a04525",
+      "hermes_cli/__init__.py": "6a4ab05b8621ec1cd66a5abbe30fa32ed5bddddea95903036da01f0af1af94ce"
+    }
+  },
+  "issue428_7bda2a": {
+    "commit": "7bda2a3368024f7ae1c70cef16583e7c2c891674",
+    "source": "https://github.com/NousResearch/hermes-agent",
+    "version": "unknown",
+    "decomposed": true,
+    "sha256": {
+      "gateway/run.py": "b06201243d8750ee5b2391826f90d4f2a9d98100701fba0b53f358141c6ce8f9",
+      "gateway/run_turn.py": "3855ac88e923d798b6c6e10dc1e59959a2102fcf4c1bf29625ea452f0abacc72",
+      "gateway/run_turn_persistence.py": "617527f602d640d3ef51c1a510d9f9cb72d81c389dd5a446bf1b64d9761fc8ad",
+      "gateway/run_turn_prepare.py": "f2e38953246292894771386eb813035b284af51b45d3dcda1d0bf21d916ca768",
+      "gateway/run_turn_hygiene.py": "d62ce3a9295d1f77e8a170862be2a85f873d2229779c18847044675b0b70f8c7",
+      "gateway/run_turn_runner.py": "efc702798fcb827b77ad485c7559643d5ecf407b06b5f115c8e3047752054c8a",
+      "gateway/run_inbound.py": "e921d8832e60f00690aea81c8bfdf1ffb332b21579778414c6679214b10ff358",
+      "gateway/run_busy.py": "5bd1fcf4a6f1a397fcd103f9d747289a3498fab08f6987c71fb0eaa7eda4bd1b",
+      "gateway/run_startup.py": "c4a7b2e2ee51af0e67c2e9c9923b9c9e595d72e914b94173c236c27a49ac9458",
+      "gateway/run_notifications.py": "8e8055cff254be34b14f34b89a86c3ac437eaef1886b9f68b0bb9661d724b3fd",
+      "cron/scheduler.py": "d72052adb3fd3944886e75066267fd6c6cdb4c8ece68e2aa20145cfcb564fffd",
+      "cron/scheduler_delivery.py": "98ef294e8af8dbcac9ed165480fc880e2736ce5e3b4ff2834e9788439caec91a",
+      "gateway/platforms/base.py": "ba558db13e29bd29b7b7ecb7e39c2830972104839f9fa6798ace32c722a04525",
+      "hermes_cli/__init__.py": "6a4ab05b8621ec1cd66a5abbe30fa32ed5bddddea95903036da01f0af1af94ce"
+    }
   }
 }

@@ -906,7 +906,7 @@ def _detect_layout_capabilities(sources, cron_contents, cron_target):
         try:
             clean = patcher.remove_patch(content)
             tree = ast.parse(clean)
-            rendered = patcher.apply_gateway_fragment(clean, target)
+            rendered = patcher.apply_gateway_fragment(clean, target, completion_sources=sources)
             for name, marker in _LAYOUT_MARKERS.items():
                 if marker in rendered:
                     locations[name].append(target)
@@ -921,7 +921,7 @@ def _detect_layout_capabilities(sources, cron_contents, cron_target):
                    for node in ast.walk(tree)):
                 locations["attachment_delivery"].append(target)
             handler = patcher._find_handler_node(tree)
-            if handler is not None and patcher._find_decomposed_completion_node(tree) is None:
+            if handler is not None and patcher._find_decomposed_completion_node(tree) is None and patcher._split_completion_node(sources, target) is None:
                 errors.append(f"{target}: decomposed completion/agent:end contract missing")
         except (ValueError, SyntaxError) as exc:
             errors.append(f"{target}: unsafe anchors or ownership ({exc})")

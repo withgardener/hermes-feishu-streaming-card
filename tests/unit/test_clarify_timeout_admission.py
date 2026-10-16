@@ -3,6 +3,7 @@ import ast
 import asyncio
 import copy
 import inspect
+import time
 
 import pytest
 
@@ -18,9 +19,39 @@ from tests.unit.test_clarify_timeout_status import (
 )
 
 
+HTTP_TRANSPORT_TIMEOUT_SECONDS = 0.8
+HTTP_CLARIFY_TIMEOUT_SECONDS = 1.0
+
+
+def _real_http_contract(function):
+    """Share the I/O substitutions and budget between both extracted paths."""
+    assert HTTP_CLARIFY_TIMEOUT_SECONDS > HTTP_TRANSPORT_TIMEOUT_SECONDS
+    body = []
+    removed = 0
+    for node in function.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+            and t.value.id == "runtime" and t.attr in {"_post", "_runtime_interaction_listener"}
+            for t in node.targets
+        ):
+            removed += 1
+        else:
+            body.append(node)
+    assert removed == 2
+    function.body = body
+    replaced = 0
+    for node in ast.walk(function):
+        if isinstance(node, ast.Constant) and type(node.value) is float and node.value == 0.04:
+            node.value = HTTP_CLARIFY_TIMEOUT_SECONDS
+            replaced += 1
+    assert replaced == 1
+    return function
+
+
 @pytest.mark.parametrize("specialized", [False, True], ids=["generic", "specialized"])
+@pytest.mark.parametrize("admission_elapsed", [0.0, 0.08], ids=["immediate", "modeled-80ms"])
 async def test_original_timeout_contract_with_actual_signed_sidecar_admission(
-    official_clarify, dispatcher, monkeypatch, tmp_path, specialized
+    official_clarify, dispatcher, monkeypatch, tmp_path, specialized, admission_elapsed
 ):
     monkeypatch.setenv("HERMES_FEISHU_CARD_STATE_DIR", str(tmp_path / "state"))
     client = TestClient(TestServer(create_app(
@@ -29,22 +60,29 @@ async def test_original_timeout_contract_with_actual_signed_sidecar_admission(
     )))
     await client.start_server()
     transport = runtime_module.SignedEventTransport(
-        event_url=str(client.make_url("/events")), timeout_seconds=0.8,
+        event_url=str(client.make_url("/events")), timeout_seconds=HTTP_TRANSPORT_TIMEOUT_SECONDS,
         secret_reader=lambda: TRANSPORT_ROOT_SECRET,
     )
     receipts = []
+    observed_budgets = []
     runtimes = []
 
     def active():
         posted = []
+        admission_offset = [0.0]
 
         def post(payload, timeout):
             posted.append(copy.deepcopy(payload))
             receipt = transport(payload, timeout)
             receipts.append((payload["event"], receipt))
+            if payload["event"] == "interaction.requested":
+                observed_budgets.append(payload["data"]["timeout_seconds"])
+                # Model admission overhead without sleeping or replacing the
+                # original Hermes wait's real monotonic deadline.
+                admission_offset[0] += admission_elapsed
             return receipt
 
-        runtime = runtime_module.PluginRuntime(post=post)
+        runtime = runtime_module.PluginRuntime(post=post, now=lambda: time.time() + admission_offset[0])
         runtimes.append(runtime)
         assert runtime.bind_ingress_from_values(
             "default", "fallback_default", "synthetic-session", "synthetic-gateway",
@@ -66,24 +104,9 @@ async def test_original_timeout_contract_with_actual_signed_sidecar_admission(
     function = tree.body[0]
     assert isinstance(function, ast.FunctionDef)
     function.name = "exercise"
-    replacements = 0
-    body = []
-    for node in function.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
-            and t.value.id == "runtime" and t.attr in {"_post", "_runtime_interaction_listener"}
-            for t in node.targets
-        ):
-            replacements += 1
-            continue
-        body.append(node)
-    assert replacements == 2
-    function.body = body
-    # Budget retains the same real deadline behavior, but leaves loopback create
-    # enough time; no production config or waiter algorithm is changed.
-    for node in ast.walk(function):
-        if isinstance(node, ast.Constant) and type(node.value) is float and node.value == 0.04:
-            node.value = 0.25
+    # The real signed HTTP contract has a transport budget plus scheduling
+    # margin. Pure waiter contracts retain their original 40ms deadline.
+    _real_http_contract(function)
     namespace = dict(original_contract.__globals__, active=active)
     exec(compile(ast.fix_missing_locations(tree), "<prior-contract-real-http-admission>", "exec"), namespace)
     try:
@@ -96,6 +119,7 @@ async def test_original_timeout_contract_with_actual_signed_sidecar_admission(
             await asyncio.to_thread(namespace["exercise"], official_clarify, dispatcher, monkeypatch, tmp_path)
         admissions = [r for event, r in receipts if event == "interaction.requested"]
         assert len(admissions) == 1
+        assert observed_budgets == [HTTP_CLARIFY_TIMEOUT_SECONDS]
         assert admissions[0] == {
             "ok": True, "applied": True,
             "delivery": {"outcome": "delivered"}, "runtime_admission": True,
@@ -181,11 +205,7 @@ def _specialized_contract(
         if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Name) and node.test.left.id == "bound":
             node.test.comparators = [ast.parse('[("", "", "synthetic-gateway")]', mode="eval").body]
     if active_override is not None:
-        tree.body[0].body = [node for node in tree.body[0].body if not (
-            isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
-                and t.value.id == "runtime" and t.attr in {"_post", "_runtime_interaction_listener"}
-                for t in node.targets))]
+        _real_http_contract(tree.body[0])
     namespace = dict(original_contract.__globals__, execute_dispatch=specialized_dispatch)
     if active_override is not None:
         namespace["active"] = active_override
@@ -202,6 +222,33 @@ def test_actual_specialized_clarify_dispatch_cannot_depend_on_generic_approval_c
 from tests.unit.test_clarify_timeout_status import (
     admitted_clarify as admitted_clarify, approval_scope,
 )
+
+
+@pytest.mark.parametrize("ack_elapsed, expected", [(0.08, True), (1.01, False)])
+def test_admission_ack_must_still_precede_descriptor_deadline(
+    admitted_clarify, monkeypatch, ack_elapsed, expected,
+):
+    runtime, _posted, entry, identity, _clock = admitted_clarify
+    runtime._patch_interactions.clear()
+    assert runtime.register_patch_interaction("clarify", *identity)
+    clock = [time.time()]
+    started = clock[0]
+    monkeypatch.setattr(runtime, "_now", lambda: clock[0])
+    descriptors = []
+    def acknowledged(payload, _timeout):
+        descriptors.append(payload["data"]["_hfc_runtime_admission"])
+        clock[0] += ack_elapsed
+        return {"ok": True, "applied": True,
+                "delivery": {"outcome": "delivered"}, "runtime_admission": True}
+    runtime._post = acknowledged
+    assert runtime.admit_patch_interaction(
+        "clarify", *identity, lambda _choice: True,
+        {"prompt": "synthetic question", "description": "", "allow_custom_input": True,
+         "multi_select": False, "timeout_seconds": HTTP_CLARIFY_TIMEOUT_SECONDS,
+         "options": [{"label": "A", "value": "A", "style": "default"}]},
+    ) is expected
+    assert len(descriptors) == 1
+    assert descriptors[0]["expires_at"] == started + HTTP_CLARIFY_TIMEOUT_SECONDS
 
 
 @pytest.fixture

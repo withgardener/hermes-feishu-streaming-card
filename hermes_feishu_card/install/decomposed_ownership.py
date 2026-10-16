@@ -68,6 +68,7 @@ def _fingerprint(snapshot: Mapping[str, bytes | None]) -> str:
 
 def render(sources: Mapping[str, bytes], strategy: str = "gateway_run_013_plus") -> dict[str, bytes]:
     rendered = {}
+    completion_sources = {name: raw.decode("utf-8") for name, raw in sources.items()}
     for target, raw in sources.items():
         text = raw.decode("utf-8")
         if target == "gateway/platforms/base.py":
@@ -77,7 +78,8 @@ def render(sources: Mapping[str, bytes], strategy: str = "gateway_run_013_plus")
             patched = patcher.apply_cron_patch(text)
             restored = patcher.remove_cron_patch(patched)
         else:
-            patched = patcher.apply_gateway_fragment(text, target, strategy=strategy)
+            patched = patcher.apply_gateway_fragment(text, target, strategy=strategy,
+                                                      completion_sources=completion_sources)
             restored = patcher.remove_patch(patched)
         compile(patched, target, "exec")
         if restored != text:
@@ -221,8 +223,14 @@ def _inspect(root: Path, *, render_hooks: bool = True) -> tuple[dict[str, bytes 
         originals = _legacy_upgrade_sources(snapshot, sources, manifest)
         return snapshot, originals, render(originals) if render_hooks else None, "stale_unpatched"
     validate_manifest(manifest)
-    if set(manifest["targets"]) != set(sources):
+    owned_targets = set(manifest["targets"])
+    added = set(sources) - owned_targets
+    extension_targets = {"gateway/run_turn_persistence.py", "gateway/run_turn_prepare.py",
+                         "gateway/run_turn_hygiene.py"}
+    if owned_targets - set(sources) or not added.issubset(extension_targets):
         raise ValueError("decomposed source target set changed")
+    if any(b"HERMES_FEISHU_CARD_" in sources[name] for name in added):
+        raise ValueError("new decomposed source has unowned hooks")
     originals = {}
     for target, row in manifest["targets"].items():
         backup = snapshot[target + BACKUP_SUFFIX]
@@ -234,9 +242,11 @@ def _inspect(root: Path, *, render_hooks: bool = True) -> tuple[dict[str, bytes 
     if any(snapshot[name + BACKUP_SUFFIX] is not None for name in SOURCE_TARGETS if name not in originals):
         raise ValueError("unowned decomposed backup exists")
     clean_targets = []
-    replacements = {}
+    replacements = {name: sources[name] for name in added}
     reapplied = False
     for target, raw in sources.items():
+        if target in added:
+            continue
         row = manifest["targets"][target]
         if sha256(raw).hexdigest() == row["patched_sha256"]:
             # The manifest binds the entire installed file to its verified

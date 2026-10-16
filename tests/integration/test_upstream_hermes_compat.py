@@ -21,7 +21,7 @@ SOURCES = json.loads(
 )
 
 
-@pytest.mark.parametrize("baseline", ["stable", "main", "production", "historical", "image", "extracted", "latest_stable", "latest_main"])
+@pytest.mark.parametrize("baseline", ["stable", "main", "production", "historical", "image", "extracted", "latest_stable", "latest_main", "issue428_297552", "issue428_7bda2a"])
 def test_pinned_upstream_install_repeat_doctor_restore(baseline, tmp_path, monkeypatch):
     configured = os.environ.get(f"HFC_UPSTREAM_{baseline.upper()}_ROOT")
     if not configured:
@@ -210,3 +210,103 @@ async def test_current_upstream_generated_ledger_executes_in_order(
     result=await namespace['send_final_ledgered'](adapter,event,'fixture-session','FINAL',{'thread_id':'fixture-thread'},reply_to='fixture-anchor')
     assert result==(outcome,adapter)
     assert calls==['record']+(['release'] if obligation_id else [])+['hook','send']+['clock']+(['finalize'] if obligation_id else [])
+
+
+@pytest.mark.parametrize('baseline', ['issue428_297552', 'issue428_7bda2a'])
+def test_persistence_revision_approval_uses_original_queue_once(baseline, tmp_path):
+    """Execute patched upstream methods and the real upstream queue/controls."""
+    import subprocess
+    import sys
+    from hermes_feishu_card.install import patcher
+    configured = os.environ.get(f'HFC_UPSTREAM_{baseline.upper()}_ROOT')
+    if not configured:
+        pytest.skip('pinned persistence revision not supplied')
+    root = Path(configured)
+    raw = (root / 'gateway/run_turn_runner.py').read_bytes()
+    assert sha256(raw).hexdigest() == SOURCES[baseline]['sha256']['gateway/run_turn_runner.py']
+    patched = patcher.apply_gateway_fragment(raw.decode(), 'gateway/run_turn_runner.py')
+    script = r'''
+import ast, logging, sys, threading, types
+from pathlib import Path
+from types import SimpleNamespace as N
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+from hermes_feishu_card import hook_runtime
+from tools import approval
+from tools.approval_gateway_wait import _await_gateway_decision
+from gateway.session_pending_controls import PendingControls
+from gateway.session_contract import SessionRef
+from hermes_state_runtime import RuntimeStoreError
+# Native-only presentation dependencies are inert; the original canonical queue,
+# authority generation checks, registration and controls are all real source.
+run = types.ModuleType('gateway.run')
+for name in ('_approval_send_outcome','_format_exec_approval_fallback','_interim_metadata','_redact_approval_command'):
+    setattr(run, name, lambda value: value)
+sys.modules['gateway.run'] = run
+settle = types.ModuleType('gateway.run_turn_runner_approval_settle')
+settle.register_timeout_notice = lambda *a, **k: None
+sys.modules[settle.__name__] = settle
+viewer = types.ModuleType('gateway.local_viewer_events')
+viewer.prompt_timeout_s = lambda *a: 30
+sys.modules[viewer.__name__] = viewer
+import gateway
+gateway.local_viewer_events = viewer
+source = Path(sys.argv[3]).read_text()
+tree = ast.parse(source)
+methods = [n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef)
+           and n.name in {'_approval_notify_sync','_render_approval_sync'}]
+namespace = {'logger': logging.getLogger('hfc-test')}
+module = ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*methods],type_ignores=[])
+exec(compile(ast.fix_missing_locations(module), 'actual-patched-turn-runner', 'exec'), namespace)
+Runner = type('Runner', (), {n.name: namespace[n.name] for n in methods})
+authority_source = ast.parse((Path(sys.argv[2])/'gateway/session_authority.py').read_text())
+auth_methods = [n for n in ast.walk(authority_source) if isinstance(n, ast.FunctionDef)
+                and n.name in {'check_approval_generation','register_approval'}]
+auth_ns = {'SessionRef':SessionRef,'RuntimeStoreError':RuntimeStoreError}
+exec(compile(ast.Module(body=auth_methods,type_ignores=[]),'actual-authority-controls','exec'),auth_ns)
+Authority=type('Authority',(),{n.name:auth_ns[n.name] for n in auth_methods})
+events = N(lock=threading.RLock(), publish=lambda *a,**kw: True)
+controls = PendingControls(events)
+authority=Authority();authority.profile_id='fixture';authority._handle=lambda ref: handle
+authority.sessions={'session':N(event_stream=events,controls=controls)}
+handle=N(execution_generation=1, execution_state='running')
+runner=Runner();runner._approval_owner=(authority,'session',1)
+runner._ctx=N(source=N(platform='feishu'), session_key='route', event_message_id='message',
+              _loop_for_step=None,_status_chat_id='chat',_run_still_current=lambda: True,
+              _status_adapter=None)
+seen=[]
+def choose(locals_, data, **kwargs):
+    assert locals_['_run_still_current']()
+    seen.append(data['request_id'])
+    return 'once'
+hook_runtime.request_approval_choice_from_hermes_locals=choose
+result=_await_gateway_decision('route',runner._approval_notify_sync,{'command':'fixture'})
+assert result['resolved'] and result['choice']=='once'
+assert len(seen)==1 and approval.list_gateway_approvals('route')==[]
+assert controls.snapshot('session',1)==()
+assert approval.resolve_gateway_approval('route','once',request_id=seen[0])==0
+assert controls.respond('session',1,seen[0],{'choice':'once'})['status']=='already_resolved'
+# A generation changes while the user reads the card. The second guard prevents
+# authorization; the original wait's notify-failure path retires the queue entry.
+def changed(locals_, data, **kwargs):
+    handle.execution_generation=2
+    return 'once'
+hook_runtime.request_approval_choice_from_hermes_locals=changed
+result=_await_gateway_decision('route',runner._approval_notify_sync,{'command':'fixture'})
+assert not result['resolved'] and result.get('notify_failed')
+assert approval.list_gateway_approvals('route')==[]
+assert controls.snapshot('session',2)==()
+print('original queue resolved once; stale generation refused; controls settled')
+'''
+    patched_path = tmp_path / 'patched_runner.py'
+    patched_path.write_text(patched)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(('HERMES_', 'HFC_', 'FEISHU_', 'LARK_'))}
+    home = tmp_path / 'home'
+    home.mkdir()
+    env.update(HOME=str(home), HERMES_HOME=str(home), HFC_STATE_DIR=str(tmp_path / 'state'))
+    result = subprocess.run([sys.executable, '-I', '-c', script,
+                             str(Path(__file__).parents[2]), str(root), str(patched_path)],
+                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert 'original queue resolved once' in result.stdout

@@ -152,6 +152,19 @@ def test_reusable_ci_checks_out_requested_ref_in_every_job():
         f".upstream/{baseline}": evidence["commit"]
         for baseline, evidence in sources.items()
     }
+    steps = workflow["jobs"]["upstream-hermes-compat"]["steps"]
+    source_step = next(step for step in steps if "test_upstream_hermes_compat.py" in step.get("run", ""))
+    for baseline in sources:
+        assert source_step["env"][f"HFC_UPSTREAM_{baseline.upper()}_ROOT"] == (
+            "${{ github.workspace }}/.upstream/" + baseline
+        )
+    before_source = "\n".join(step.get("run", "") for step in steps[:steps.index(source_step)])
+    assert "ruamel.yaml" in before_source
+    pm_step = next(step for step in steps if "test_pm_generation.py" in step.get("run", ""))
+    assert pm_step["env"]["HFC_UPSTREAM_PM_ROOT"] == "${{ github.workspace }}/.upstream/issue428_7bda2a"
+    preparation = "\n".join(step.get("run", "") for step in steps[:steps.index(pm_step)])
+    assert 'HFC_TEST_WHEEL=' in preparation
+    assert "pip wheel --no-deps --wheel-dir" in preparation
 
 
 def test_official_actions_are_sha_pinned_to_node24_capable_releases():

@@ -2,6 +2,12 @@
 
 架构重构、体验升级、迁移和验收统一跟踪于[完整执行计划](docs/plans/2026-10-13-refactor-upgrade.md)。实现与验收按计划逐项登记；发行范围和验证限制以对应发行说明为准。
 
+## V5.0.1
+
+- #428：验证 inherited persistence completion 与审批 renderer，保留原 handle、代次检查和逐字 restore。
+- #431：通过官方 PM admission 持久登记精确 HFC wheel，覆盖真实环境换代与受控回滚。
+- 版本、安装默认值和双语发行说明同步；跨平台 CI、精确 merge/tag 和公开安装按发布门禁验证。
+
 ## V5.0.0
 
 - 任务分区阅读、续答历史折叠及经过身份校验的导航。

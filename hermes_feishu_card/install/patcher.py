@@ -270,10 +270,12 @@ def _apply_turn_callbacks(content: str, *, strategy: str) -> str:
     content = _apply_clarify_patch(content)
     content = _apply_callback_patch(
         content,
-        callback_name="_approval_notify_sync",
+        callback_name=_approval_callback_name(content),
         begin_marker=APPROVAL_PATCH_BEGIN,
         end_marker=APPROVAL_PATCH_END,
-        renderer=_render_approval_hook_block,
+        renderer=(_render_generation_approval_hook_block
+                  if _approval_callback_name(content) == "_render_approval_sync"
+                  else _render_approval_hook_block),
         required_outer_names=(
             "source",
             "event_message_id",
@@ -419,10 +421,13 @@ def _apply_start_patch(content: str, *, strategy: str) -> str:
     return "".join(lines[:insert_at] + hook + lines[insert_at:])
 
 
-def _apply_complete_patch(content: str, *, strategy: str = "legacy_gateway_run") -> str:
+def _apply_complete_patch(content: str, *, strategy: str = "legacy_gateway_run",
+                          completion_sources=None, target=None) -> str:
+    decomposed_node = (_split_completion_node({**completion_sources, target: content}, target)
+                       if completion_sources is not None else None)
     renderer = (
         _render_decomposed_complete_hook_block
-        if _find_decomposed_completion_node(_parse_content(content)) is not None
+        if decomposed_node is not None or _find_decomposed_completion_node(_parse_content(content)) is not None
         else _render_complete_hook_block_with_reply_anchor
         if strategy == "gateway_run_013_plus"
         else _render_complete_hook_block
@@ -436,7 +441,8 @@ def _apply_complete_patch(content: str, *, strategy: str = "legacy_gateway_run")
         # rendering in one pass.
         stripped = _remove_complete_patch(content)
         if stripped != content:
-            return _apply_complete_patch(stripped, strategy=strategy)
+            return _apply_complete_patch(stripped, strategy=strategy,
+                                         completion_sources=completion_sources, target=target)
         lines = content.splitlines(keepends=True)
         begin_index, end_index = owned_block
         indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
@@ -448,7 +454,7 @@ def _apply_complete_patch(content: str, *, strategy: str = "legacy_gateway_run")
 
     tree = _parse_content(content)
     lines = content.splitlines(keepends=True)
-    completion_location = _find_completion_return_location(tree, lines)
+    completion_location = _find_completion_return_location(tree, lines, decomposed_node)
     if completion_location is None:
         return content
 
@@ -1572,12 +1578,12 @@ def _find_handler_body_location(tree, lines):
     return None
 
 
-def _find_completion_return_location(tree, lines):
-    handler = _find_handler_node(tree)
+def _find_completion_return_location(tree, lines, completion_node=None):
+    handler = completion_node or _find_handler_node(tree)
     if handler is None:
         return None
 
-    decomposed = _find_decomposed_completion_node(tree)
+    decomposed = completion_node or _find_decomposed_completion_node(tree)
     if decomposed is not None:
         handler = decomposed
     already_sent_location = _find_already_sent_early_return_location(handler, lines)
@@ -2337,6 +2343,7 @@ def _find_simple_owned_patch(
     expected = renderer(indent, newline)
     expected_blocks = [expected]
     if renderer is _render_approval_hook_block:
+        expected_blocks.append(_render_turn_context_hook_block(_render_generation_approval_hook_block, indent, newline))
         previous_context = _render_turn_context_hook_block(renderer, indent, newline)
         expected_blocks.append([line for line in previous_context
                                 if not line.strip().startswith('_approval_session_key = ctx.session_key')])
@@ -3312,7 +3319,7 @@ def _render_turn_context_hook_block(renderer, indent: str, newline: str):
             line = line.replace(old, new)
         adapted.append(line)
     adapted.insert(1, f"{indent}_hfc_turn_ctx = ctx{newline}")
-    if renderer is _render_approval_hook_block:
+    if renderer in (_render_approval_hook_block, _render_generation_approval_hook_block):
         adapted.insert(2, f"{indent}_approval_session_key = ctx.session_key or \"\"{newline}")
     return adapted
 
@@ -3682,6 +3689,32 @@ def _render_approval_hook_block(indent: str, newline: str):
         *_render_hook_exception_handler(indent, newline),
         f"{indent}{APPROVAL_PATCH_END}{newline}",
     ]
+
+
+def _render_generation_approval_hook_block(indent: str, newline: str):
+    block = _render_approval_hook_block(indent, newline)
+    inner = _child_indent(indent)
+    deeper = _child_indent(inner)
+    guard = [
+        f"{inner}def _hfc_approval_current():{newline}",
+        f'{deeper}if not getattr(ctx, "_run_still_current")():{newline}',
+        f"{deeper}    return False{newline}",
+        f"{deeper}try:{newline}",
+        f"{deeper}    if self._approval_owner is not None:{newline}",
+        f"{deeper}        _authority, _session, _generation = self._approval_owner{newline}",
+        f"{deeper}        _authority.check_approval_generation(_session, _generation){newline}",
+        f"{deeper}except Exception:{newline}",
+        f"{deeper}    return False{newline}",
+        f"{deeper}return True{newline}",
+    ]
+    block[2:2] = guard
+    block = [line.replace('_run_still_current()', '_hfc_approval_current()')
+             if 'ctx._run_still_current()' not in line else line for line in block]
+    block = [line.replace('if _hfc_approval_choice:',
+                          'if _hfc_approval_choice and _hfc_approval_current():') for line in block]
+    index = next(i for i, line in enumerate(block) if '**locals(),' in line)
+    block.insert(index + 1, f'{deeper}    "_run_still_current": _hfc_approval_current,{newline}')
+    return block
 
 
 def _render_status_hook_block(indent: str, newline: str, *, suppress_owned: bool = True):
@@ -4054,16 +4087,23 @@ DECOMPOSED_LAYOUT_MARKERS = {
 }
 
 
-def apply_gateway_fragment(content: str, target: str, *, strategy="gateway_run_013_plus") -> str:
+def apply_gateway_fragment(content: str, target: str, *, strategy="gateway_run_013_plus",
+                           completion_sources=None) -> str:
     """Render one routed legacy fragment; never infer an integration mode."""
     if target not in ("gateway/run.py", *DECOMPOSED_GATEWAY_TARGETS):
         raise ValueError("unknown Gateway patch target")
     tree = _parse_content(content)
+    split_node = (_split_completion_node({**completion_sources, target: content}, target)
+                  if completion_sources is not None else None)
     if _find_handler_node(tree) is not None:
         content = _apply_start_patch(content, strategy=strategy)
-        content = _apply_complete_patch(content, strategy=strategy)
-        content = _apply_turn_timing_patch(content)
+        if split_node is None:
+            content = _apply_complete_patch(content, strategy=strategy)
+        content = _apply_turn_timing_patch(content, validated_split=split_node is not None)
         content = _apply_stale_interrupted_patch(content)
+    elif split_node is not None:
+        content = _apply_complete_patch(content, strategy=strategy,
+                                        completion_sources=completion_sources, target=target)
     content = _apply_queued_complete_patch(content)
     content = _apply_queued_followup_patch(content)
     content = _apply_redirect_patch(content)
@@ -4086,6 +4126,105 @@ def _find_startup_boot_send(func):
                  and _same_expression(node.value.value.func, "self._await_startup_boot_sends")), None)
 
 
+def _approval_callback_name(content):
+    """The extracted renderer runs only AFTER Hermes' original generation check."""
+    tree = _parse_content(remove_patch(content))
+    runner = _find_turn_runner_node(tree)
+    if runner is None:
+        return "_approval_notify_sync"
+    renderers = [n for n in runner.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_render_approval_sync"]
+    if not renderers:
+        return "_approval_notify_sync"
+    expected = ast.parse('''def _approval_notify_sync(self, approval_data: dict) -> None:
+    if self._approval_owner is not None:
+        authority, session_id, generation = self._approval_owner
+        authority.check_approval_generation(session_id, generation)
+    self._render_approval_sync(approval_data)
+    if self._approval_owner is not None:
+        from gateway import local_viewer_events
+        authority.register_approval(session_id, generation, self._ctx.session_key, approval_data,
+                                    timeout_s=local_viewer_events.prompt_timeout_s(self, "approval"))
+''').body[0]
+    notifiers = [n for n in runner.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_approval_notify_sync"]
+    calls = [n for n in ast.walk(runner) if isinstance(n, ast.Call)
+             and _same_expression(n.func, "register_gateway_notify")]
+    expected_call = ast.parse("register_gateway_notify(session_key, self._approval_notify_sync)").body[0].value
+    if (len(renderers) != 1 or len(notifiers) != 1
+            or ast.dump(notifiers[0]) != ast.dump(expected)
+            or not _binds_turn_context(renderers[0]) or len(calls) != 1
+            or ast.dump(calls[0]) != ast.dump(expected_call)):
+        raise ValueError("extracted approval generation/notify contract changed")
+    return "_render_approval_sync"
+
+
+def _split_completion_node(sources, target):
+    """Resolve the verified inherited owner, never a same-named dead method."""
+    persistence = "gateway/run_turn_persistence.py"
+    if persistence not in sources:
+        return None
+    if target not in {"gateway/run_turn.py", persistence}:
+        return None
+    import copy
+    handler_tree = _parse_content(remove_patch(sources.get("gateway/run_turn.py", "")))
+    peer_tree = _parse_content(remove_patch(sources[persistence]))
+    owners = [node for node in handler_tree.body if isinstance(node, ast.ClassDef)
+              and node.name == "GatewayTurnMixin"]
+    peers = [node for node in peer_tree.body if isinstance(node, ast.ClassDef)
+             and node.name == "GatewayTurnPersistenceMixin"]
+    imports = [node for node in handler_tree.body if isinstance(node, ast.ImportFrom)
+               and node.module == "gateway.run_turn_persistence" and node.level == 0
+               and any(alias.name == "GatewayTurnPersistenceMixin" and alias.asname is None
+                       for alias in node.names)]
+    methods = {"_hmwa_post_turn_hooks", "_hmwa_deliver_turn_response"}
+    if (len(owners) != 1 or len(peers) != 1 or len(imports) != 1
+            or tuple(ast.unparse(base) for base in owners[0].bases) not in {
+                ("GatewayTurnPersistenceMixin",),
+                ("GatewayTurnPrepareMixin", "GatewayTurnHygieneMixin", "GatewayTurnPersistenceMixin")}
+            or any(getattr(node, "name", None) in methods for node in owners[0].body)):
+        raise ValueError("inherited completion ownership contract changed")
+    # Earlier bases must be proven not to shadow persistence. Bind their
+    # imports, class definitions and absence of rebinding, not just their names.
+    for base in owners[0].bases:
+        if not isinstance(base, ast.Name):
+            raise ValueError("inherited completion base is not a direct name")
+        name = base.id
+        module = {"GatewayTurnPrepareMixin": "gateway.run_turn_prepare",
+                  "GatewayTurnHygieneMixin": "gateway.run_turn_hygiene",
+                  "GatewayTurnPersistenceMixin": "gateway.run_turn_persistence"}[name]
+        bindings = [node for node in handler_tree.body if isinstance(node, ast.ImportFrom)
+                    and node.module == module and node.level == 0
+                    and any(alias.name == name and alias.asname is None for alias in node.names)]
+        all_imports = [alias for n in ast.walk(handler_tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+                       for alias in n.names if (alias.asname or alias.name.split('.')[0]) == name]
+        if len(bindings) != 1 or len(all_imports) != 1 or any(
+                isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
+                or isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store) and n.attr in methods
+                for n in ast.walk(handler_tree)):
+            raise ValueError("inherited completion base binding changed")
+        base_tree = _parse_content(remove_patch(sources.get(module.replace(".", "/") + ".py", "")))
+        classes = [n for n in base_tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+        if (len(classes) != 1 or classes[0].bases or classes[0].keywords or classes[0].decorator_list
+                or any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
+                       for n in ast.walk(base_tree))
+                or any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id in methods
+                       or isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store) and n.attr in methods
+                       for n in ast.walk(base_tree))
+                or any(getattr(n, "name", None) in {"__getattribute__", "__getattr__"} for n in classes[0].body)
+                or (name != "GatewayTurnPersistenceMixin" and any(
+                    getattr(n, "name", None) in methods for n in classes[0].body))):
+            raise ValueError("inherited completion earlier base shadow or rebinding")
+    combined = copy.deepcopy(handler_tree)
+    owner = next(node for node in combined.body if isinstance(node, ast.ClassDef)
+                 and node.name == "GatewayTurnMixin")
+    owner.body.extend(node for node in peers[0].body if getattr(node, "name", None) in methods)
+    delivery = _find_decomposed_completion_node(combined)
+    if delivery is None:
+        raise ValueError("inherited completion/agent:end contract missing")
+    return delivery
+
+
 def _find_decomposed_completion_node(tree):
     handler = _find_handler_node(tree)
     owners = [node for node in tree.body if isinstance(node, ast.ClassDef)
@@ -4102,6 +4241,8 @@ def _find_decomposed_completion_node(tree):
         candidates = [node for node in owners[0].body
                       if isinstance(node, ast.AsyncFunctionDef) and node.name == name]
         if len(candidates) != 1:
+            return None
+        if candidates[0].decorator_list:
             return None
         args = candidates[0].args
         if (tuple(arg.arg for arg in (*args.posonlyargs, *args.args)) != parameters
@@ -4199,11 +4340,11 @@ def _apply_stale_interrupted_patch(content):
         indent, _detect_newline(content))
     return "".join(lines)
 
-def _apply_turn_timing_patch(content):
+def _apply_turn_timing_patch(content, *, validated_split=False):
     content = _remove_simple_owned_patch(content, TURN_TIMING_PATCH_BEGIN, TURN_TIMING_PATCH_END,
                                          _render_turn_timing_hook_block, "turn timing patch markers")
     tree = _parse_content(content)
-    if _find_decomposed_completion_node(tree) is None:
+    if not validated_split and _find_decomposed_completion_node(tree) is None:
         return content
     handler = _find_handler_node(tree)
     if "_turn_seconds" not in _function_scope_names(handler):

@@ -21,7 +21,7 @@ Use it when connecting [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 [What’s new in V5](#whats-new-in-v5) · [Upgrade from V4.x](#upgrade-from-v4x-to-v5) · [Install](#quick-install) · [Configure](#configuration) · [Recent releases](#recent-releases) · [User guide](docs/user-guide.en.md) · [Contributors](#contributors)
 
-**V5: follow the task, continue the conversation, keep the complete result.** This page describes v5.0.0; installable versions are listed in [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases). See the [release notes](docs/release-notes-v5.0.0.en.md).
+**V5: follow the task, continue the conversation, keep the complete result.** This page describes v5.0.1; installable versions are listed in [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases). See the [release notes](docs/release-notes-v5.0.1.en.md).
 
 ## What's new in V5
 
@@ -46,6 +46,8 @@ card:
 ```
 
 This combination starts with the process panel collapsed and keeps it available after completion. The `task` preset itself expands the panel by default; the second line explicitly selects collapse. Upgrading does not switch `classic`, `focused` or `detailed` to `task`.
+
+V5.0.1 supports inherited completion and approval-renderer contracts for the Hermes 0.22.x revisions pinned at `297552a9` and `7bda2a33`. PM-managed installs register the exact HFC wheel as a durable dependency for later generations. See the [maintenance guide](docs/wiki/maintenance-guide.md#hermes-022x-与-pm-依赖登记) for ownership, uninstall and validation limits.
 
 ## Why HFC
 
@@ -106,7 +108,7 @@ These are real historical screenshots, not a claim that every detail matches V5.
 **Keep your existing bot.** Reuse the actual Hermes directory, configuration, credentials and profile. Example paths are not substitutes for your split-HOME, Docker or multi-instance layout.
 
 1. Record current HFC/Hermes versions and service managers. Back up configuration, `.env` and installer recovery material. After tasks finish, stop Gateway, Desktop and sidecar through their existing managers.
-2. Pin the installer to `v5.0.0` and supply the same configuration and credentials paths. Run it only after that tag is published. The installer checks the provenance and compatibility of the old installation.
+2. Pin the installer to `v5.0.1` and supply the same configuration and credentials paths. Run it only after that tag is published. The installer checks the provenance and compatibility of the old installation.
 3. If diagnostics require restoring old hooks first, use the official `restore` command they provide, then reinstall. Stop on unknown source drift; never edit installed `gateway/run.py` or delete manifests/backups to bypass checks.
 4. Opt into the task layout with the two fields above if desired. Keep credentials, routing, native-table settings and other reading preferences from your existing configuration.
 5. Restore the original service managers and restart Gateway/Desktop as directed. Check `status`, `doctor --explain` and `card-config --running`, then send a real message to verify the card and footer.
@@ -117,7 +119,7 @@ macOS / Linux example—replace these paths with those used by your current inst
 export HERMES_DIR="$HOME/.hermes/hermes-agent"
 export HFC_CONFIG="$HOME/.hermes/config.yaml"
 export HFC_ENV_FILE="$HOME/.hermes/.env"
-curl -fsSL https://raw.githubusercontent.com/baileyh8/hermes-feishu-streaming-card/v5.0.0/install.sh | bash -s -- --version v5.0.0 --config "$HFC_CONFIG" --env-file "$HFC_ENV_FILE"
+curl -fsSL https://raw.githubusercontent.com/baileyh8/hermes-feishu-streaming-card/v5.0.1/install.sh | bash -s -- --version v5.0.1 --config "$HFC_CONFIG" --env-file "$HFC_ENV_FILE"
 ```
 
 See the **[V4.x → V5 upgrade guide](docs/upgrade-v4-to-v5.en.md)** for Windows, Docker, split HOME, verification and rollback. Updating HFC is separate from updating Hermes; Feishu `/update` is not the plugin-version upgrade command.
@@ -153,7 +155,7 @@ Start or restart Hermes Gateway as directed by setup, then message the bot and c
 - **Docker:** inside an existing Hermes container, run the repository's installer:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v5.0.0
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v5.0.1
 bash install-docker.sh
 ```
 
@@ -282,6 +284,7 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 
 | Version | Highlights |
 |---|---|
+| [v5.0.1](docs/release-notes-v5.0.1.en.md) | Hermes 0.22.x completion/approval compatibility and persistent PM dependencies |
 | [v5.0.0](docs/release-notes-v5.0.0.en.md) | Task sections, interaction continuity, turn metrics and installation boundaries |
 | [v4.7.7](docs/release-notes-v4.7.7.en.md) | Opt-in native tables; preserve long cells and indivisible Markdown tables |
 | [v4.7.6](docs/release-notes-v4.7.6.en.md) | Split HOME binding, multi-instance ownership and diagnostics |
@@ -291,11 +294,12 @@ HFC uses a **sidecar-only** architecture: Hermes executes tasks, the installer m
 | [v4.7.2](docs/release-notes-v4.7.2.en.md) | Update shutdown protection, SDK callbacks, integrity recovery and configuration map |
 | [v4.7.1](docs/release-notes-v4.7.1.en.md) | Slash-confirm callback repair and visible confirmation results |
 | [v4.7.0](docs/release-notes-v4.7.0.en.md) | Task layout, offline previews, attributed quota and interaction-state repairs |
-| [v4.6.13](docs/release-notes-v4.6.13.en.md) | Private control-token transport and current Hermes source verification |
 
 See [release history](docs/release-history.en.md) for earlier versions, and [CHANGELOG](CHANGELOG.md) or [GitHub Releases](https://github.com/baileyh8/hermes-feishu-streaming-card/releases) for the full record.
 
 ## Contributors
+
+- V5.0.1: [lanx214](https://github.com/lanx214) reported [#428](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/428) and [#431](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/431); [za8209](https://github.com/za8209) supplied macOS reproduction logs and source analysis in #428. These are issue-evidence credits, separate from code authorship. Earlier code and contributor credits remain intact. Thanks to [Lite-G](https://github.com/Lite-G) for the independent compatibility analysis and proposal in [PR #432](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/432); that PR's code is not included in this release.
 
 - #384: Thanks to [lanx214](https://github.com/lanx214), [Lite-G](https://github.com/Lite-G), and [7360403-coder](https://github.com/7360403-coder) for split-HOME, shared-source and NAS container evidence.
 

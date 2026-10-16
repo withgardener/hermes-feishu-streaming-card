@@ -2,9 +2,9 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-This branch targets `5.0.0`; published availability is determined by the GitHub Release tag and assets. Opt-in native tables preserve oversized cells via Markdown fallback; indivisible Markdown tables retain their full source for the shared payload/handoff gate.
+This branch targets `5.0.1`; published availability is determined by the GitHub Release tag and assets. Opt-in native tables preserve oversized cells via Markdown fallback; indivisible Markdown tables retain their full source for the shared payload/handoff gate.
 
-Full tests, exact-merge CI, assets/checksums and public-tag installation remain release gates. See [release notes](release-notes-v5.0.0.en.md) and the [acceptance record](reviews/2026-10-03-task-cards-acceptance.md). Platform API smoke, real Gateway execution, desktop visuals and Android/iOS acceptance are separate evidence; missing coverage is not a pass.
+Full tests, exact-merge CI, assets/checksums and public-tag installation remain release gates. See [release notes](release-notes-v5.0.1.en.md) and the [acceptance record](reviews/2026-10-03-task-cards-acceptance.md). Platform API smoke, real Gateway execution, desktop visuals and Android/iOS acceptance are separate evidence; missing coverage is not a pass.
 
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.

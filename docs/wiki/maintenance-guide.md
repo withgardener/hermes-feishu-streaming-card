@@ -361,3 +361,20 @@ Hermes 对已启用的插件可只更新 `allow_tool_override: false`，不排�
 交互送达回执不确定时，只发送一次准入 POST，再通过认证的 `GET /interactions/{id}/delivery` 查询完整身份指纹。这个只读端点不更新等待者心跳或过期状态；不可用通用 result poll 替代。指纹仅在 Feishu 送达且原 reservation commit 成功后写入同一个 InteractionState；新建同 ID 对象不得继承证明，检查点不恢复它。查询响应上限 64 KiB，整次查询最多 3 秒，包含响应头和分块读取；不另建常驻线程或后台重试。没有匹配证明时仍走原生回退。
 
 实际 PluginManager 注册清单必须包含 `post_api_request`，与插件真实注册的完整集合严格相等。安装能力验证不得只检查处理函数存在，或从被测常量生成预期集合而漏掉注册接线。历史恢复只识别已知完整 revision 组合，不能任意混搭旧 publish、clarify 和 terminal 模板。
+
+
+## Hermes 0.22.x 与 PM 依赖登记
+
+以下兼容性与依赖登记修复包含在 V5.0.1；发行和真实环境验收边界见[发行说明](../release-notes-v5.0.1.md)。
+
+Issue [#428](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/428) 的两个固定源码修订 `297552a9d646119871391d202509822cd86330df`、`7bda2a3368024f7ae1c70cef16583e7c2c891674` 把 post-turn hooks 和最终响应投递移入 `GatewayTurnPersistenceMixin`。安装器同时核对 handler 的 import/继承关系、MRO 前置 mixin 无遮蔽、调用参数与 `agent:end`；计时仍从原 handler 传入，completion 只写在 persistence owner。缺少来源、重绑定、接点重复或契约漂移均拒绝安装。旧 V4 manifest 增加这组源码目标时，先验证原备份与 ownership，再要求 `--accept-hermes-upgrade`；成功后 restore 恢复新源码的原始字节。
+
+审批 hook 位于 `_render_approval_sync` 的 context binding 后，保留原 `_approval_notify_sync` 的 generation check 和 observer registration。等待期间及解析前再核对原 generation，通过 Hermes 的原 request ID/queue resolver 解析一次。`PendingControls` 仍只是原队列的视图；重复或已撤销的 request 不能批准下一项。原生 fallback 与异常退出仍由 Hermes 处理，不持久化执行 handle。
+
+Issue [#431](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/431) 的故障来自直接 pip 安装只覆盖当前 PM venv。PM 代次从声明重建时，这种临时安装会消失。`install/pm_dependency.py` 现在在所选 Hermes HOME 的 `plugins/hfc-runtime-dependency/` 保存精确普通 wheel、仅含依赖的 virtual `pyproject.toml` 与 `.hfc-owner.json`。它通过官方 `hermes_cli.plugins_admission.admit_plugin_set_change` 登记 `plugins.enabled`，保留其他 enabled/disabled 与配置项；不直接编辑 PM facts 或 lock。该目录无 runtime manifest 和 `register()`，实际 producer 仍是 wheel 的唯一 `hermes_agent.plugins` entry point。`tool.uv.sources` 使用目录内 wheel path，PM 复制 workspace 后继续使用相同包字节。
+
+已经能够 import 同版本也必须完成登记。登记后重新读取 committed venv，并核对 `site-packages`、wheel 来源摘要及每个包资源字节。显式 install spec 不会换成同版本 PyPI 包；wheel 缓存不依赖原下载临时目录。POSIX 路径使用绑定目录描述符的 rename，Windows 沿用显式 lstat/目录身份复检的 portable 安装边界；未知 PM API、明确 disabled、未归属目录、用户修改及不确定文件状态均拒绝覆盖。跨 profile 的共享依赖冲突交给 PM 原 resolver 拒绝，不自动移除另一 profile 的依赖。
+
+普通安装失败会撤回本次新增 selection，并恢复本次替换前的 owned dependency source。PM 是否已提交不能确认时，保留 source 与诊断材料，不把超时当成未安装。`restore` 只恢复 hooks，保留依赖；`uninstall` 在 hooks 恢复后通过同一 admission API 移除 HFC 自己新增的 selection 和未修改的 owned source，不认领用户预先登记的依赖。旧版非 PM 的 pip 安装路径保持独立。
+
+验证分层：离线 fixture 覆盖漂移拒绝、旧布局、V4 扩展迁移及逐字 restore；两个固定 SHA 另跑真实源码安装矩阵和原审批 queue/controls。PM 集成测试在私有 HOME 的最小 project 中执行固定上游的真实 dependency engine，注入现成 uv/Python 仅用于供应工具；A→B 两代均通过独立子进程从普通 wheel 导入，并检查唯一 entry point。portable 分支在本机做故障注入，尚未执行 Windows 主机验收。它没有运行完整 Hermes dependency closure、PM worker transport、生产 updater、实际 Gateway/model 或真实飞书客户端。全量 preflight 仍使用固定 `v2026.8.3` Git fixture；不能用其通过替代上述 pinned 检查。
