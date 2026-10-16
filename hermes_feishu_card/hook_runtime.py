@@ -156,8 +156,31 @@ POLICY_CACHE_TTL_SECONDS = 1.0
 POLICY_CACHE_LIMIT = 1024
 _FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
 _CONTEXT_COMPACTION_STATUS_RE = re.compile(
-    r"\bCompacting\s+context\b",
+    r"\A(?:🗜️ )?Compacting\s+context"
+    r"(?: — (?:summarizing|still summarizing) earlier conversation so I can continue\.\.\.)?\Z",
     re.IGNORECASE,
+)
+_MEMORY_RECALL_STATUS_RE = re.compile(
+    r"\A🧠 [^—\r\n]{1,80} — recalled "
+    r"(?:1 memory|(?:[2-9]|[1-9][0-9]{1,5}) memories|relevant memory)"
+    r"(?:  🧠 [^—\r\n]{1,80} — recalled "
+    r"(?:1 memory|(?:[2-9]|[1-9][0-9]{1,5}) memories|relevant memory))*\Z"
+)
+_ROUTINE_COMPRESSION_STATUS_PATTERNS = (
+    re.compile(r"\A📦 Pre-API compression: ~[0-9,]+ tokens near the context/output limit\. Compacting before the next model call\.\Z"),
+    re.compile(r"\A📦 Preflight compression: ~[0-9,]+ tokens >= [0-9,]+ threshold\. This may take a moment\.\Z"),
+    re.compile(r"\A💤 Resumed after [0-9]+s idle — compacting ~[0-9,]+ tokens before continuing\.\Z"),
+    re.compile(r"\A🗜️ Context too large \(~[0-9,]+ tokens\) — compressing \([0-9]+/[0-9]+\)\.\.\.\Z"),
+    re.compile(r"\A🗜️ Compressed [0-9,]+ → [0-9,]+ messages, retrying\.\.\.\Z"),
+    re.compile(r"\A🗜️ Compressed ~[0-9,]+ → ~[0-9,]+ tokens, retrying\.\.\.\Z"),
+    re.compile(r"\A🗜️ Context reduced to [0-9,]+ tokens \(was [0-9,]+\), retrying\.\.\.\Z"),
+    re.compile(r"\A🗜️ Compressed [0-9,]+ → [0-9,]+ payload bytes, retrying\.\.\.\Z"),
+)
+_COMPACTION_DONE_STATUS_RE = re.compile(
+    r"\A✓ Context compaction complete — continuing turn\.\.\.\Z"
+)
+_ITERATION_BUDGET_STATUS_RE = re.compile(
+    r"\A⚠️ Iteration budget exhausted \((?P<used>[0-9]+)/(?P<limit>[0-9]+)\) — asking model to summarise\Z"
 )
 MEDIA_RE = re.compile(r"MEDIA:([^\s\]]+)")
 LOCAL_FILE_RE = re.compile(
@@ -1888,6 +1911,57 @@ def emit_from_hermes_locals_threadsafe(
         return False
 
 
+def _hfc_classify_status_callback_notice(event_type: Any, message: Any) -> dict[str, Any] | None:
+    """Classify exact Hermes status-callback templates that belong on the current turn card."""
+    if type(event_type) is not str or type(message) is not str:
+        return None
+    if event_type == "lifecycle" and _MEMORY_RECALL_STATUS_RE.fullmatch(message):
+        return {
+            "title": "记忆召回", "level": "info", "notice_kind": "memory-recall",
+            "notice_id": "memory-recall", "notice_terminal": False, "content": message,
+        }
+    compaction_done = event_type == "compacted" and _COMPACTION_DONE_STATUS_RE.fullmatch(message)
+    iteration_budget = bool(event_type == "lifecycle" and _ITERATION_BUDGET_STATUS_RE.fullmatch(message))
+    compaction_started = event_type in {"lifecycle", "context"} and (
+        _CONTEXT_COMPACTION_STATUS_RE.fullmatch(message)
+        or bool(_ITERATION_BUDGET_STATUS_RE.fullmatch(message))
+        or any(pattern.fullmatch(message) for pattern in _ROUTINE_COMPRESSION_STATUS_PATTERNS)
+    )
+    if compaction_done or compaction_started:
+        title = "上下文压缩完成" if compaction_done else "正在压缩上下文"
+        content = (
+            "上下文压缩已完成，正在继续当前任务。"
+            if compaction_done else "正在总结较早的对话，完成后会继续当前任务。"
+        )
+        if iteration_budget:
+            title = "即将生成摘要"
+            content = "已达到本轮迭代上限，正在请求摘要后结束当前任务。"
+        return {
+            "title": title,
+            "level": "info", "notice_kind": "context-compaction",
+            "notice_id": "context-compaction:active", "notice_terminal": bool(compaction_done),
+            "phase": "started", "content": content,
+        }
+    return None
+
+
+def _status_callback_notice_locals(local_vars: dict[str, Any], notice: dict[str, Any]) -> dict[str, Any]:
+    notice_terminal = bool(notice.get("notice_terminal", False))
+    return {
+        **local_vars,
+        "_hfc_notice_title": notice["title"],
+        "_hfc_notice_level": notice["level"],
+        "_hfc_notice_kind": notice["notice_kind"],
+        "_hfc_notice_id": notice["notice_id"],
+        "_hfc_notice_scope": "session",
+        "_hfc_notice_terminal": notice_terminal,
+        "_hfc_notice_phase": notice.get("phase", "started"),
+        "_hfc_notice_create_session": False,
+        "display_status": "in_progress",
+        "content": notice["content"],
+    }
+
+
 def handle_status_from_hermes_locals(
     local_vars: dict[str, Any],
     *,
@@ -1902,35 +1976,35 @@ def handle_status_from_hermes_locals(
             event_type == "lifecycle" and isinstance(message, str) and len(message) <= 1000
             and re.fullmatch(r"❌ (?:API failed|Rate limited) after [1-9][0-9]{0,2} retries — [^\r\n]+", message)
         )
-        # PATCH-016 (compaction card suppressed) was retired on 2026-10-14 at the
-        # user's request (「都改成卡片比较美观」): the compaction status is a card again,
-        # shown as the turn card's 正在压缩上下文 phase instead of an English text line.
-        is_compaction = bool(_CONTEXT_COMPACTION_STATUS_RE.search(str(message or "")))
-        if not provider_failure and not is_compaction:
+        raw_message = message if isinstance(message, str) else ""
+        status_notice = _hfc_classify_status_callback_notice(event_type, raw_message)
+        recall_status = bool(status_notice and status_notice.get("notice_kind") == "memory-recall")
+        is_compaction = bool(status_notice and status_notice.get("notice_kind") == "context-compaction")
+        if not provider_failure and not recall_status and not is_compaction:
             return False
         run_guard = local_vars.get("_run_still_current")
         if callable(run_guard) and not run_guard():
             return False
+        if recall_status:
+            return emit_from_hermes_locals_threadsafe(
+                _status_callback_notice_locals(local_vars, status_notice),
+                event_name="system.notice",
+            )
         event_locals = {
             **local_vars,
-            "_hfc_notice_title": "正在压缩上下文",
-            "_hfc_notice_level": "info",
-            "_hfc_notice_kind": "context-compaction",
-            "_hfc_notice_id": "context-compaction:active",
+            "_hfc_notice_title": status_notice["title"] if status_notice else "模型服务异常",
+            "_hfc_notice_level": status_notice["level"] if status_notice else "warning",
+            "_hfc_notice_kind": status_notice["notice_kind"] if status_notice else "provider-failure",
+            "_hfc_notice_id": status_notice["notice_id"] if status_notice else "provider-failure:terminal",
             "_hfc_notice_scope": "session",
-            "_hfc_notice_phase": "started",
+            "_hfc_notice_phase": status_notice.get("phase", "started") if status_notice else "",
             "_hfc_notice_create_session": True,
-            "display_status": "in_progress",
-            "content": "正在总结较早的对话，完成后会继续当前任务。",
+            "display_status": "in_progress" if status_notice else "completed",
+            "content": status_notice["content"] if status_notice else (
+                "模型服务请求失败，本轮正在结束。错误说明会保留在结果卡中。"
+            ),
         }
         if provider_failure:
-            event_locals.update({
-                "_hfc_notice_title": "模型服务异常",
-                "_hfc_notice_level": "warning",
-                "_hfc_notice_kind": "provider-failure",
-                "_hfc_notice_id": "provider-failure:terminal",
-                "content": "模型服务请求失败，本轮正在结束。错误说明会保留在结果卡中。",
-            })
             return _emit_status_notice_confirmed(event_locals)
         return emit_from_hermes_locals_threadsafe(
             event_locals,
