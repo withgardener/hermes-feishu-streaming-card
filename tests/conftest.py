@@ -22,6 +22,10 @@ _PATCH_007 = (
     "LOCAL PATCH (PATCH-007): token payload also carries prompt/cache fields for the "
     "rolling cache-rate footer (exact-equality token assertion)"
 )
+_PATCH_024 = (
+    "LOCAL PATCH (PATCH-024): known hourglass statuses are rendered as HFC cards, so "
+    "the upstream plain-text adapter recall route does not apply"
+)
 
 INTENTIONAL_LOCAL_BEHAVIOUR = {
     "tests/unit/test_331_adapted.py::test_actual_queued_interruption_block_delivers_metrics_then_next_turn": _PATCH_007,
@@ -59,6 +63,9 @@ INTENTIONAL_LOCAL_BEHAVIOUR = {
     # v5.0.0 (2026-10-15): the legacy_hide=False case asserts the content-area tool_activity_
     # row is rendered; PATCH-012 hides it in every state. Passes on pristine v5.0.0.
     "tests/unit/test_card_preview.py::test_expanded_completed_history_keeps_successful_tools_without_default_body_duplicates[False]": _PATCH_012,
+    # PATCH-024 classifies the hourglass family as HFC cards, not adapter-native text,
+    # so core's text egress helper must not attempt a plain-text recall registration.
+    "tests/unit/test_localized_transient_notices.py::test_actual_adapter_egress_preserves_plain_text_and_result": _PATCH_024,
 }
 
 
