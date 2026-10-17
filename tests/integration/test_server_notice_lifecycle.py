@@ -130,6 +130,46 @@ async def drain():
         await asyncio.sleep(0)
 
 
+@pytest.mark.parametrize("text", [
+    "↪ Redirected current run. I'll adjust using your correction.",
+    "↪ 已重定向当前运行。我会根据你的修正进行调整。",
+    "⏳ Compressing context", "⏳ 正在压缩上下文",
+])
+@pytest.mark.parametrize("profile", ["default", "work"])
+async def test_localized_recall_real_http_keeps_route_and_deduplicates(monkeypatch, text, profile):
+    app, clients = app_with_clients()
+    selected = clients[profile, "alpha"]
+    deleted = asyncio.Event()
+    async def delete_message(message_id):
+        selected.deleted.append(message_id)
+        deleted.set()
+        return True
+    selected.delete_message = delete_message
+    runtime.reset_runtime_state()
+    monkeypatch.delenv("HERMES_FEISHU_CARD_PROFILE_ID", raising=False)
+    async with TestClient(TestServer(app)) as http:
+        monkeypatch.setattr(runtime, "load_runtime_config", lambda: SimpleNamespace(
+            enabled=True, event_url=str(http.make_url("/events")), timeout_seconds=2.0))
+        source = SimpleNamespace(platform="feishu", profile_id=profile, chat_id="oc_fixture", thread_id="topic_fixture")
+        result = SimpleNamespace(success=True, message_id="om_localized_ack")
+        # The adapter egress and busy hook may both observe one confirmed send.
+        # Repeated registration must still create only one deletion task.
+        for _ in range(2):
+            assert await runtime.recall_transient_thread_notice_async(source, text, result)
+        assert len(app[server.EPHEMERAL_RECALL_TASKS_KEY]) == 1
+        assert app[server.METRICS_KEY].ephemeral_recalls_scheduled == 1
+        assert selected.deleted == []
+        # Wake the existing 15s timer only after registration assertions. This
+        # avoids making deduplication depend on HTTP completing within 50ms.
+        next(iter(app[server.EPHEMERAL_RECALL_WAKE_KEY].values()))[1].set()
+        await asyncio.wait_for(deleted.wait(), timeout=2)
+        await drain()
+        assert selected.deleted == ["om_localized_ack"]
+        assert all(not client.deleted for client in clients.values() if client is not selected)
+        assert app[server.METRICS_KEY].ephemeral_recalls_completed == 1
+    runtime.reset_runtime_state()
+
+
 async def test_owned_notice_expires_without_later_chat_activity(monkeypatch):
     monkeypatch.setattr(server, 'OWNED_NOTICE_TTL_SECONDS', .03, raising=False)
     fake=Client();app=server.create_app(fake)

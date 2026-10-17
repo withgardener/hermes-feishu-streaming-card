@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.0.2 — 2026-10-17
+
+- Recall exact known en/zh redirect, interrupt and steer receipts (including active-subagent steering) through the same busy-entry and delay classifier; support the bare simplified-Chinese compression status (#434).
+- Match complete receipts so onboarding and appended guidance remain visible. Preserve queue/demoted-subagent messages, unknown translations and native Working heartbeat edit/cleanup behavior.
+- Thanks to Timeral for the reproduction and source analysis in #434; issue evidence is credited separately from code authorship, with all earlier credits retained.
+
+See [Chinese release notes](docs/release-notes-v5.0.2.md) and [English release notes](docs/release-notes-v5.0.2.en.md) for scope and verification boundaries.
+
 ## v5.0.1 — 2026-10-16
 
 - Support verified inherited completion and approval-renderer seams in the two reported Hermes 0.22.x revisions (#428), retaining strict source checks, original interaction authority and exact restore. Optional split progress/provider capture remains outside this patch.

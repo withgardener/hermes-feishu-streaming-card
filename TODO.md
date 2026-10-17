@@ -2,6 +2,12 @@
 
 架构重构、体验升级、迁移和验收统一跟踪于[完整执行计划](docs/plans/2026-10-13-refactor-upgrade.md)。实现与验收按计划逐项登记；发行范围和验证限制以对应发行说明为准。
 
+## V5.0.2
+
+- #434：已知中英文 busy 完整回执与中文裸压缩提示沿原路由撤回；保留排队、onboarding、未知文案及原生心跳收尾。
+- 修复候选 `74f409e` 已通过 focused 146 项、本地 full 6687 passed / 33 skipped 与 18 项 CI 检查；5.0.2 的精确提交、tag、资产和公开安装继续走发布门禁。
+- 未新增真实飞书、桌面或移动端验收；已核对的子代理排队说明保持留存。
+
 ## V5.0.1
 
 - #428：验证 inherited persistence completion 与审批 renderer，保留原 handle、代次检查和逐字 restore。

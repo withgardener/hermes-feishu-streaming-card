@@ -87,36 +87,23 @@ from .profile_sources import (
     validate_trusted_profile_identity,
 )
 from .status import normalize_display_status
+from .transient_notices import (
+    BUSY_REDIRECT_ACK_PREFIX,
+    BUSY_REDIRECT_ACK_RECALL_SECONDS,
+    BUSY_INTERRUPT_ACK_PREFIX,
+    BUSY_INTERRUPT_ACK_RECALL_SECONDS,
+    BUSY_STEER_ACK_PREFIX,
+    BUSY_STEER_ACK_RECALL_SECONDS,
+    STATUS_NOTICE_PREFIX,
+    STATUS_NOTICE_RECALL_SECONDS,
+    is_transient_busy_ack,
+    transient_notice_recall_seconds,
+)
 from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
-# The busy path's redirect acknowledgement ("↪ Redirected current run. I'll adjust using your
-# correction.") tells the user their correction landed. Once read it is only a stale instruction in
-# the thread, so the sidecar withdraws it this many seconds later. Queue
-# acknowledgements state something the user still needs and are deliberately left alone.
-BUSY_REDIRECT_ACK_PREFIX = "↪ Redirected current run"
-BUSY_REDIRECT_ACK_RECALL_SECONDS = 15.0
-# Interrupt and steer confirmations become stale once the current task accepts the input.
-# Queue acknowledgements and onboarding guidance remain visible.
-BUSY_INTERRUPT_ACK_PREFIX = "⚡ Interrupting current task"
-BUSY_INTERRUPT_ACK_RECALL_SECONDS = 15.0
-BUSY_STEER_ACK_PREFIX = "⏩ Steered into current run"
-BUSY_STEER_ACK_RECALL_SECONDS = 15.0
-# Known status templates stay plain text; an hourglass alone never authorizes recall.
-
-STATUS_NOTICE_PREFIX = "⏳"
-STATUS_NOTICE_RECALL_SECONDS = 15.0
-# (text prefix, seconds to wait before withdrawing) — every transient notice hfc withdraws after the
-# user has had a chance to read it. Content the user still needs (queued acks, provider-
-# failure replies) is deliberately absent: only self-erasing status pings belong here.
-TRANSIENT_THREAD_NOTICES: tuple[tuple[str, float], ...] = (
-    (BUSY_REDIRECT_ACK_PREFIX, BUSY_REDIRECT_ACK_RECALL_SECONDS),
-    (BUSY_INTERRUPT_ACK_PREFIX, BUSY_INTERRUPT_ACK_RECALL_SECONDS),
-    (BUSY_STEER_ACK_PREFIX, BUSY_STEER_ACK_RECALL_SECONDS),
-    (STATUS_NOTICE_PREFIX, STATUS_NOTICE_RECALL_SECONDS),
-)
 DEFAULT_TIMEOUT_SECONDS = 0.8
 INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
 TERMINAL_TIMEOUT_SECONDS = 10.0
@@ -9528,38 +9515,8 @@ async def suppress_task_heartbeat_async(source: Any) -> bool:
 
 
 def _transient_notice_recall_seconds(content: Any) -> Optional[float]:
-    """Seconds to wait before withdrawing this notice, or None when it must stay."""
-    text = str(content or "")
-    if text.startswith(BUSY_INTERRUPT_ACK_PREFIX):
-        return (BUSY_INTERRUPT_ACK_RECALL_SECONDS if re.fullmatch(
-            r"⚡ Interrupting current task(?: \([^\r\n]*\))?\. I'll respond to your message shortly\.", text
-        ) else None)
-    if text.startswith(BUSY_STEER_ACK_PREFIX):
-        steer_patterns = (
-            r"⏩ Steered into current run(?: \([^\r\n]*\))?\. Your message arrives after the next tool call\.",
-            r"⏩ Steered into current run and its active subagent\(s\)(?: \([^\r\n]*\))?\. Your message arrives after their next tool call\.",
-        )
-        return (BUSY_STEER_ACK_RECALL_SECONDS
-                if any(re.fullmatch(pattern, text) for pattern in steer_patterns)
-                else None)
-    # The adapter also sends answers and important queue/error acknowledgements.
-    # An hourglass alone is not evidence that a message is disposable status.
-    if text.startswith(STATUS_NOTICE_PREFIX):
-        # Core edits Working heartbeats in place. A timer would delete the target
-        # and force a fresh send on every later tick; core owns final cleanup.
-        status_patterns = (
-            r"⏳ (?:Compressing context|Waiting for approval|tool execution timed out; retrying)(?:\.\.\.)?",
-            r"⏳ Retrying in \d+(?:\.\d+)?s \(attempt \d+/\d+\)(?:\.\.\.)?",
-            r"⏳ loading [^\r\n]+ into memory — \d+(?:\.\d+)?%[^\r\n]*",
-            r"⏳ waiting on [^\r\n]+ — (?:no stream output for \d+s[^\r\n]*|retrying in \d+s \(attempt \d+/\d+\))",
-        )
-        return (STATUS_NOTICE_RECALL_SECONDS
-                if any(re.fullmatch(pattern, text) for pattern in status_patterns)
-                else None)
-    for prefix, delay in TRANSIENT_THREAD_NOTICES:
-        if text.startswith(prefix):
-            return delay
-    return None
+    """Compatibility entry point for exact known transient notice recognition."""
+    return transient_notice_recall_seconds(content)
 
 
 def _notice_source(candidate: Any) -> Any:
@@ -9571,7 +9528,7 @@ def _notice_source(candidate: Any) -> Any:
 async def recall_transient_thread_notice_async(candidate: Any, content: Any, result: Any) -> bool:
     """Withdraw a transient thread notice once the user has had a chance to read it.
 
-    See ``TRANSIENT_THREAD_NOTICES`` for which notices qualify and why. ``candidate`` is either an
+    See ``transient_notices`` for the exact known templates and exclusions. ``candidate`` is either an
     event carrying ``source`` or a ``SessionSource`` itself (the long-running heartbeat call site has
     only the source). Best-effort throughout: a failed request must never disturb the send that
     already succeeded, so every failure path returns False instead of raising.
@@ -9606,8 +9563,7 @@ async def recall_busy_redirect_ack_async(event: Any, content: Any, result: Any) 
     Keep the historical entry-point name for installed hook compatibility.
     Queue acknowledgements and interrupt/steer onboarding guidance are retained.
     """
-    if not str(content or "").startswith((BUSY_REDIRECT_ACK_PREFIX, BUSY_INTERRUPT_ACK_PREFIX,
-                                        BUSY_STEER_ACK_PREFIX)):
+    if not is_transient_busy_ack(content):
         return False
     return await recall_transient_thread_notice_async(event, content, result)
 
