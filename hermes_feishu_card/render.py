@@ -44,6 +44,7 @@ DEFAULT_FOOTER_FIELDS = (
     "model",
     "input_tokens",
     "output_tokens",
+    "cache_rate",
     "context",
 )
 MAIN_CONTENT_CHUNK_CHARS = 2400
@@ -360,12 +361,10 @@ def _render_card_unchecked(
         and pending_interaction.status == "pending"
         and pending_interaction.kind in {"approval", "clarify"}
     ):
-        prefix = (
-            "待审批："
-            if pending_interaction.kind == "approval"
-            else "待选择："
-        )
-        header_title = f"{prefix}{header_title}"
+        # LOCAL PATCH (PATCH-013): _header_title_with_state() above already
+        # returns the bare "待审批"/"待选择" word for a pending interaction;
+        # do not re-prefix it here (that used to produce "待选择：待选择：<prompt>").
+        pass
     main_role = "notice" if session.delivery_kind == "notice" else "body"
     elements = []
     if pending_approval:
@@ -391,8 +390,19 @@ def _render_card_unchecked(
                 used_roles=used_text_size_roles,
             ),
         )
-    # Keep live progress and pending interaction layouts unchanged. Only the
-    # content tool area is optional; timeline evidence and counts stay intact.
+    # LOCAL PATCH (PATCH-012): user asked to hide the always-visible tool
+    # activity row directly under the answer text (duplicate of the full row
+    # already shown inside the collapsible 思考过程 panel). Keep the panel
+    # itself; only suppress this content-area summary — unconditionally, for
+    # every session status. Upstream v4.6.2 added an opt-in
+    # `hide_completed_tool_activity` flag (default False, completed/failed
+    # only) via #331, and v4.6.4 added a second opt-in
+    # `hide_successful_tool_activity` flag (completed-only); our local patch
+    # already hides this row in ALL states, which is a strict superset of
+    # both upstream flags, so upstream's new conditionals are folded in but
+    # effectively always short-circuited by the unconditional empty list
+    # below. Original upstream call preserved as a comment for easy
+    # restoration.
     hide_terminal_tools = (
         hide_completed_tool_activity and session.status in {"completed", "failed"}
     ) or (hide_successful_tool_activity and session.status == "completed")
@@ -419,21 +429,26 @@ def _render_card_unchecked(
                 else ""
             ),
         )
-    tool_activity_elements = (
-        []
-        if pending_approval
-        else _render_tool_activity_elements(
-            session,
-            text_sizes=text_sizes,
-            used_text_size_roles=used_text_size_roles,
-            display_status=display_status,
-            max_chars=max_tool_result_chars,
-            hide_successful=hide_terminal_tools,
-            task_layout=presentation == "task",
-            details_in_timeline=rendered_tool_ids,
-            observation_only=presentation == "task" and bool(task_presentation(session).observation),
-        )
-    )
+    # LOCAL PATCH (PATCH-012): content-area tool activity row suppressed in every
+    # state (see the comment above `hide_terminal_tools`). v4.7.0 moved this call
+    # after the timeline (it now consumes `rendered_tool_ids`); original upstream
+    # call preserved as a comment for easy restoration.
+    tool_activity_elements: list[Dict[str, Any]] = []
+    # tool_activity_elements = (
+    #     []
+    #     if pending_approval
+    #     else _render_tool_activity_elements(
+    #         session,
+    #         text_sizes=text_sizes,
+    #         used_text_size_roles=used_text_size_roles,
+    #         display_status=display_status,
+    #         max_chars=max_tool_result_chars,
+    #         hide_successful=hide_terminal_tools,
+    #         task_layout=presentation == "task",
+    #         details_in_timeline=rendered_tool_ids,
+    #         observation_only=presentation == "task" and bool(task_presentation(session).observation),
+    #     )
+    # )
     elements.extend(tool_activity_elements)
     elements.extend(timeline_elements)
     elements.extend(
@@ -606,8 +621,20 @@ def render_legacy_interaction_callback_card(
         interaction.status == "pending"
         and interaction.kind in {"approval", "clarify"}
     ):
-        prefix = "待审批：" if interaction.kind == "approval" else "待选择："
-        header_title = f"{prefix}{header_title}"
+        # LOCAL PATCH (PATCH-013): bare state word instead of prefix + full
+        # prompt text — the prompt is already shown in the card body, and the
+        # large-font header duplicating it was the exact complaint.
+        header_title = "待审批" if interaction.kind == "approval" else "待选择"
+    elif (
+        interaction.status == "completed"
+        and interaction.kind in {"approval", "clarify"}
+    ):
+        # LOCAL PATCH (PATCH-015): same simplification for the completed
+        # state — the full prompt is already shown in the card body (via
+        # _interaction_review_elements), and the large-font header repeating
+        # it a second time was the exact complaint. The body still carries
+        # the full question + "已选择：..." result line, unchanged.
+        header_title = "已审批" if interaction.kind == "approval" else "已选择"
     header = {
         "template": template,
         "title": {
@@ -698,8 +725,15 @@ def _render_legacy_callback_card(
 
     # Mobile clients truncate long headers without exposing their full text.
     # Keep the complete question in the body before options and controls.
+    # LOCAL PATCH (PATCH-013 follow-up, 2026-09-25): upstream only repeats the
+    # prompt in the body when it is > 40 chars, because the header already
+    # carried the full question. PATCH-013 reduced the header to the bare
+    # "待审批"/"待选择" word, so a short question was shown NOWHERE on the card.
+    # Always put the full question in the body (classic). v4.7.0's opt-in task
+    # presentation re-inserts a short question at the top of the card itself
+    # (presentation.py), so keep upstream's `> 40` rule there to preserve its order.
     prompt = normalize_stream_text(interaction.prompt).strip()
-    if len(prompt) > 40:
+    if prompt and (presentation != "task" or len(prompt) > 40):
         elements.append({"tag": "markdown", "content": prompt})
     description = mask_approval_scope(normalize_stream_text(interaction.description).strip())
     if description:
@@ -1068,7 +1102,12 @@ def _header_title_with_state(
         return configured_title
     interaction = session.active_interaction
     if interaction is not None and interaction.status == "pending":
-        return _sanitize_runtime_header(interaction.prompt) or configured_title
+        # LOCAL PATCH (PATCH-013): user reported the full prompt text as the
+        # (large-font) header duplicated the same prompt already shown in the
+        # card body. Header now shows only the bare state word; the caller
+        # (which used to prepend "待审批："/"待选择：" to this return value)
+        # is patched separately to not double up.
+        return "待审批" if interaction.kind == "approval" else "待选择"
     metrics = _runtime_header_metrics(session, display_status=display_status)
     if display_status == "completed":
         return f"✅ {configured_title}" + (f" · {metrics}" if metrics else "")
@@ -2664,8 +2703,12 @@ def _render_footer(
         # mid-turn: the core only sends tokens with turn.completed, so an approval that fires
         # during the run legitimately shows no counts rather than a fake ↑0 ↓0).
         waiting: list[str] = []
-        if session.tool_count and not compact:
-            waiting.append(f"工具 #{session.tool_count}")
+        # LOCAL PATCH (PATCH-011): user asked to hide the tool-count field from
+        # every footer state (waiting/running/completed). Upstream shows it
+        # (v4.7.0: unless compact); suppressed here rather than deleting the
+        # upstream code, so a future HFC re-render only needs this block re-applied.
+        # if session.tool_count and not compact:
+        #     waiting.append(f"工具 #{session.tool_count}")
         if session.created_at:
             # Only once there is a second to show: a freshly-armed approval would otherwise read
             # "0s · 等待选择 · ⏳ 5 分钟后过期", which is noise, not information.
@@ -2690,9 +2733,10 @@ def _render_footer(
         # the title — the user asked for "工具 N · <time>" order in both places (it used to be
         # time then count here).
         running = [f"{_spinner_frame()} {_status_tag('执行中', 'blue')}"] if include_status else []
-        if session.tool_count and not compact:
-            # Maintainer note (contract change): hash before the count, matching the title.
-            running.append(f"工具 #{session.tool_count}")
+        # LOCAL PATCH (PATCH-011): tool-count suppressed in every footer state.
+        # if session.tool_count and not compact:
+        #     # Maintainer note (contract change): hash before the count, matching the title.
+        #     running.append(f"工具 #{session.tool_count}")
         running.append(_format_duration(max(0.0, _time.time() - float(session.created_at))))
         # Maintainer note (contract change): the footer repeats the title's action phrase
         # ("正在读取文件") so the state line reads the same wherever the eye lands — the user
@@ -2704,6 +2748,20 @@ def _render_footer(
     tokens = session.tokens if isinstance(session.tokens, dict) else {}
     input_tokens = _safe_int(tokens.get("input_tokens"))
     output_tokens = _safe_int(tokens.get("output_tokens"))
+    # LOCAL PATCH (PATCH-007): rolling per-call cache hit rate from cache_history
+    # ([[prompt, cache_read], ...] last 10 API calls); falls back to cumulative
+    # prompt/cache_read when the history payload is absent.
+    prompt_tokens = _safe_int(tokens.get("prompt_tokens"))
+    cache_read_tokens = _safe_int(tokens.get("cache_read_tokens"))
+    cache_rate = ""
+    cache_history = tokens.get("cache_history")
+    if isinstance(cache_history, list) and cache_history:
+        h_prompt = sum(int(p) for p, c in cache_history if int(p) > 0)
+        h_read = sum(int(c) for p, c in cache_history if int(p) > 0)
+        if h_prompt > 0 and h_read > 0:
+            cache_rate = f"cache {min(100, max(0, round(h_read / h_prompt * 100)))}%"
+    if not cache_rate and prompt_tokens > 0 and cache_read_tokens > 0:
+        cache_rate = f"cache {min(100, max(0, round(cache_read_tokens / prompt_tokens * 100)))}%"
     try:
         duration = float(session.duration)
     except (TypeError, ValueError):
@@ -2751,6 +2809,7 @@ def _render_footer(
         "model": html.escape(model, quote=True) if compact else _colored_model_label(model),
         "input_tokens": f"↑{_format_count(input_tokens)}",
         "output_tokens": f"↓{_format_count(output_tokens)}",
+        "cache_rate": cache_rate,
         "context": (
             f"ctx {_format_count(used_context)}/"
             f"{_format_count(max_context)} {context_percent}%"
@@ -2759,10 +2818,11 @@ def _render_footer(
         "output_rate": _format_output_rate(tokens),
     }
     selected = []
-    if session.tool_count and not compact:
-        # Maintainer note (contract change): the count leads the other metrics, matching the title
-        # (it used to be appended last, after ctx); it carries a hash, per the user's request.
-        selected.append(f"工具 #{session.tool_count}")
+    # LOCAL PATCH (PATCH-011): tool-count suppressed in every footer state.
+    # if session.tool_count and not compact:
+    #     # Maintainer note (contract change): the count leads the other metrics, matching the title
+    #     # (it used to be appended last, after ctx); it carries a hash, per the user's request.
+    #     selected.append(f"工具 #{session.tool_count}")
     fields = DEFAULT_FOOTER_FIELDS if footer_fields is None else footer_fields
     available = {
         "duration": duration > 0, "model": model != "Unknown",
@@ -2771,6 +2831,9 @@ def _render_footer(
         "context": max_context > 0 and "used_tokens" in context,
         "subscription_usage": bool(subscription_usage),
         "output_rate": bool(values["output_rate"]),
+        # LOCAL PATCH (PATCH-007): upstream v5 filters every footer (not only the
+        # compact task preset) by availability; keep the rolling cache_rate visible.
+        "cache_rate": bool(cache_rate),
     }
     fields = [field for field in fields if available.get(field, False)]
     for field in fields:
