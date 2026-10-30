@@ -100,6 +100,11 @@ APPROVAL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_APPROVAL_PATCH_BEGIN"
 APPROVAL_PATCH_END = "# HERMES_FEISHU_CARD_APPROVAL_PATCH_END"
 STATUS_PATCH_BEGIN = "# HERMES_FEISHU_CARD_STATUS_PATCH_BEGIN"
 STATUS_PATCH_END = "# HERMES_FEISHU_CARD_STATUS_PATCH_END"
+# Hermes v0.22.5 split the status callback into its own turn-progress mixin;
+# these name the exact seam the relocated hook is allowed to attach to.
+STATUS_CALLBACK_NAME = "_status_callback_sync"
+STATUS_CALLBACK_ARGS = ("event_type", "message")
+_TURN_PROGRESS_MIXIN = "GatewayTurnProgressMixin"
 CRON_PATCH_BEGIN = "# HERMES_FEISHU_CARD_CRON_PATCH_BEGIN"
 CRON_PATCH_END = "# HERMES_FEISHU_CARD_CRON_PATCH_END"
 SLASH_CONFIRM_PATCH_BEGIN = "# HERMES_FEISHU_CARD_SLASH_CONFIRM_PATCH_BEGIN"
@@ -1456,6 +1461,23 @@ def _apply_callback_patch(
             required_callback_calls=required_callback_calls,
         )
         use_turn_context = callback_body is not None
+    if (
+        callback_body is None
+        and allow_turn_context
+        and callback_name == STATUS_CALLBACK_NAME
+    ):
+        # Hermes v0.22.5 moved only the status callback out of TurnRunner into
+        # gateway/run_turn_progress.py. Restrict the relocated seam to that one
+        # callback: the rest still live in TurnRunner, and widening this would
+        # let a second copy of an existing anchor render in a new target.
+        callback_body = _find_turn_progress_callback_body_location(
+            tree,
+            lines,
+            callback_name,
+            required_callback_args=required_callback_args,
+            required_callback_calls=required_callback_calls,
+        )
+        use_turn_context = callback_body is not None
     if callback_body is None:
         return content
 
@@ -1742,6 +1764,83 @@ def _find_turn_runner_callback_body_location(
     if direct_context:
         return _turn_context_binding_location(candidate, lines)
     return _body_location(candidate, lines)
+
+
+def _find_turn_progress_callback_body_location(
+    tree,
+    lines,
+    callback_name: str,
+    *,
+    required_callback_args=(),
+    required_callback_calls=(),
+):
+    """Locate a turn-context callback that upstream moved out of ``TurnRunner``.
+
+    Hermes v0.22.5 relocated ``_status_callback_sync`` from a closure inside
+    ``gateway/run_turn_runner.py::_run_agent_inner`` into
+    ``gateway/run_turn_progress.py::GatewayTurnProgressMixin``, leaving only the
+    ``agent.status_callback = ctx._status_callback_sync`` wiring behind. The
+    predicate stays as strict as the legacy closure one: one mixin class, one
+    undecorated direct method of that name, the same required arguments, the
+    same ``ctx = self._ctx`` turn-context binding, and the live-status guard call
+    that distinguishes the real callback from a same-named stub. If upstream
+    renames any of those seams this returns ``None`` and doctor reports the
+    anchor as missing instead of the hook landing on a wrong function.
+    """
+    if required_callback_calls:
+        return None
+    candidate = _locate_turn_progress_callback(
+        tree, callback_name, required_callback_args
+    )
+    if candidate is None:
+        return None
+    return _turn_context_binding_location(candidate, lines)
+
+
+def _locate_turn_progress_callback(tree, callback_name: str, required_callback_args=()):
+    mixins = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == _TURN_PROGRESS_MIXIN
+    ]
+    if len(mixins) != 1:
+        return None
+    candidates = [
+        node
+        for node in mixins[0].body
+        if isinstance(node, ast.FunctionDef) and node.name == callback_name
+    ]
+    if len(candidates) != 1 or candidates[0].decorator_list:
+        return None
+    candidate = candidates[0]
+    if not set(required_callback_args).issubset(_function_argument_names(candidate)):
+        return None
+    if not _binds_turn_context(candidate):
+        return None
+    if not _calls_self_attribute(candidate, "_status_live"):
+        return None
+    return candidate
+
+
+def has_split_status_callback(tree) -> bool:
+    """Public predicate: the relocated status callback exists in ``tree``."""
+    return (
+        _locate_turn_progress_callback(
+            tree, STATUS_CALLBACK_NAME, STATUS_CALLBACK_ARGS
+        )
+        is not None
+    )
+
+
+def _calls_self_attribute(node, attribute: str) -> bool:
+    return any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == attribute
+        and isinstance(child.func.value, ast.Name)
+        and child.func.value.id == "self"
+        for child in ast.walk(node)
+    )
 
 
 def _find_stable_tool_lifecycle_location(tree, lines):
