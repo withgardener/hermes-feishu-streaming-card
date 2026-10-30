@@ -49,6 +49,10 @@ DEFAULT_FOOTER_FIELDS = (
 )
 MAIN_CONTENT_CHUNK_CHARS = 2400
 DEFAULT_TITLE = "Hermes Agent"
+# LOCAL PATCH (PATCH-037, pre-tool text): bounds for re-surfacing archived answer
+# prefaces in the card body (see _render_card_unchecked).
+MAX_BODY_PREFACE_BLOCKS = 6
+MAX_BODY_PREFACE_CHARS = 800
 RUNTIME_HEADER_MAX_CHARS = 120
 CARD_QUOTE_SUMMARY_MAX_CHARS = 120
 TEXT_SIZE_ROLE_ORDER = ("body", "reasoning", "tool", "notice", "footer")
@@ -367,6 +371,33 @@ def _render_card_unchecked(
         pass
     main_role = "notice" if session.delivery_kind == "notice" else "body"
     elements = []
+    # LOCAL PATCH (PATCH-037, pre-tool text): an assistant's text that was already
+    # streamed BEFORE a tool call is archived into a "思考 N" timeline entry once
+    # the turn keeps going after that tool (`CardSession._archive_current_answer_to_reasoning`),
+    # so the card body ended up holding only the closing sentence while the
+    # opening paragraph vanished into 思考过程. Re-surface those archived prefaces
+    # as ordinary body blocks ABOVE the main content; the timeline keeps its own
+    # copy for the panel, so nothing is hidden and nothing is duplicated inside
+    # the same surface.
+    preface_elements: list[Dict[str, Any]] = []
+    if reasoning_format != "code" and not pending_approval:
+        for _index, _entry in enumerate(
+            [
+                entry for entry in session.timeline.snapshot()
+                if entry.kind == "reasoning" and str(entry.content or "").strip()
+            ][-MAX_BODY_PREFACE_BLOCKS:]
+        ):
+            preface_elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": f"pre_tool_text_{_index}",
+                    "content": _limit_text(
+                        normalize_stream_text(_entry.content).strip(),
+                        MAX_BODY_PREFACE_CHARS,
+                        overflow_label="前文过长，已折叠",
+                    ),
+                }
+            )
     if pending_approval:
         # Keep the authorization scope and choices together. Prior answers and
         # the execution timeline must not push this decision below old output.
@@ -390,6 +421,10 @@ def _render_card_unchecked(
                 used_roles=used_text_size_roles,
             ),
         )
+    if preface_elements:
+        # LOCAL PATCH (PATCH-037): chronological — the pre-tool text reads above
+        # the answer it preceded.
+        elements = preface_elements + elements
     # LOCAL PATCH (PATCH-012): user asked to hide the always-visible tool
     # activity row directly under the answer text (duplicate of the full row
     # already shown inside the collapsible 思考过程 panel). Keep the panel
