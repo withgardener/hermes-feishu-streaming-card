@@ -1,0 +1,4456 @@
+import ast
+import re
+import textwrap
+
+from .source_layout import (
+    DECOMPOSED_GATEWAY_TARGETS as DECOMPOSED_GATEWAY_TARGETS,
+    DECOMPOSED_TARGETS as DECOMPOSED_TARGETS,
+)
+from . import admission_extraction, stop_cancellation
+from .gateway_contracts import find_stale_interrupted_location
+from .cron_contracts import (
+    find_cron_deliver_body_location as _find_cron_deliver_body_location,
+    find_cron_media_delivery_location as _find_cron_media_delivery_location,
+)
+from .completion_contracts import (
+    DELIVERY as _COMPLETION_DELIVERY,
+    DELIVERY_ARGS as _COMPLETION_DELIVERY_ARGS,
+    METHODS as _COMPLETION_METHODS,
+    POST_HOOK as _COMPLETION_POST_HOOK,
+    WRAPPER as _COMPLETION_WRAPPER,
+    dispatch_return as _completion_dispatch_return,
+    return_matches as _completion_return_matches,
+    wrapper_is_exact as _completion_wrapper_is_exact,
+)
+
+from .base_contracts import (
+    find_base_patch_locations,
+    _has_decomposed_base,
+    _has_split_exact_base,
+    _parse_exact_base_content,
+)
+from .ast_contracts import (
+    _body_location,
+    _is_docstring_expr,
+    _leading_whitespace,
+    _line_ending,
+    _line_indent,
+    _same_expression,
+    _strip_line_ending,
+)
+
+from .patch_descriptors import (
+    HYBRID_PATCH_DESCRIPTORS,
+    HYBRID_PATCH_GROUPS,
+    HYBRID_PATCH_REGISTRY,
+    HYBRID_PATCH_TARGET_ORDER,
+    HYBRID_PATCH_TARGETS,
+    LegacyTargetPatchAdapter,
+    PatchDescriptorRegistry,
+    PatchFragmentDescriptor,
+    PatchGroupDescriptor,
+    detect_patch_groups_by_target as _detect_patch_groups_by_target,
+    remove_patch_snapshots as _remove_patch_snapshots,
+    render_patch_snapshots_from_verified_originals as _render_patch_snapshots_from_verified_originals,
+)
+
+
+TURN_TIMING_PATCH_BEGIN = "# HERMES_FEISHU_CARD_TURN_TIMING_PATCH_BEGIN"
+TURN_TIMING_PATCH_END = "# HERMES_FEISHU_CARD_TURN_TIMING_PATCH_END"
+STALE_INTERRUPTED_PATCH_BEGIN = "# HERMES_FEISHU_CARD_STALE_INTERRUPTED_PATCH_BEGIN"
+STALE_INTERRUPTED_PATCH_END = "# HERMES_FEISHU_CARD_STALE_INTERRUPTED_PATCH_END"
+PATCH_BEGIN = "# HERMES_FEISHU_CARD_PATCH_BEGIN"
+PATCH_END = "# HERMES_FEISHU_CARD_PATCH_END"
+COMPLETE_PATCH_BEGIN = "# HERMES_FEISHU_CARD_COMPLETE_PATCH_BEGIN"
+COMPLETE_PATCH_END = "# HERMES_FEISHU_CARD_COMPLETE_PATCH_END"
+QUEUED_COMPLETE_PATCH_BEGIN = "# HERMES_FEISHU_CARD_QUEUED_COMPLETE_PATCH_BEGIN"
+QUEUED_COMPLETE_PATCH_END = "# HERMES_FEISHU_CARD_QUEUED_COMPLETE_PATCH_END"
+QUEUED_FOLLOWUP_PATCH_BEGIN = "# HERMES_FEISHU_CARD_QUEUED_FOLLOWUP_PATCH_BEGIN"
+QUEUED_FOLLOWUP_PATCH_END = "# HERMES_FEISHU_CARD_QUEUED_FOLLOWUP_PATCH_END"
+# The busy-path send is the one fragment that CAPTURES an upstream statement (see
+# _apply_busy_recall_patch): the v1 suffix lets a future revision install beside a v0 block instead
+# of silently reusing it.
+BUSY_RECALL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_BUSY_RECALL_PATCH_BEGIN_V1"
+BUSY_RECALL_PATCH_END = "# HERMES_FEISHU_CARD_BUSY_RECALL_PATCH_END_V1"
+# The long-running heartbeat send already keeps its result in `_notify_res`, so this fragment only
+# READS it — no upstream statement is captured (unlike the busy-recall block above).
+LONG_RUNNING_RECALL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_LONG_RUNNING_RECALL_PATCH_BEGIN"
+LONG_RUNNING_RECALL_PATCH_END = "# HERMES_FEISHU_CARD_LONG_RUNNING_RECALL_PATCH_END"
+TASK_HEARTBEAT_PATCH_BEGIN = "# HERMES_FEISHU_CARD_TASK_HEARTBEAT_PATCH_BEGIN"
+TASK_HEARTBEAT_PATCH_END = "# HERMES_FEISHU_CARD_TASK_HEARTBEAT_PATCH_END"
+QUEUED_FINAL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_QUEUED_FINAL_PATCH_BEGIN"
+QUEUED_FINAL_PATCH_END = "# HERMES_FEISHU_CARD_QUEUED_FINAL_PATCH_END"
+REDIRECT_PATCH_BEGIN = "# HERMES_FEISHU_CARD_REDIRECT_PATCH_BEGIN"
+REDIRECT_PATCH_END = "# HERMES_FEISHU_CARD_REDIRECT_PATCH_END"
+TOOL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_TOOL_PATCH_BEGIN"
+TOOL_PATCH_END = "# HERMES_FEISHU_CARD_TOOL_PATCH_END"
+STABLE_TOOL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_STABLE_TOOL_PATCH_BEGIN"
+STABLE_TOOL_PATCH_END = "# HERMES_FEISHU_CARD_STABLE_TOOL_PATCH_END"
+ANSWER_DELTA_PATCH_BEGIN = "# HERMES_FEISHU_CARD_ANSWER_DELTA_PATCH_BEGIN"
+ANSWER_DELTA_PATCH_END = "# HERMES_FEISHU_CARD_ANSWER_DELTA_PATCH_END"
+THINKING_DELTA_PATCH_BEGIN = "# HERMES_FEISHU_CARD_THINKING_DELTA_PATCH_BEGIN"
+THINKING_DELTA_PATCH_END = "# HERMES_FEISHU_CARD_THINKING_DELTA_PATCH_END"
+CLARIFY_PATCH_BEGIN = "# HERMES_FEISHU_CARD_CLARIFY_PATCH_BEGIN"
+CLARIFY_PATCH_END = "# HERMES_FEISHU_CARD_CLARIFY_PATCH_END"
+# Hermes 242ff24ff7 (2026-09-16) extracted the clarify body into this helper; its
+# caller unpacks ``(response, answered)``, unlike the callback it came from.
+EXTRACTED_CLARIFY_HELPER = "_ask_clarify_question"
+EXTRACTED_CLARIFY_ARGS = ("question", "choices", "multi_select")
+APPROVAL_PATCH_BEGIN = "# HERMES_FEISHU_CARD_APPROVAL_PATCH_BEGIN"
+APPROVAL_PATCH_END = "# HERMES_FEISHU_CARD_APPROVAL_PATCH_END"
+STATUS_PATCH_BEGIN = "# HERMES_FEISHU_CARD_STATUS_PATCH_BEGIN"
+STATUS_PATCH_END = "# HERMES_FEISHU_CARD_STATUS_PATCH_END"
+CRON_PATCH_BEGIN = "# HERMES_FEISHU_CARD_CRON_PATCH_BEGIN"
+CRON_PATCH_END = "# HERMES_FEISHU_CARD_CRON_PATCH_END"
+SLASH_CONFIRM_PATCH_BEGIN = "# HERMES_FEISHU_CARD_SLASH_CONFIRM_PATCH_BEGIN"
+SLASH_CONFIRM_PATCH_END = "# HERMES_FEISHU_CARD_SLASH_CONFIRM_PATCH_END"
+COMMAND_CARD_PATCH_BEGIN = "# HERMES_FEISHU_CARD_COMMAND_CARD_PATCH_BEGIN"
+COMMAND_CARD_PATCH_END = "# HERMES_FEISHU_CARD_COMMAND_CARD_PATCH_END"
+COMMAND_CARD_STARTUP_PATCH_BEGIN = (
+    "# HERMES_FEISHU_CARD_COMMAND_CARD_STARTUP_PATCH_BEGIN"
+)
+COMMAND_CARD_STARTUP_PATCH_END = "# HERMES_FEISHU_CARD_COMMAND_CARD_STARTUP_PATCH_END"
+NATIVE_REDELIVERY_PATCH_BEGIN = "# HERMES_FEISHU_CARD_NATIVE_REDELIVERY_PATCH_BEGIN"
+NATIVE_REDELIVERY_PATCH_END = "# HERMES_FEISHU_CARD_NATIVE_REDELIVERY_PATCH_END"
+PLATFORM_NOTICE_PATCH_BEGIN = "# HERMES_FEISHU_CARD_PLATFORM_NOTICE_PATCH_BEGIN"
+PLATFORM_NOTICE_PATCH_END = "# HERMES_FEISHU_CARD_PLATFORM_NOTICE_PATCH_END"
+HFC_COMMAND_PATCH_BEGIN = "# HERMES_FEISHU_CARD_HFC_COMMAND_PATCH_BEGIN"
+HFC_COMMAND_PATCH_END = "# HERMES_FEISHU_CARD_HFC_COMMAND_PATCH_END"
+EXACT_BASE_NO_TEXT_PATCH_BEGIN = (
+    "# HERMES_FEISHU_CARD_EXACT_BASE_NO_TEXT_PATCH_BEGIN"
+)
+EXACT_BASE_NO_TEXT_PATCH_END = "# HERMES_FEISHU_CARD_EXACT_BASE_NO_TEXT_PATCH_END"
+EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN = (
+    "# HERMES_FEISHU_CARD_EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN"
+)
+EXACT_BASE_FINAL_DELIVERY_PATCH_END = (
+    "# HERMES_FEISHU_CARD_EXACT_BASE_FINAL_DELIVERY_PATCH_END"
+)
+
+_HANDLER_NAME = "_handle_message_with_agent"
+_NO_FINAL_NEWLINE = "# HERMES_FEISHU_CARD_NO_FINAL_NEWLINE"
+_SUPPORTED_STRATEGIES = {"legacy_gateway_run", "gateway_run_013_plus"}
+
+
+def _require_single_target_legacy_mode(integration_mode: str) -> None:
+    if type(integration_mode) is not str:
+        raise TypeError("integration_mode must be an ordinary str")
+    if integration_mode == "legacy-patch":
+        return
+    if integration_mode in {"hybrid", "native-hooks"}:
+        raise ValueError(
+            f"{integration_mode} requires the aggregate patch API with all targets"
+        )
+    raise ValueError(f"unsupported integration mode: {integration_mode}")
+
+
+def detect_patch_groups_by_target(
+    snapshots,
+    *,
+    expected_groups,
+    expected_fragment_matrix,
+    registry=None,
+):
+    """Strictly detect a complete logical patch matrix in byte snapshots."""
+    registry = HYBRID_PATCH_REGISTRY if registry is None else registry
+    return _detect_patch_groups_by_target(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
+        registry=registry,
+    )
+
+
+def remove_patch_snapshots(
+    snapshots,
+    *,
+    expected_groups,
+    expected_fragment_matrix,
+    registry=None,
+):
+    """Strictly remove a complete aggregate patch set in memory."""
+    registry = HYBRID_PATCH_REGISTRY if registry is None else registry
+    return _remove_patch_snapshots(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
+        registry=registry,
+    )
+
+
+def render_patch_snapshots_from_verified_originals(
+    verified_originals,
+    *,
+    verified_original_sha256,
+    integration_mode,
+    required_patch_groups,
+    expected_fragment_matrix,
+    registry=None,
+):
+    """Render only from an externally verified, complete original snapshot."""
+    registry = HYBRID_PATCH_REGISTRY if registry is None else registry
+    return _render_patch_snapshots_from_verified_originals(
+        verified_originals,
+        verified_original_sha256=verified_original_sha256,
+        integration_mode=integration_mode,
+        required_patch_groups=required_patch_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
+        registry=registry,
+    )
+
+
+def apply_patch(
+    content: str,
+    strategy: str = "legacy_gateway_run",
+    *,
+    integration_mode: str = "legacy-patch",
+) -> str:
+    """Insert the Feishu card hook block into a safe Hermes message handler."""
+    _require_single_target_legacy_mode(integration_mode)
+    if strategy not in _SUPPORTED_STRATEGIES:
+        raise ValueError(f"unsupported patch strategy: {strategy}")
+    content = _apply_start_patch(content, strategy=strategy)
+    content = _apply_complete_patch(content, strategy=strategy)
+    content = _apply_queued_complete_patch(content)
+    content = _apply_queued_followup_patch(content)
+    if strategy == "gateway_run_013_plus":
+        content = _apply_redirect_patch(content)
+        content = _apply_busy_recall_patch(content)
+        content = _apply_long_running_recall_patch(content)
+        content = _apply_task_heartbeat_patch(content)
+        content = _apply_cron_patch(content)
+        content = _apply_command_card_startup_patch(content)
+        content = _apply_native_redelivery_patch(content)
+        content = _apply_command_card_adapter_patch(content)
+        content = _apply_hfc_command_patch(content)
+        content = _apply_platform_notice_patch(content)
+        content = _apply_slash_confirm_patch(content)
+    return _apply_turn_callbacks(content, strategy=strategy)
+
+
+def _apply_turn_callbacks(content: str, *, strategy: str) -> str:
+    from .provider_route import apply_provider_route_patch
+    content = apply_provider_route_patch(content)
+    content = _apply_stable_tool_lifecycle_patch(content)
+    content = _apply_callback_patch(
+        content,
+        callback_name="progress_callback",
+        begin_marker=TOOL_PATCH_BEGIN,
+        end_marker=TOOL_PATCH_END,
+        renderer=_render_tool_hook_block,
+        required_outer_names=(
+            "source",
+            "event_message_id",
+            "_loop_for_step",
+            "_run_still_current",
+        ),
+        required_callback_args=("event_type", "tool_name", "preview"),
+    )
+    content = _apply_callback_patch(
+        content,
+        callback_name="_stream_delta_cb",
+        begin_marker=ANSWER_DELTA_PATCH_BEGIN,
+        end_marker=ANSWER_DELTA_PATCH_END,
+        renderer=_render_answer_delta_hook_block,
+        required_outer_names=(
+            "source",
+            "event_message_id",
+            "_loop_for_step",
+            "_run_still_current",
+        ),
+        required_callback_args=("text",),
+        required_callback_calls=(("_stream_consumer", "on_delta"),),
+        allow_turn_context=True,
+    )
+    content = _apply_callback_patch(
+        content,
+        callback_name="_interim_assistant_cb",
+        begin_marker=THINKING_DELTA_PATCH_BEGIN,
+        end_marker=THINKING_DELTA_PATCH_END,
+        renderer=_render_thinking_delta_hook_block,
+        required_outer_names=(
+            "source",
+            "event_message_id",
+            "_loop_for_step",
+            "_run_still_current",
+        ),
+        required_callback_args=("text", "already_streamed"),
+        allow_turn_context=True,
+    )
+    content = _apply_clarify_patch(content)
+    content = _apply_callback_patch(
+        content,
+        callback_name=_approval_callback_name(content),
+        begin_marker=APPROVAL_PATCH_BEGIN,
+        end_marker=APPROVAL_PATCH_END,
+        renderer=(_render_generation_approval_hook_block
+                  if _approval_callback_name(content) == "_render_approval_sync"
+                  else _render_approval_hook_block),
+        required_outer_names=(
+            "source",
+            "event_message_id",
+            "_status_chat_id",
+            "_approval_session_key",
+            "_run_still_current",
+        ),
+        required_callback_args=("approval_data",),
+        allow_turn_context=True,
+    )
+    if strategy == "gateway_run_013_plus":
+        content = _apply_callback_patch(
+            content,
+            callback_name="_status_callback_sync",
+            begin_marker=STATUS_PATCH_BEGIN,
+            end_marker=STATUS_PATCH_END,
+            renderer=_render_status_hook_block,
+            required_outer_names=(
+                "source",
+                "event_message_id",
+                "_status_chat_id",
+                "_loop_for_step",
+                "_run_still_current",
+            ),
+            required_callback_args=("event_type", "message"),
+            allow_turn_context=True,
+        )
+    return content
+
+
+def apply_cron_patch(
+    content: str,
+    *,
+    integration_mode: str = "legacy-patch",
+) -> str:
+    """Insert the Feishu card cron hook into a safe Hermes cron delivery function."""
+    _require_single_target_legacy_mode(integration_mode)
+    return _apply_cron_patch(content)
+
+
+def apply_base_patch(
+    content: str,
+    *,
+    integration_mode: str = "legacy-patch",
+) -> str:
+    """Patch Hermes' exact final-delivery pipeline without reimplementing it.
+
+    This entry point is intentionally separate from :func:`apply_patch`: it
+    operates on ``gateway/platforms/base.py``, while ``apply_patch`` owns
+    ``gateway/run.py``.  The structural contract is strict because placing
+    either hook on the wrong side of the delivery ledger can create a crash
+    window or acknowledge content that Hermes never attempted to send.
+    """
+    _require_single_target_legacy_mode(integration_mode)
+    owned = _find_owned_exact_base_blocks(content, strict=True)
+    tree = _parse_exact_base_content(content)
+    lines = content.splitlines(keepends=True)
+    no_text_location, final_location = _find_exact_base_patch_locations(tree, lines)
+
+    if owned is not None:
+        _validate_exact_base_owned_locations(
+            owned,
+            no_text_location=no_text_location,
+            final_location=final_location,
+        )
+        return admission_extraction.apply(stop_cancellation.apply(content))
+
+    newline = _detect_newline(content)
+    no_text_index, no_text_indent = no_text_location
+    final_index, final_indent = final_location
+    no_text_renderer = (_render_decomposed_base_no_text_hook_block
+                        if _has_decomposed_base(tree) else _render_exact_base_no_text_hook_block)
+    no_text_hook = no_text_renderer(no_text_indent, newline)
+    final_renderer = (
+        _render_decomposed_split_base_final_hook_block
+        if _has_split_exact_base(tree) and _has_decomposed_base(tree)
+        else _render_split_base_final_delivery_hook_block
+        if _has_split_exact_base(tree)
+        else _render_decomposed_base_final_hook_block
+        if _has_decomposed_base(tree)
+        else _render_exact_base_final_delivery_hook_block
+    )
+    final_hook = final_renderer(final_indent, newline)
+
+    # Insert bottom-up so the earlier location is not shifted by the later
+    # block. Both anchors are guaranteed to belong to the same exact pipeline.
+    for index, hook in sorted(((final_index, final_hook), (no_text_index, no_text_hook)), reverse=True):
+        lines[index:index] = hook
+    return admission_extraction.apply(stop_cancellation.apply("".join(lines)))
+
+
+def remove_base_patch(content: str) -> str:
+    """Strictly remove exact BasePlatformAdapter hooks owned by this project."""
+    content = stop_cancellation.remove(admission_extraction.remove(content))
+    owned = _find_owned_exact_base_blocks(content, strict=True)
+    if owned is None:
+        return content
+
+    tree = _parse_exact_base_content(content)
+    lines = content.splitlines(keepends=True)
+    no_text_location, final_location = _find_exact_base_patch_locations(tree, lines)
+    _validate_exact_base_owned_locations(
+        owned,
+        no_text_location=no_text_location,
+        final_location=final_location,
+    )
+    return _remove_exact_base_blocks(content, owned)
+
+
+def remove_base_patch_lenient(content: str) -> str:
+    """Remove owned Base hooks while accepting older generated block bodies."""
+    content = stop_cancellation.remove(admission_extraction.remove(content))
+    owned = _find_owned_exact_base_blocks(content, strict=False)
+    if owned is None:
+        return content
+    return _remove_exact_base_blocks(content, owned)
+
+
+def _apply_start_patch(content: str, *, strategy: str) -> str:
+    owned_block = _find_owned_block(content)
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_hook_block(indent, newline, strategy=strategy)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    lines = content.splitlines(keepends=True)
+    handler_body = _find_handler_body_location(tree, lines)
+    if handler_body is None:
+        raise ValueError("could not find safe handler")
+
+    newline = _detect_newline(content)
+    insert_at, body_indent = handler_body
+    hook = _render_hook_block(body_indent, newline, strategy=strategy)
+    if _needs_leading_newline(lines, insert_at):
+        hook = [newline, f"{body_indent}{_NO_FINAL_NEWLINE}{newline}"] + hook
+
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_complete_patch(content: str, *, strategy: str = "legacy_gateway_run",
+                          completion_sources=None, target=None) -> str:
+    decomposed_node = (_split_completion_node({**completion_sources, target: content}, target)
+                       if completion_sources is not None else None)
+    renderer = (
+        _render_decomposed_complete_hook_block
+        if decomposed_node is not None or _find_decomposed_completion_node(_parse_content(content)) is not None
+        else _render_complete_hook_block_with_reply_anchor
+        if strategy == "gateway_run_013_plus"
+        else _render_complete_hook_block
+    )
+
+    owned_block = _find_owned_complete_block(content)
+    if owned_block is not None:
+        # Re-apply from a clean slate so a recognised block migrates to the
+        # current expected location (for example, from after an
+        # `already_sent` early return to before it) and to the current
+        # rendering in one pass.
+        stripped = _remove_complete_patch(content)
+        if stripped != content:
+            return _apply_complete_patch(stripped, strategy=strategy,
+                                         completion_sources=completion_sources, target=target)
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = renderer(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    lines = content.splitlines(keepends=True)
+    completion_location = _find_completion_return_location(tree, lines, decomposed_node)
+    if completion_location is None:
+        return content
+
+    newline = _detect_newline(content)
+    insert_at, body_indent = completion_location
+    hook = renderer(body_indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_queued_complete_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        QUEUED_COMPLETE_PATCH_BEGIN,
+        QUEUED_COMPLETE_PATCH_END,
+        "queued completion patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_queued_complete_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    lines = content.splitlines(keepends=True)
+    target = 'if first_response and not _already_streamed:'
+    for index, line in enumerate(lines):
+        if _strip_line_ending(line).strip() != target:
+            continue
+        # `first_response = result.get(...)` no longer sits on the immediately
+        # preceding line in newer Hermes (a multi-line call to
+        # _stream_confirmed_final_delivery is interleaved), so scan a short
+        # window above the anchor instead of only lines[index - 1].
+        lookback = lines[max(0, index - 12) : index]
+        if not any("first_response = result.get(" in item for item in lookback):
+            continue
+        indent = _leading_whitespace(_strip_line_ending(line))
+        newline = _line_ending(line) or _detect_newline(content)
+        hook = _render_queued_complete_hook_block(indent, newline)
+        return "".join(lines[:index] + hook + lines[index:])
+
+    current_target = "if _intentional_silence:"
+    for index, line in enumerate(lines):
+        if _strip_line_ending(line).strip() not in {
+            current_target,
+            "if self._is_intentional_silence(_delivery_result, first_response):",
+        }:
+            continue
+        lookback = lines[max(0, index - 48) : index]
+        if not any("first_response = _delivery_result.get(" in item for item in lookback):
+            continue
+        if not any("_delivery_result = response if isinstance(response, dict)" in item for item in lookback):
+            continue
+        indent = _leading_whitespace(_strip_line_ending(line))
+        newline = _line_ending(line) or _detect_newline(content)
+        hook = _render_queued_complete_hook_block(indent, newline)
+        return "".join(lines[:index] + hook + lines[index:])
+    return content
+
+
+def _apply_queued_followup_patch(content: str) -> str:
+    content = _apply_queued_final_patch(content)
+    owned_block = _find_simple_marker_block(
+        content,
+        QUEUED_FOLLOWUP_PATCH_BEGIN,
+        QUEUED_FOLLOWUP_PATCH_END,
+        "queued follow-up patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_queued_followup_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    target = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target_node = node.targets[0]
+        if isinstance(target_node, ast.Name) and target_node.id == "followup_result":
+            target = node
+            break
+    if target is None or target.lineno is None or target.end_lineno is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    insert_at = target.lineno - 1
+    indent = _leading_whitespace(_strip_line_ending(lines[insert_at]))
+    newline = _line_ending(lines[insert_at]) or _detect_newline(content)
+    hook = _render_queued_followup_hook_block(indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_queued_final_patch(content: str) -> str:
+    owned = _find_simple_marker_block(content, QUEUED_FINAL_PATCH_BEGIN,
+                                      QUEUED_FINAL_PATCH_END, "queued final patch markers")
+    lines = content.splitlines(keepends=True)
+    if owned is not None:
+        begin, end = owned
+        indent = _leading_whitespace(_strip_line_ending(lines[begin]))
+        newline = _line_ending(lines[begin]) or _detect_newline(content)
+        return "".join(lines[:begin] + _render_queued_final_hook_block(indent, newline) + lines[end + 1:])
+    for node in ast.walk(_parse_content(content)):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "followup_result"
+                and isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call)
+                and isinstance(node.value.value.func, ast.Attribute)
+                and node.value.value.func.attr == "_run_agent"):
+            indent = _leading_whitespace(_strip_line_ending(lines[node.lineno - 1]))
+            newline = _line_ending(lines[node.lineno - 1]) or _detect_newline(content)
+            return "".join(lines[:node.end_lineno] + _render_queued_final_hook_block(indent, newline) + lines[node.end_lineno:])
+    return content
+
+
+def _apply_redirect_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        REDIRECT_PATCH_BEGIN,
+        REDIRECT_PATCH_END,
+        "redirect patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_redirect_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    lines = content.splitlines(keepends=True)
+    # Hermes 0.21 moved redirect into its own outcome-returning helper.
+    for owner in ast.walk(_parse_content(content)):
+        if not isinstance(owner, ast.AsyncFunctionDef) or owner.name != "_resolve_busy_steer_or_redirect":
+            continue
+        proven_redirect = any(
+            isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "redirected"
+            and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "_try_agent_verb" and len(node.value.args) == 4
+            and isinstance(node.value.args[0], ast.Name) and node.value.args[0].id == "running_agent"
+            and isinstance(node.value.args[1], ast.Constant) and node.value.args[1].value == "redirect"
+            for node in ast.walk(owner)
+        )
+        if not proven_redirect:
+            continue
+        targets = [node for node in owner.body if isinstance(node, ast.Return)
+                   and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                   and node.value.func.attr == "_BusySteerOutcome"
+                   and any(kw.arg == "redirected" and isinstance(kw.value, ast.Name)
+                           and kw.value.id == "redirected" for kw in node.value.keywords)]
+        if len(targets) == 1:
+            index = targets[0].lineno - 1
+            indent = _leading_whitespace(_strip_line_ending(lines[index]))
+            newline = _line_ending(lines[index]) or _detect_newline(content)
+            return "".join(lines[:index] + _render_redirect_hook_block(indent, newline) + lines[index:])
+    for index, line in enumerate(lines):
+        stripped = _strip_line_ending(line).strip()
+        if stripped not in {"if not steered and not redirected:", "if not redirected:"}:
+            continue
+        lookback = lines[max(0, index - 80) : index]
+        if not any("running_agent.redirect(" in item for item in lookback):
+            continue
+        if not any("redirected = False" in item for item in lookback):
+            continue
+        indent = _leading_whitespace(_strip_line_ending(line))
+        newline = _line_ending(line) or _detect_newline(content)
+        hook = _render_redirect_hook_block(indent, newline)
+        return "".join(lines[:index] + hook + lines[index:])
+    return content
+
+
+def _render_busy_recall_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import recall_busy_redirect_ack_async as _hfc_recall_ack{newline}"
+        ),
+        f"{inner_indent}await _hfc_recall_ack(event, content, _hfc_recall_result){newline}",
+        *_render_hook_exception_handler(indent, newline),
+    ]
+
+
+def _remove_busy_recall_patch(content: str) -> str:
+    block = _find_simple_marker_block(content, BUSY_RECALL_PATCH_BEGIN,
+                                     BUSY_RECALL_PATCH_END, "busy recall patch markers")
+    if block is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    begin, end = block
+    indent = lines[begin][:len(lines[begin]) - len(lines[begin].lstrip())]
+    newline = _line_ending(lines[begin]) or _detect_newline(content)
+    hook = _render_busy_recall_hook_block(indent, newline)
+    captured = lines[begin + 1:end]
+    prefix = indent + "_hfc_recall_result = "
+    if (len(captured) <= len(hook) or captured[-len(hook):] != hook
+            or not captured[0].startswith(prefix + "await ")):
+        raise ValueError("corrupt busy recall patch")
+    original = captured[:-len(hook)]
+    original[0] = indent + original[0][len(prefix):]
+    try:
+        body = ast.parse(textwrap.dedent("".join(original))).body
+    except SyntaxError as exc:
+        raise ValueError("corrupt busy recall capture") from exc
+    if (len(body) != 1 or not isinstance(body[0], ast.Expr)
+            or not isinstance(body[0].value, ast.Await)
+            or not isinstance(body[0].value.value, ast.Call)
+            or not _same_expression(body[0].value.value.func, "adapter._send_with_retry")):
+        raise ValueError("corrupt busy recall capture")
+    return "".join(lines[:begin] + original + lines[end + 1:])
+
+
+def _apply_busy_recall_patch(content: str) -> str:
+    """Withdraw the busy-path redirect acknowledgement shortly after it is sent.
+
+    Every other fragment only ADDS code beside an anchor. This one captures the existing send
+    (``await adapter._send_with_retry(...)`` in ``_send_busy_reply``) as ``_hfc_recall_result``,
+    because the message id to recall lives only in that return value. The captured span is upstream's
+    own text with a single ``name = `` prefix, so a pristine restore + re-apply reproduces it, and
+    the install marker keeps re-application idempotent. When the statement's shape changes upstream
+    we leave the file untouched rather than guess at a rewrite.
+    """
+    if (
+        _find_simple_marker_block(
+            content,
+            BUSY_RECALL_PATCH_BEGIN,
+            BUSY_RECALL_PATCH_END,
+            "busy recall patch markers",
+        )
+        is not None
+    ):
+        _remove_busy_recall_patch(content)  # Validate captured code before accepting ownership.
+        return content
+
+    func = _find_async_function(_parse_content(content), "_send_busy_reply")
+    if func is None:
+        return content
+    targets = [
+        node for node in func.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call)
+        and _same_expression(node.value.value.func, "adapter._send_with_retry")
+    ]
+    target = targets[0] if len(targets) == 1 else None
+    if target is None or target.lineno is None or target.end_lineno is None:
+        return content
+
+    lines = content.splitlines(keepends=True)
+    start, end = target.lineno - 1, target.end_lineno - 1
+    if start < 0 or end < start or end >= len(lines):
+        return content
+    if not _line_ending(lines[end]):
+        # Optional cleanup must not turn a valid EOF send into invalid Python.
+        return content
+    stripped = lines[start].lstrip()
+    if not stripped.startswith("await "):
+        return content
+    indent = lines[start][: len(lines[start]) - len(stripped)]
+    newline = _line_ending(lines[start]) or _detect_newline(content)
+    return "".join(
+        lines[:start]
+        + [
+            f"{indent}{BUSY_RECALL_PATCH_BEGIN}{newline}",
+            f"{indent}_hfc_recall_result = {stripped}",
+        ]
+        + lines[start + 1 : end + 1]
+        + _render_busy_recall_hook_block(indent, newline)
+        + [f"{indent}{BUSY_RECALL_PATCH_END}{newline}"]
+        + lines[end + 1 :]
+    )
+
+
+def _render_long_running_notice_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{LONG_RUNNING_RECALL_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import recall_transient_thread_notice_async as _hfc_recall_notice{newline}"
+        ),
+        f"{inner_indent}await _hfc_recall_notice(source, _heartbeat_text, _notify_res){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{LONG_RUNNING_RECALL_PATCH_END}{newline}",
+    ]
+
+
+def _apply_long_running_recall_patch(content: str) -> str:
+    """Withdraw the long-running heartbeat text shortly after it is sent.
+
+    ``⏳ Working — 12 min — iteration 42/150, …`` is edited in place every
+    ``HERMES_AGENT_NOTIFY_INTERVAL`` (180s) and — with ``display.cleanup_progress`` off — never
+    removed, so a finished turn leaves its last heartbeat in the thread. The user asked for the
+    same treatment the busy-path redirect acknowledgement gets (「可以像 redirect 那个一样被撤回
+    吗」): withdraw it a few seconds after it is sent. The heartbeat loop then sends a fresh one on
+    its next tick because editing a withdrawn message fails, so long turns still report progress.
+
+    Purely additive: upstream already keeps the send result in ``_notify_res``, so this fragment
+    only READS it and captures no upstream statement. The anchor is the assignment that records the
+    heartbeat's message id; the hook goes right after its INNERMOST enclosing ``if``, i.e. once per
+    fresh heartbeat send (never for the edit path, which arms nothing new).
+    """
+    content = _remove_simple_owned_patch(
+        content, LONG_RUNNING_RECALL_PATCH_BEGIN, LONG_RUNNING_RECALL_PATCH_END,
+        _render_long_running_notice_hook_block, "long running recall patch markers")
+    tree = _parse_content(content)
+    assignments = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "_heartbeat_msg_id"
+            and isinstance(node.value, ast.Call) and _same_expression(node.value.func, "str")
+            and len(node.value.args) == 1 and not node.value.keywords
+            and _same_expression(node.value.args[0], "_notify_res.message_id")
+    ]
+    if len(assignments) != 1:
+        return content
+    assign = assignments[0]
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    scope = parents.get(assign)
+    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        scope = parents.get(scope)
+    if not isinstance(scope, ast.AsyncFunctionDef) or scope.name not in {
+        "_notify_long_running", "_run_agent_notify_long_running",
+    }:
+        return content
+    if assign.lineno is None or assign.end_lineno is None:
+        return content
+    owners = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and node.lineno <= assign.lineno
+        and (node.end_lineno or 0) >= (assign.end_lineno or 0)
+    ]
+    if not owners:
+        return content
+    # The INNERMOST owner: the branch that only runs after a fresh send. The outermost one would
+    # also fire on the in-place edit path, re-arming the withdrawal for a message nobody re-sent.
+    owner = max(owners, key=lambda node: node.lineno)
+    if assign not in owner.body or not _same_expression(
+        owner.test,
+        'getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None)',
+    ):
+        return content
+    fresh_send = parents.get(owner)
+    if not isinstance(fresh_send, ast.If) or not _same_expression(
+        fresh_send.test, 'not (_notify_res and getattr(_notify_res, "success", False))',
+    ) or owner not in fresh_send.body:
+        return content
+    index = fresh_send.body.index(owner)
+    if index == 0:
+        return content
+    send = fresh_send.body[index - 1]
+    if not (isinstance(send, ast.Assign) and len(send.targets) == 1
+            and isinstance(send.targets[0], ast.Name) and send.targets[0].id == "_notify_res"
+            and isinstance(send.value, ast.Await) and isinstance(send.value.value, ast.Call)):
+        return content
+    call = send.value.value
+    if not (any(_same_expression(call.func, name) for name in ("adapter.send", "_notify_adapter.send"))
+            and len(call.args) == 2 and _same_expression(call.args[0], "source.chat_id")
+            and _same_expression(call.args[1], "_heartbeat_text")
+            and all(keyword.arg == "metadata" for keyword in call.keywords)):
+        return content
+    lines = content.splitlines(keepends=True)
+    last = owner.end_lineno
+    if last is None or last - 1 >= len(lines) or not _line_ending(lines[last - 1]):
+        return content
+    indent = _line_indent(lines, owner.lineno - 1)
+    newline = _line_ending(lines[owner.lineno - 1]) or _detect_newline(content)
+    lines[last:last] = _render_long_running_notice_hook_block(indent, newline)
+    return "".join(lines)
+
+
+def _remove_long_running_recall_patch(content: str) -> str:
+    return _remove_simple_owned_patch(
+        content, LONG_RUNNING_RECALL_PATCH_BEGIN, LONG_RUNNING_RECALL_PATCH_END,
+        _render_long_running_notice_hook_block, "long running recall patch markers")
+
+
+def _render_task_heartbeat_hook_block(indent, newline):
+    inner = _child_indent(indent)
+    return [
+        f"{indent}{TASK_HEARTBEAT_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner}from hermes_feishu_card.hook_runtime import suppress_task_heartbeat_async as _hfc_suppress_heartbeat{newline}",
+        f"{inner}if await _hfc_suppress_heartbeat(source):{newline}",
+        f"{_child_indent(inner)}continue{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{TASK_HEARTBEAT_PATCH_END}{newline}",
+    ]
+
+
+def _apply_task_heartbeat_patch(content):
+    """Gate the verified heartbeat producer, never arbitrary adapter text."""
+    content = _remove_simple_owned_patch(content, TASK_HEARTBEAT_PATCH_BEGIN,
+        TASK_HEARTBEAT_PATCH_END, _render_task_heartbeat_hook_block, "task heartbeat patch markers")
+    tree = _parse_content(content)
+    scopes = [node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)
+              and node.name in {"_notify_long_running", "_run_agent_notify_long_running"}]
+    if not scopes:
+        return content
+    if len(scopes) != 1:
+        raise ValueError("ambiguous task heartbeat producer")
+    scope = scopes[0]
+    checks = [node for node in ast.walk(scope) if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "_should_emit_long_running_notification"]
+    if not checks:
+        return content  # Older producers have no verified live-owner boundary.
+    expected = ast.parse(
+        "if not self._should_emit_long_running_notification(session_key, agent_holder[0], _executor_task_holder[0]):\n"
+        "    break\n"
+    ).body[0]
+    guards = [(loop, node) for loop in ast.walk(scope) if isinstance(loop, ast.While)
+              for node in loop.body if isinstance(node, ast.If) and ast.dump(node) == ast.dump(expected)]
+    legacy_executor_alias = False
+    if not guards and scope.name == "_notify_long_running":
+        if len(checks) != 1:
+            raise ValueError("ambiguous task heartbeat live-owner checks")
+        legacy_guard = ast.parse(
+            "if not self._should_emit_long_running_notification(session_key, agent_holder[0], _exec_ref):\n"
+            "    break\n"
+        ).body[0]
+        guards = [(loop, node) for loop in ast.walk(scope) if isinstance(loop, ast.While)
+                  for node in loop.body if isinstance(node, ast.If) and ast.dump(node) == ast.dump(legacy_guard)]
+        if len(guards) == 1:
+            loop, guard = guards[0]
+            binding = ast.parse(
+                "try:\n    _exec_ref = _executor_task\n"
+                "except NameError:\n    _exec_ref = None\n"
+            ).body[0]
+            position = loop.body.index(guard)
+            previous = loop.body[position - 1] if position else None
+            writes = [node for node in ast.walk(scope) if isinstance(node, ast.Name)
+                      and isinstance(node.ctx, (ast.Store, ast.Del))
+                      and node.id in {"_exec_ref", "_executor_task"}]
+            if (previous is None or ast.dump(previous) != ast.dump(binding)
+                    or scope.args.posonlyargs or scope.args.args or scope.args.kwonlyargs
+                    or scope.args.vararg or scope.args.kwarg
+                    or len(writes) != 2 or any(node not in set(ast.walk(previous)) for node in writes)):
+                raise ValueError("task heartbeat executor alias binding changed")
+            legacy_executor_alias = True
+    if len(guards) != 1:
+        raise ValueError("task heartbeat live-owner contract changed")
+    loop, guard = guards[0]
+    assignments = [node for node in loop.body if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                   and node.targets[0].id == "_heartbeat_text"]
+    if len(assignments) != 1 or loop.body.index(assignments[0]) <= loop.body.index(guard):
+        raise ValueError("task heartbeat text contract changed")
+    text = assignments[0].value
+    known_templates = (
+        'disp._generic_status_phrase("status") if _long_running_mode == "generic" '
+        'else f"⏳ Working — {_elapsed_mins} min{_status_detail}"',
+        'disp._generic_status_phrase("status") if _long_running_mode == "generic" '
+        'else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)',
+        'f"⏳ Working — {_elapsed_mins} min{_status_detail}"',
+    )
+    if legacy_executor_alias:
+        known_templates = (
+            '_generic_status_phrase("status") if _long_running_mode == "generic" '
+            'else f"⏳ Working — {_elapsed_mins} min{_status_detail}"',
+        )
+    fixed_heartbeat = (not legacy_executor_alias and isinstance(text, ast.Constant) and type(text.value) is str
+                       and re.fullmatch(r"⏳ Working — \d+ min(?: — [^\r\n]*)?", text.value))
+    if not fixed_heartbeat and not any(_same_expression(text, item) for item in known_templates):
+        raise ValueError("task heartbeat message template changed")
+    source_writes = [node.id for node in ast.walk(scope)
+                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                     and node.id in {"source", "session_key", "agent_holder"}]
+    for method, count, arguments in (
+        ("send", 2, ("source.chat_id", "_heartbeat_text")),
+        ("edit_message", 3, ("source.chat_id", "_heartbeat_msg_id", "_heartbeat_text")),
+    ):
+        calls = [node for node in ast.walk(scope) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == method]
+        if (len(calls) != 1 or not any(_same_expression(calls[0].func, f"{name}.{method}")
+                                     for name in ("adapter", "_notify_adapter"))
+                or len(calls[0].args) != count
+                or not all(_same_expression(value, expected_value)
+                           for value, expected_value in zip(calls[0].args, arguments))
+                or any(item.arg != "metadata" for item in calls[0].keywords)):
+            raise ValueError("task heartbeat delivery contract changed")
+    if scope.name == "_run_agent_notify_long_running":
+        binding = ast.parse("source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder").body[0]
+        if (sorted(source_writes) != ["agent_holder", "session_key", "source"]
+                or not any(ast.dump(node) == ast.dump(binding) for node in scope.body)):
+            raise ValueError("task heartbeat source contract changed")
+    elif source_writes:
+        raise ValueError("task heartbeat source contract changed")
+    lines = content.splitlines(keepends=True)
+    index = guard.end_lineno
+    lines[index:index] = _render_task_heartbeat_hook_block(
+        _line_indent(lines, guard.lineno - 1), _detect_newline(content))
+    return "".join(lines)
+
+
+def _apply_slash_confirm_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        SLASH_CONFIRM_PATCH_BEGIN,
+        SLASH_CONFIRM_PATCH_END,
+        "slash confirm patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_slash_confirm_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = _find_async_function(tree, "_request_slash_confirm")
+    if func is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    start = max(func.lineno - 1, 0)
+    end = getattr(func, "end_lineno", None)
+    if end is None:
+        end = len(lines)
+    anchor = "_slash_confirm_mod.register(session_key, confirm_id, command, handler)"
+    for index in range(start, min(end, len(lines))):
+        if _strip_line_ending(lines[index]).strip() != anchor:
+            continue
+        indent = _leading_whitespace(_strip_line_ending(lines[index]))
+        newline = _line_ending(lines[index]) or _detect_newline(content)
+        hook = _render_slash_confirm_hook_block(indent, newline)
+        return "".join(lines[: index + 1] + hook + lines[index + 1 :])
+    return content
+
+
+def _apply_command_card_adapter_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        COMMAND_CARD_PATCH_BEGIN,
+        COMMAND_CARD_PATCH_END,
+        "command card patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_command_card_adapter_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = _find_async_function(tree, "_handle_message")
+    if func is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    start = max(func.lineno - 1, 0)
+    end = getattr(func, "end_lineno", None)
+    if end is None:
+        end = len(lines)
+    for index in range(start, min(end, len(lines))):
+        if _strip_line_ending(lines[index]).strip() not in {"source = event.source", "event, source, is_internal = _admitted"}:
+            continue
+        indent = _leading_whitespace(_strip_line_ending(lines[index]))
+        newline = _line_ending(lines[index]) or _detect_newline(content)
+        hook = _render_command_card_adapter_hook_block(indent, newline)
+        return "".join(lines[: index + 1] + hook + lines[index + 1 :])
+    return content
+
+
+def _apply_command_card_startup_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        COMMAND_CARD_STARTUP_PATCH_BEGIN,
+        COMMAND_CARD_STARTUP_PATCH_END,
+        "command card startup patch markers",
+    )
+    if owned_block is not None:
+        stripped = _remove_simple_owned_patch(
+            content,
+            COMMAND_CARD_STARTUP_PATCH_BEGIN,
+            COMMAND_CARD_STARTUP_PATCH_END,
+            _render_command_card_startup_hook_block,
+            "command card startup patch markers",
+        )
+        if stripped != content:
+            return _apply_command_card_startup_patch(stripped)
+
+    tree = _parse_content(content)
+    func = (_find_gateway_runner_method(tree, "_start_finish_wiring")
+            or _find_gateway_runner_method(tree, "start"))
+    if func is None:
+        return content
+    anchor = (_find_startup_boot_send(func) or _find_redelivery_startup_call(func)
+              or _find_recovered_watcher_drain(func))
+    if anchor is None or anchor.lineno is None:
+        return content
+
+    lines = content.splitlines(keepends=True)
+    insert_at = anchor.lineno - 1
+    indent = _line_indent(lines, insert_at)
+    newline = _line_ending(lines[insert_at]) or _detect_newline(content)
+    hook = _render_command_card_startup_hook_block(indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_native_redelivery_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        NATIVE_REDELIVERY_PATCH_BEGIN,
+        NATIVE_REDELIVERY_PATCH_END,
+        "native redelivery patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_native_redelivery_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = (_find_gateway_runner_method(tree, "_redeliver_claimed_obligations")
+            or _find_gateway_runner_method(tree, "_redeliver_pending_obligations"))
+    if func is None:
+        return content
+    send = _find_redelivery_adapter_send(func)
+    if send is None or send.lineno is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    insert_at = send.lineno - 1
+    indent = _line_indent(lines, insert_at)
+    newline = _line_ending(lines[insert_at]) or _detect_newline(content)
+    hook = _render_native_redelivery_hook_block(indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_platform_notice_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        PLATFORM_NOTICE_PATCH_BEGIN,
+        PLATFORM_NOTICE_PATCH_END,
+        "platform notice patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_platform_notice_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = _find_async_function(tree, "_deliver_platform_notice")
+    if func is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    notice_body = _body_location(func, lines)
+    if notice_body is None:
+        return content
+
+    newline = _detect_newline(content)
+    insert_at, body_indent = notice_body
+    hook = _render_platform_notice_hook_block(body_indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_hfc_command_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        HFC_COMMAND_PATCH_BEGIN,
+        HFC_COMMAND_PATCH_END,
+        "hfc command patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_hfc_command_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = _find_async_function(tree, "_handle_message")
+    if func is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    start = max(func.lineno - 1, 0)
+    end = getattr(func, "end_lineno", None)
+    if end is None:
+        end = len(lines)
+    anchor = "_quick_key = self._session_key_for_source(source)"
+    for index in range(start, min(end, len(lines))):
+        if _strip_line_ending(lines[index]).strip() != anchor:
+            continue
+        indent = _leading_whitespace(_strip_line_ending(lines[index]))
+        newline = _line_ending(lines[index]) or _detect_newline(content)
+        hook = _render_hfc_command_hook_block(indent, newline)
+        return "".join(lines[: index + 1] + hook + lines[index + 1 :])
+    return content
+
+
+def remove_patch(content: str) -> str:
+    """Remove the owned Feishu card hook block from patched Hermes content."""
+    content = _remove_busy_recall_patch(content)
+    content = _remove_long_running_recall_patch(content)
+    content = _remove_simple_owned_patch(content, TASK_HEARTBEAT_PATCH_BEGIN,
+        TASK_HEARTBEAT_PATCH_END, _render_task_heartbeat_hook_block, "task heartbeat patch markers")
+    from .provider_route import remove_provider_route_patch
+    content = remove_provider_route_patch(content)
+    content = _remove_simple_owned_patch(
+        content, STALE_INTERRUPTED_PATCH_BEGIN, STALE_INTERRUPTED_PATCH_END,
+        _render_stale_interrupted_hook_block, "stale interrupted patch markers")
+    content = _remove_simple_owned_patch(
+        content, TURN_TIMING_PATCH_BEGIN, TURN_TIMING_PATCH_END,
+        _render_turn_timing_hook_block, "turn timing patch markers")
+    content = _remove_cron_patch(content)
+    content = _remove_simple_owned_patch(
+        content,
+        COMMAND_CARD_STARTUP_PATCH_BEGIN,
+        COMMAND_CARD_STARTUP_PATCH_END,
+        _render_command_card_startup_hook_block,
+        "command card startup patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        NATIVE_REDELIVERY_PATCH_BEGIN,
+        NATIVE_REDELIVERY_PATCH_END,
+        _render_native_redelivery_hook_block,
+        "native redelivery patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        COMMAND_CARD_PATCH_BEGIN,
+        COMMAND_CARD_PATCH_END,
+        _render_command_card_adapter_hook_block,
+        "command card patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        HFC_COMMAND_PATCH_BEGIN,
+        HFC_COMMAND_PATCH_END,
+        _render_hfc_command_hook_block,
+        "hfc command patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        PLATFORM_NOTICE_PATCH_BEGIN,
+        PLATFORM_NOTICE_PATCH_END,
+        _render_platform_notice_hook_block,
+        "platform notice patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        SLASH_CONFIRM_PATCH_BEGIN,
+        SLASH_CONFIRM_PATCH_END,
+        _render_slash_confirm_hook_block,
+        "slash confirm patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        STABLE_TOOL_PATCH_BEGIN,
+        STABLE_TOOL_PATCH_END,
+        _render_stable_tool_lifecycle_hook_block,
+        "stable tool lifecycle patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        TOOL_PATCH_BEGIN,
+        TOOL_PATCH_END,
+        _render_tool_hook_block,
+        "tool patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        ANSWER_DELTA_PATCH_BEGIN,
+        ANSWER_DELTA_PATCH_END,
+        _render_answer_delta_hook_block,
+        "answer delta patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        THINKING_DELTA_PATCH_BEGIN,
+        THINKING_DELTA_PATCH_END,
+        _render_thinking_delta_hook_block,
+        "thinking delta patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        CLARIFY_PATCH_BEGIN,
+        CLARIFY_PATCH_END,
+        _render_clarify_hook_block,
+        "clarify patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        APPROVAL_PATCH_BEGIN,
+        APPROVAL_PATCH_END,
+        _render_approval_hook_block,
+        "approval patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        STATUS_PATCH_BEGIN,
+        STATUS_PATCH_END,
+        _render_status_hook_block,
+        "status callback patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        QUEUED_FINAL_PATCH_BEGIN,
+        QUEUED_FINAL_PATCH_END,
+        _render_queued_final_hook_block,
+        "queued final patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        QUEUED_FOLLOWUP_PATCH_BEGIN,
+        QUEUED_FOLLOWUP_PATCH_END,
+        _render_queued_followup_hook_block,
+        "queued follow-up patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        REDIRECT_PATCH_BEGIN,
+        REDIRECT_PATCH_END,
+        _render_redirect_hook_block,
+        "redirect patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        QUEUED_COMPLETE_PATCH_BEGIN,
+        QUEUED_COMPLETE_PATCH_END,
+        _render_queued_complete_hook_block,
+        "queued completion patch markers",
+    )
+    content = _remove_complete_patch(content)
+    owned_block = _find_owned_block(content)
+    if owned_block is None:
+        return content
+
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index = owned_block
+    if _has_no_final_newline_sentinel(lines, begin_index):
+        return "".join(
+            lines[: begin_index - 2]
+            + [_strip_line_ending(lines[begin_index - 2])]
+            + lines[end_index + 1 :]
+        )
+    return "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+
+def remove_cron_patch(content: str) -> str:
+    """Remove the owned Feishu card cron hook block from patched Hermes content."""
+    return _remove_cron_patch(content)
+
+
+def remove_cron_patch_lenient(content: str) -> str:
+    """Remove an older generated cron block without requiring its exact body."""
+    owned_block = _find_simple_marker_block(
+        content,
+        CRON_PATCH_BEGIN,
+        CRON_PATCH_END,
+        "cron patch markers",
+    )
+    if owned_block is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index = owned_block
+    return "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+
+def remove_patch_lenient(content: str) -> str:
+    """Remove owned patch markers, accepting older generated block bodies."""
+    content = _remove_busy_recall_patch(content)
+    content = _remove_long_running_recall_patch(content)
+    owned_complete_block = _find_simple_marker_block(
+        content,
+        COMPLETE_PATCH_BEGIN,
+        COMPLETE_PATCH_END,
+        "completion patch markers",
+    )
+    if owned_complete_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_complete_block
+        content = "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+    for begin_marker, end_marker in (
+        (PATCH_BEGIN, PATCH_END),
+        (TURN_TIMING_PATCH_BEGIN, TURN_TIMING_PATCH_END),
+        (STALE_INTERRUPTED_PATCH_BEGIN, STALE_INTERRUPTED_PATCH_END),
+        (TASK_HEARTBEAT_PATCH_BEGIN, TASK_HEARTBEAT_PATCH_END),
+        (STABLE_TOOL_PATCH_BEGIN, STABLE_TOOL_PATCH_END),
+        (TOOL_PATCH_BEGIN, TOOL_PATCH_END),
+        (ANSWER_DELTA_PATCH_BEGIN, ANSWER_DELTA_PATCH_END),
+        (THINKING_DELTA_PATCH_BEGIN, THINKING_DELTA_PATCH_END),
+        (CLARIFY_PATCH_BEGIN, CLARIFY_PATCH_END),
+        (APPROVAL_PATCH_BEGIN, APPROVAL_PATCH_END),
+        (STATUS_PATCH_BEGIN, STATUS_PATCH_END),
+        (COMMAND_CARD_STARTUP_PATCH_BEGIN, COMMAND_CARD_STARTUP_PATCH_END),
+        (NATIVE_REDELIVERY_PATCH_BEGIN, NATIVE_REDELIVERY_PATCH_END),
+        (COMMAND_CARD_PATCH_BEGIN, COMMAND_CARD_PATCH_END),
+        (HFC_COMMAND_PATCH_BEGIN, HFC_COMMAND_PATCH_END),
+        (PLATFORM_NOTICE_PATCH_BEGIN, PLATFORM_NOTICE_PATCH_END),
+        (SLASH_CONFIRM_PATCH_BEGIN, SLASH_CONFIRM_PATCH_END),
+        (QUEUED_COMPLETE_PATCH_BEGIN, QUEUED_COMPLETE_PATCH_END),
+    ):
+        owned_block = _find_simple_marker_block(
+            content,
+            begin_marker,
+            end_marker,
+            "callback patch markers",
+        )
+        if owned_block is not None:
+            lines = content.splitlines(keepends=True)
+            begin_index, end_index = owned_block
+            content = "".join(lines[:begin_index] + lines[end_index + 1 :])
+    return remove_patch(content)
+
+
+def _remove_complete_patch(content: str) -> str:
+    owned_block = _find_owned_complete_block(content)
+    if owned_block is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index = owned_block
+    return "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+
+def _apply_callback_patch(
+    content: str,
+    *,
+    callback_name: str,
+    begin_marker: str,
+    end_marker: str,
+    renderer,
+    required_outer_names=(),
+    required_callback_args=(),
+    required_callback_calls=(),
+    allow_turn_context=False,
+) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        begin_marker,
+        end_marker,
+        "callback patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        # A marker proves ownership of these lines, not the identity of the
+        # callback that still runs. Re-select from the original source for every
+        # callback, including progress/interim callbacks without preferred calls.
+        # Unknown/ambiguous optional seams stay unpatched instead of retaining a
+        # stale hook and reporting it as a verified installation.
+        content = "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    lines = content.splitlines(keepends=True)
+    callback_body = _find_callback_body_location(
+        tree,
+        lines,
+        callback_name,
+        required_outer_names=required_outer_names,
+        required_callback_args=required_callback_args,
+        required_callback_calls=required_callback_calls,
+    )
+    use_turn_context = False
+    if callback_body is None and allow_turn_context:
+        callback_body = _find_turn_runner_callback_body_location(
+            tree,
+            lines,
+            callback_name,
+            required_callback_args=required_callback_args,
+            required_callback_calls=required_callback_calls,
+        )
+        use_turn_context = callback_body is not None
+    if callback_body is None:
+        return content
+
+    newline = _detect_newline(content)
+    insert_at, body_indent = callback_body
+    hook = (
+        _render_turn_context_hook_block(renderer, body_indent, newline)
+        if use_turn_context
+        else renderer(body_indent, newline)
+    )
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_stable_tool_lifecycle_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        STABLE_TOOL_PATCH_BEGIN,
+        STABLE_TOOL_PATCH_END,
+        "stable tool lifecycle patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        unpatched = "".join(lines[:begin_index] + lines[end_index + 1 :])
+        return _apply_stable_tool_lifecycle_patch(unpatched)
+
+    tree = _parse_content(content)
+    lines = content.splitlines(keepends=True)
+    location = _find_stable_tool_lifecycle_location(tree, lines)
+    use_turn_context = False
+    if location is None:
+        location = _find_turn_runner_stable_tool_lifecycle_location(tree, lines)
+        use_turn_context = location is not None
+    if location is None:
+        return content
+    insert_at, indent = location
+    newline = _detect_newline(content)
+    hook = (
+        _render_turn_context_hook_block(
+            _render_stable_tool_lifecycle_hook_block, indent, newline
+        )
+        if use_turn_context
+        else _render_stable_tool_lifecycle_hook_block(indent, newline)
+    )
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_cron_patch(content: str) -> str:
+    owned_block = _find_owned_cron_block(content)
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index, media_aware = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        tree = _parse_content_with_markers(content)
+        desired_media_aware = _find_cron_media_delivery_location(tree, lines) is not None
+        if media_aware != desired_media_aware:
+            unpatched = "".join(lines[:begin_index] + lines[end_index + 1 :])
+            return _apply_cron_patch(unpatched)
+        expected = _render_cron_hook_block(
+            indent,
+            newline,
+            media_aware=media_aware,
+        )
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    lines = content.splitlines(keepends=True)
+    media_delivery = _find_cron_media_delivery_location(tree, lines)
+    location = media_delivery or _find_cron_deliver_body_location(tree, lines)
+    if location is None:
+        return content
+
+    newline = _detect_newline(content)
+    insert_at, body_indent = location
+    hook = _render_cron_hook_block(
+        body_indent,
+        newline,
+        media_aware=media_delivery is not None,
+    )
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _remove_simple_owned_patch(
+    content: str,
+    begin_marker: str,
+    end_marker: str,
+    renderer,
+    error_label: str,
+) -> str:
+    owned_block = _find_simple_owned_patch(
+        content, begin_marker, end_marker, renderer, error_label
+    )
+    if owned_block is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index = owned_block
+    return "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+
+def _remove_cron_patch(content: str) -> str:
+    owned_block = _find_owned_cron_block(content)
+    if owned_block is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index, _media_aware = owned_block
+    return "".join(lines[:begin_index] + lines[end_index + 1 :])
+
+
+def _parse_content(content: str):
+    try:
+        return ast.parse(content)
+    except SyntaxError as exc:
+        raise ValueError("could not find safe handler") from exc
+
+
+def _find_handler_body_location(tree, lines):
+    for node in tree.body:
+        if _is_handler(node):
+            return _body_location(node, lines)
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if _is_handler(child):
+                    return _body_location(child, lines)
+
+    return None
+
+
+def _find_completion_return_location(tree, lines, completion_node=None):
+    handler = completion_node or _find_handler_node(tree)
+    if handler is None:
+        return None
+
+    decomposed = completion_node or _find_decomposed_completion_node(tree)
+    if decomposed is not None:
+        handler = decomposed
+    already_sent_location = _find_already_sent_early_return_location(handler, lines)
+    if already_sent_location is not None:
+        return already_sent_location
+
+    returns = [
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Return)
+        and isinstance(getattr(node, "value", None), ast.Name)
+        and node.value.id == "response"
+        and node.lineno is not None
+    ]
+    if not returns:
+        return None
+
+    target = max(returns, key=lambda node: node.lineno)
+    insert_at = target.lineno - 1
+    return insert_at, _line_indent(lines, insert_at)
+
+
+def _find_already_sent_early_return_location(handler, lines):
+    """Locate the streaming `already_sent` early-return branch, if present.
+
+    Hermes 0.18.x returns None from the handler before the final
+    `return response` when gateway streaming already delivered the text
+    (``if agent_result.get("already_sent") and not agent_result.get("failed"):``).
+    The completion hook must run before that branch or streamed turns never
+    emit ``message.completed``.
+    """
+    candidates = []
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.If) or node.lineno is None:
+            continue
+        try:
+            test_source = ast.unparse(node.test)
+        except Exception:
+            continue
+        if "agent_result.get('already_sent')" not in test_source:
+            continue
+        if "not agent_result.get('failed')" not in test_source:
+            continue
+        if not _branch_returns(node.body):
+            continue
+        candidates.append(node)
+    if not candidates:
+        return None
+
+    target = min(candidates, key=lambda node: node.lineno)
+    insert_at = target.lineno - 1
+    return insert_at, _line_indent(lines, insert_at)
+
+
+def _branch_returns(body) -> bool:
+    for node in body:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Return):
+                return True
+    return False
+
+
+def _find_callback_body_location(
+    tree,
+    lines,
+    callback_name: str,
+    *,
+    required_outer_names=(),
+    required_callback_args=(),
+    required_callback_calls=(),
+):
+    run_agent = _find_run_agent_node(tree)
+    if run_agent is None:
+        return None
+    candidates = []
+    for node in ast.walk(run_agent):
+        if isinstance(node, ast.FunctionDef) and node.name == callback_name:
+            if not _has_required_callback_scope(
+                run_agent,
+                node,
+                required_outer_names,
+                required_callback_args,
+            ):
+                continue
+            candidates.append(node)
+    candidate = _select_callback_candidate(candidates, required_callback_calls)
+    return _body_location(candidate, lines) if candidate is not None else None
+
+
+def _select_callback_candidate(candidates, required_callback_calls=()):
+    """Keep the established preferred-call fallback, but never guess a target."""
+    if required_callback_calls:
+        preferred = [
+            node for node in candidates
+            if _has_required_callback_calls(node, required_callback_calls)
+        ]
+        if preferred:
+            candidates = preferred
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _find_turn_runner_callback_body_location(
+    tree,
+    lines,
+    callback_name: str,
+    *,
+    required_callback_args=(),
+    required_callback_calls=(),
+):
+    turn_runner = _find_turn_runner_node(tree)
+    if turn_runner is None:
+        return None
+
+    direct_context = any(isinstance(n, ast.FunctionDef) and n.name == callback_name
+                         and _binds_turn_context(n) for n in turn_runner.body)
+    if direct_context:
+        candidates = [
+            node
+            for node in turn_runner.body
+            if isinstance(node, ast.FunctionDef) and node.name == callback_name
+        ]
+    else:
+        run_sync = _find_direct_class_function_node(turn_runner, "_setup_stream_consumer")
+        if run_sync is not None:
+            callback_name = {"_stream_delta_cb": "stream_delta_cb", "_interim_assistant_cb": "interim_assistant_cb"}.get(callback_name, callback_name)
+        else:
+            run_sync = _find_direct_class_function_node(turn_runner, "run_sync")
+        if run_sync is None or not _binds_turn_context(run_sync):
+            return None
+        candidates = [
+            node
+            for node in ast.walk(run_sync)
+            if isinstance(node, ast.FunctionDef) and node.name == callback_name
+        ]
+
+    candidates = [
+        node
+        for node in candidates
+        if set(required_callback_args).issubset(_function_argument_names(node))
+    ]
+    if direct_context:
+        candidates = [node for node in candidates if _binds_turn_context(node)]
+    candidate = _select_callback_candidate(candidates, required_callback_calls)
+    if candidate is None:
+        return None
+    if direct_context:
+        return _turn_context_binding_location(candidate, lines)
+    return _body_location(candidate, lines)
+
+
+def _find_stable_tool_lifecycle_location(tree, lines):
+    run_agent = _find_run_agent_node(tree)
+    if run_agent is None:
+        return None
+    required_names = {
+        "agent",
+        "source",
+        "event_message_id",
+        "_loop_for_step",
+        "_run_still_current",
+        "progress_callback",
+    }
+    if not required_names.issubset(_function_scope_names(run_agent)):
+        return None
+    return _last_stable_tool_lifecycle_assignment_location(run_agent, lines)
+
+
+def _find_turn_runner_stable_tool_lifecycle_location(tree, lines):
+    turn_runner = _find_turn_runner_node(tree)
+    if turn_runner is None:
+        return None
+    run_sync = (_find_direct_class_function_node(turn_runner, "_wire_turn_agent_callbacks")
+                or _find_direct_class_function_node(turn_runner, "run_sync"))
+    if run_sync is None or not _binds_turn_context(run_sync):
+        return None
+    if "agent" not in _function_scope_names(run_sync):
+        return None
+    return _last_stable_tool_lifecycle_assignment_location(run_sync, lines)
+
+
+def _unconditionally_executed_statements(function_node):
+    """The statements that run on EVERY call: the function body, plus any ``try`` protected body.
+
+    Used to keep this module's anchors on the assignment that always executes. Hermes reassigns
+    the tool callbacks in more than one place; 0.21.3 added a NEW reassignment deep inside
+    ``if ctx.mute_notification_reply:`` (a branch that is normally False) which sits later in the
+    function than the unconditional one. "The last assignment wins" therefore parked the tool
+    lifecycle block INSIDE that branch, where it never ran: the callbacks were never wrapped, no
+    tool events reached the sidecar, and the card lost its tool row and tool count while the tool
+    lines leaked back to plain text. Anchor on what always runs, not on what is merely last.
+    """
+    allowed = set()
+
+    def visit(body):
+        for stmt in body:
+            allowed.add(id(stmt))
+            # A `try` protected body runs whether or not it later raises; handlers/orelse/finally
+            # are conditional (`finally` is unconditional in fact, but nothing anchors there).
+            if isinstance(stmt, ast.Try):
+                visit(stmt.body)
+
+    visit(function_node.body)
+    return allowed
+
+
+def _last_stable_tool_lifecycle_assignment_location(function_node, lines):
+    # Hermes configures the per-turn callbacks in this order:
+    # initial tool callbacks -> approval wrappers -> reasoning reset.  Bind HFC
+    # after the reset, or the upstream assignments silently replace our sinks.
+    # A later `mute_notification_reply` branch intentionally clears presentation
+    # callbacks and must remain after the anchor.
+    callback_names = {
+        "tool_start_callback",
+        "tool_complete_callback",
+        "reasoning_callback",
+    }
+    allowed = _unconditionally_executed_statements(function_node)
+    candidates = []
+    for node in ast.walk(function_node):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            _is_agent_callback_target(target, callback_name)
+            for target in targets
+            for callback_name in callback_names
+        ):
+            continue
+        if id(node) in allowed:
+            candidates.append(node)
+    # Unknown conditional-only layouts cannot prove that the hook will run.
+    # Leave the capability unavailable rather than installing an inert hook.
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda node: getattr(node, "end_lineno", None) or node.lineno,
+    )
+    # Do not claim an anchor that a later, unknown branch can overwrite.  The
+    # only known post-anchor reassignment is the intentional muted-turn clear:
+    # a direct child of an exact ``if ctx.mute_notification_reply:`` (or the
+    # legacy bare spelling) that assigns None to a presentation callback.
+    parents = {child: parent for parent in ast.walk(function_node)
+               for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(function_node):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            _is_agent_callback_target(target, callback_name)
+            for target in targets
+            for callback_name in callback_names
+        ):
+            continue
+        if (getattr(node, "lineno", 0) or 0) <= latest.lineno:
+            continue
+        if not _is_exact_mute_clear_assignment(node, parents.get(node)):
+            return None
+    end_lineno = getattr(latest, "end_lineno", None) or latest.lineno
+    return end_lineno, _line_indent(lines, latest.lineno - 1)
+
+
+def _is_exact_mute_clear_assignment(node, parent) -> bool:
+    """Accept only the known direct muted-turn callback clear."""
+    if not isinstance(parent, ast.If) or parent.orelse or node not in parent.body:
+        return False
+    if not (
+        _same_expression(parent.test, "ctx.mute_notification_reply")
+        or _same_expression(parent.test, "mute_notification_reply")
+    ):
+        return False
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    value = node.value
+    return (
+        isinstance(value, ast.Constant)
+        and value.value is None
+        and any(
+            _is_agent_callback_target(target, callback_name)
+            for target in targets
+            for callback_name in (
+                "tool_progress_callback",
+                "tool_start_callback",
+                "tool_complete_callback",
+                "reasoning_callback",
+            )
+        )
+    )
+
+
+def _find_turn_runner_node(tree):
+    return next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "TurnRunner"
+        ),
+        None,
+    )
+
+
+def _find_direct_class_function_node(class_node, name: str):
+    return next(
+        (
+            node
+            for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ),
+        None,
+    )
+
+
+def _binds_turn_context(node) -> bool:
+    return _find_turn_context_binding(node) is not None
+
+
+def _find_turn_context_binding(node):
+    for statement in node.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        value = statement.value
+        if (
+            isinstance(target, ast.Name)
+            and target.id == "ctx"
+            and isinstance(value, ast.Attribute)
+            and value.attr == "_ctx"
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "self"
+        ):
+            return statement
+    return None
+
+
+def _turn_context_binding_location(node, lines):
+    binding = _find_turn_context_binding(node)
+    if binding is None:
+        return None
+    end_lineno = getattr(binding, "end_lineno", None) or binding.lineno
+    return end_lineno, _line_indent(lines, binding.lineno - 1)
+
+
+def _is_agent_callback_target(node, attribute: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attribute
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "agent"
+    )
+
+
+def _has_required_callback_scope(
+    run_agent,
+    callback,
+    required_outer_names,
+    required_callback_args,
+) -> bool:
+    outer_names = _function_scope_names(run_agent)
+    callback_args = _function_argument_names(callback)
+    return set(required_outer_names).issubset(outer_names) and set(
+        required_callback_args
+    ).issubset(callback_args)
+
+
+def _has_required_callback_calls(callback, required_callback_calls) -> bool:
+    if not required_callback_calls:
+        return True
+    calls = {
+        (child.func.value.id, child.func.attr)
+        for child in ast.walk(callback)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and isinstance(child.func.value, ast.Name)
+    }
+    return set(required_callback_calls).issubset(calls)
+
+
+def _function_scope_names(node) -> set[str]:
+    names = set(_function_argument_names(node))
+    for child in ast.walk(node):
+        if child is node:
+            continue
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(child.name)
+        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            names.add(child.id)
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            names.add(child.name)
+        elif isinstance(child, ast.arg):
+            continue
+    return names
+
+
+def _function_argument_names(node) -> set[str]:
+    args = []
+    args.extend(getattr(node.args, "posonlyargs", []))
+    args.extend(node.args.args)
+    args.extend(node.args.kwonlyargs)
+    if node.args.vararg is not None:
+        args.append(node.args.vararg)
+    if node.args.kwarg is not None:
+        args.append(node.args.kwarg)
+    return {arg.arg for arg in args}
+
+
+def _is_handler(node) -> bool:
+    return isinstance(node, ast.AsyncFunctionDef) and node.name == _HANDLER_NAME
+
+
+def _find_owned_block(content: str):
+    begin_count = content.count(PATCH_BEGIN)
+    end_count = content.count(PATCH_END)
+    lines = content.splitlines(keepends=True)
+    sentinel_indexes = _sentinel_line_indexes(lines)
+    if begin_count == 0 and end_count == 0:
+        if sentinel_indexes:
+            raise ValueError("corrupt patch markers")
+        return None
+    if begin_count != 1 or end_count != 1:
+        raise ValueError("corrupt patch markers")
+
+    begin_index = _exact_marker_line_index(lines, PATCH_BEGIN)
+    end_index = _exact_marker_line_index(lines, PATCH_END)
+    if begin_index is None or end_index is None or begin_index >= end_index:
+        raise ValueError("corrupt patch markers")
+
+    _validate_sentinel_marker_adjacency(sentinel_indexes, begin_index)
+
+    indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+    newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+    legacy = _render_hook_block(indent, newline, strategy="legacy_gateway_run")
+    gateway_013_plus = _render_hook_block(
+        indent, newline, strategy="gateway_run_013_plus"
+    )
+    legacy_without_commands = _render_hook_block_without_commands(
+        indent, newline, strategy="legacy_gateway_run"
+    )
+    gateway_013_plus_without_commands = _render_hook_block_without_commands(
+        indent, newline, strategy="gateway_run_013_plus"
+    )
+    placeholder = _render_placeholder_hook_block(indent, newline)
+    legacy_silent = _with_silent_exception_handler(legacy, indent, newline)
+    gateway_013_plus_silent = _with_silent_exception_handler(
+        gateway_013_plus, indent, newline
+    )
+    legacy_without_commands_silent = _with_silent_exception_handler(
+        legacy_without_commands, indent, newline
+    )
+    gateway_013_plus_without_commands_silent = _with_silent_exception_handler(
+        gateway_013_plus_without_commands, indent, newline
+    )
+    placeholder_silent = _with_silent_exception_handler(placeholder, indent, newline)
+    actual = lines[begin_index : end_index + 1]
+
+    gateway_013_plus_pre_idle = _render_hook_block(
+        indent, newline, strategy="gateway_run_013_plus", isolate_turn=False
+    )
+    if actual not in (
+        gateway_013_plus_pre_idle,
+        _with_silent_exception_handler(gateway_013_plus_pre_idle, indent, newline),
+        legacy,
+        gateway_013_plus,
+        legacy_without_commands,
+        gateway_013_plus_without_commands,
+        placeholder,
+        legacy_silent,
+        gateway_013_plus_silent,
+        legacy_without_commands_silent,
+        gateway_013_plus_without_commands_silent,
+        placeholder_silent,
+    ):
+        raise ValueError("corrupt patch markers")
+
+    tree = _parse_content_with_markers(content)
+    if _has_no_final_newline_sentinel(lines, begin_index):
+        _validate_no_final_newline_sentinel(lines, begin_index, end_index, tree)
+
+    handler_body = _find_handler_body_location(tree, lines)
+    if handler_body is None:
+        raise ValueError("corrupt patch markers")
+
+    first_body_index, _body_indent = handler_body
+    expected_begin_index = (
+        first_body_index - 2
+        if actual
+        in (
+            gateway_013_plus_pre_idle,
+            _with_silent_exception_handler(gateway_013_plus_pre_idle, indent, newline),
+            gateway_013_plus,
+            gateway_013_plus_silent,
+            gateway_013_plus_without_commands,
+            gateway_013_plus_without_commands_silent,
+        )
+        else first_body_index - 1
+    )
+    if begin_index != expected_begin_index:
+        raise ValueError("corrupt patch markers")
+    return begin_index, end_index
+
+
+def _find_owned_complete_block(content: str):
+    begin_count = content.count(COMPLETE_PATCH_BEGIN)
+    end_count = content.count(COMPLETE_PATCH_END)
+    if begin_count == 0 and end_count == 0:
+        return None
+    if begin_count != 1 or end_count != 1:
+        raise ValueError("corrupt completion patch markers")
+
+    lines = content.splitlines(keepends=True)
+    begin_index = _exact_marker_line_index(lines, COMPLETE_PATCH_BEGIN)
+    end_index = _exact_marker_line_index(lines, COMPLETE_PATCH_END)
+    if begin_index is None or end_index is None or begin_index >= end_index:
+        raise ValueError("corrupt completion patch markers")
+
+    indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+    newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+    expected_with_anchor = _render_complete_hook_block_with_reply_anchor(indent, newline)
+    expected = _render_complete_hook_block(indent, newline)
+    v400 = _render_v400_complete_hook_block(indent, newline)
+    pre_exact_with_anchor = _render_pre_exact_complete_hook_block_with_reply_anchor(
+        indent, newline
+    )
+    pre_exact = _render_pre_exact_complete_hook_block(indent, newline)
+    pre_exact_v400 = _render_pre_exact_v400_complete_hook_block(indent, newline)
+    legacy = _render_legacy_complete_hook_block(indent, newline)
+    previous_async = _render_previous_async_complete_hook_block(indent, newline)
+    previous_async_without_platform = (
+        _render_previous_async_complete_hook_block_without_platform_guard(indent, newline)
+    )
+    expected_with_anchor_silent = _with_silent_exception_handler(
+        expected_with_anchor, indent, newline
+    )
+    expected_silent = _with_silent_exception_handler(expected, indent, newline)
+    v400_silent = _with_silent_exception_handler(v400, indent, newline)
+    pre_exact_with_anchor_silent = _with_silent_exception_handler(
+        pre_exact_with_anchor, indent, newline
+    )
+    pre_exact_silent = _with_silent_exception_handler(pre_exact, indent, newline)
+    pre_exact_v400_silent = _with_silent_exception_handler(
+        pre_exact_v400, indent, newline
+    )
+    legacy_silent = _with_silent_exception_handler(legacy, indent, newline)
+    previous_async_silent = _with_silent_exception_handler(
+        previous_async, indent, newline
+    )
+    previous_async_without_platform_silent = _with_silent_exception_handler(
+        previous_async_without_platform, indent, newline
+    )
+    actual = lines[begin_index : end_index + 1]
+    if actual not in (
+        _render_decomposed_complete_hook_block(indent, newline),
+        expected_with_anchor,
+        expected,
+        v400,
+        pre_exact_with_anchor,
+        pre_exact,
+        pre_exact_v400,
+        legacy,
+        previous_async,
+        previous_async_without_platform,
+        expected_with_anchor_silent,
+        expected_silent,
+        v400_silent,
+        pre_exact_with_anchor_silent,
+        pre_exact_silent,
+        pre_exact_v400_silent,
+        legacy_silent,
+        previous_async_silent,
+        previous_async_without_platform_silent,
+    ):
+        raise ValueError("corrupt completion patch markers")
+    return begin_index, end_index
+
+
+def _find_owned_cron_block(content: str):
+    marker_block = _find_simple_marker_block(
+        content,
+        CRON_PATCH_BEGIN,
+        CRON_PATCH_END,
+        "cron patch markers",
+    )
+    if marker_block is None:
+        return None
+
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index = marker_block
+    indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+    newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+    actual = lines[begin_index : end_index + 1]
+    pre_media = _render_cron_hook_block(indent, newline, media_aware=False)
+    post_media = _render_cron_hook_block(indent, newline, media_aware=True)
+    pre_media_silent = _with_silent_exception_handler(pre_media, indent, newline)
+    post_media_silent = _with_silent_exception_handler(post_media, indent, newline)
+    if actual in (post_media, post_media_silent):
+        media_aware = True
+    elif actual in (pre_media, pre_media_silent):
+        media_aware = False
+    else:
+        raise ValueError("corrupt cron patch markers")
+
+    tree = _parse_content_with_markers(content)
+    location = (
+        _find_cron_media_delivery_location(tree, lines)
+        if media_aware
+        else _find_cron_deliver_body_location(tree, lines)
+    )
+    if location is None:
+        raise ValueError("corrupt cron patch markers")
+    insert_at, _body_indent = location
+    expected_begin_index = insert_at if media_aware else insert_at - 1
+    if begin_index != expected_begin_index:
+        raise ValueError("corrupt cron patch markers")
+    return begin_index, end_index, media_aware
+
+
+def _parse_content_with_markers(content: str):
+    try:
+        return ast.parse(content)
+    except SyntaxError as exc:
+        raise ValueError("corrupt patch markers") from exc
+
+
+def _sentinel_line_indexes(lines):
+    return [
+        index
+        for index, line in enumerate(lines)
+        if _strip_line_ending(line)
+        == _leading_whitespace(_strip_line_ending(line)) + _NO_FINAL_NEWLINE
+    ]
+
+
+def _validate_sentinel_marker_adjacency(sentinel_indexes, begin_index: int) -> None:
+    if not sentinel_indexes:
+        return
+    if len(sentinel_indexes) != 1 or sentinel_indexes[0] != begin_index - 1:
+        raise ValueError("corrupt patch markers")
+
+
+def _validate_no_final_newline_sentinel(lines, begin_index: int, end_index: int, tree) -> None:
+    if end_index != len(lines) - 1:
+        raise ValueError("corrupt patch markers")
+
+    handler = _find_handler_node(tree)
+    if (
+        handler is None
+        or len(handler.body) != 2
+        or not _is_docstring_expr(handler.body[0])
+        or not isinstance(handler.body[1], ast.Try)
+    ):
+        raise ValueError("corrupt patch markers")
+
+    docstring_end_lineno = getattr(handler.body[0], "end_lineno", handler.body[0].lineno)
+    if docstring_end_lineno is None:
+        raise ValueError("corrupt patch markers")
+
+    sentinel_index = begin_index - 1
+    if sentinel_index != docstring_end_lineno or begin_index != sentinel_index + 1:
+        raise ValueError("corrupt patch markers")
+
+
+def _find_handler_node(tree):
+    for node in tree.body:
+        if _is_handler(node):
+            return node
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if _is_handler(child):
+                    return child
+
+    return None
+
+
+def _find_run_agent_node(tree):
+    inner = _find_direct_run_agent_node(tree, "_run_agent_inner")
+    if inner is not None:
+        return inner
+    return _find_direct_run_agent_node(tree, "_run_agent")
+
+
+def _find_direct_run_agent_node(tree, name: str):
+    for node in tree.body:
+        if _is_run_agent(node, name):
+            return node
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if _is_run_agent(child, name):
+                    return child
+
+    return None
+
+
+def _find_async_function(tree, name: str):
+    for node in tree.body:
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+            return node
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, ast.AsyncFunctionDef) and child.name == name:
+                    return child
+
+    return None
+
+
+def _find_gateway_runner_method(tree, name: str):
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name not in {"GatewayRunner", "GatewayStartupMixin"}:
+            continue
+        for child in node.body:
+            if isinstance(child, ast.AsyncFunctionDef) and child.name == name:
+                return child
+    return None
+
+
+def _find_exact_base_patch_locations(tree, lines):
+    return find_base_patch_locations(
+        tree, lines,
+        owned_ledger_blocks=(
+            "".join(_render_split_base_final_delivery_hook_block("", "\n")),
+            "".join(_render_decomposed_split_base_final_hook_block("", "\n")),
+        ),
+    )
+
+def _find_redelivery_startup_call(func):
+    for node in func.body:
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Await):
+            continue
+        call = node.value.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_redeliver_pending_obligations"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+        ):
+            return node
+    return None
+
+
+def _find_redelivery_adapter_send(func):
+    matches = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Await):
+            continue
+        call = node.value.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "send"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "adapter"
+            and any(
+                isinstance(target, ast.Name) and target.id == "result"
+                for target in node.targets
+            )
+        ):
+            matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _find_recovered_watcher_drain(func):
+    for node in func.body:
+        if not isinstance(node, ast.Try):
+            continue
+        has_pending_watchers = any(
+            isinstance(child, ast.Attribute)
+            and child.attr == "pending_watchers"
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "process_registry"
+            for child in ast.walk(node)
+        )
+        has_watcher_call = any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "_run_process_watcher"
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "self"
+            for child in ast.walk(node)
+        )
+        if has_pending_watchers and has_watcher_call:
+            return node
+    return None
+
+
+def _is_run_agent(node, name: str = "_run_agent") -> bool:
+    return isinstance(node, ast.AsyncFunctionDef) and node.name == name
+
+
+def _find_simple_owned_patch(
+    content: str,
+    begin_marker: str,
+    end_marker: str,
+    renderer,
+    error_label: str,
+):
+    marker_block = _find_simple_marker_block(
+        content,
+        begin_marker,
+        end_marker,
+        error_label,
+    )
+    if marker_block is None:
+        return None
+    lines = content.splitlines(keepends=True)
+    begin_index, end_index = marker_block
+    indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+    newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+    expected = renderer(indent, newline)
+    expected_blocks = [expected]
+    if renderer is _render_approval_hook_block:
+        expected_blocks.append(_render_turn_context_hook_block(_render_generation_approval_hook_block, indent, newline))
+        previous_context = _render_turn_context_hook_block(renderer, indent, newline)
+        expected_blocks.append([line for line in previous_context
+                                if not line.strip().startswith('_approval_session_key = ctx.session_key')])
+    if renderer is _render_command_card_adapter_hook_block:
+        expected_blocks.append(_render_legacy_command_card_adapter_hook_block(indent, newline))
+    if renderer in (
+        _render_stable_tool_lifecycle_hook_block,
+        _render_answer_delta_hook_block,
+        _render_thinking_delta_hook_block,
+        _render_clarify_hook_block,
+        _render_approval_hook_block,
+        _render_status_hook_block,
+    ):
+        expected_blocks.append(
+            _render_turn_context_hook_block(renderer, indent, newline)
+        )
+    if renderer is _render_queued_final_hook_block:
+        expected_blocks.extend([
+            _render_v452_queued_final_hook_block(indent, newline),
+            _render_pr310_queued_final_hook_block(indent, newline),
+        ])
+    if renderer is _render_queued_followup_hook_block:
+        expected_blocks.extend([
+            _render_v462_queued_followup_hook_block(indent, newline),
+            _render_v468_queued_followup_hook_block(indent, newline),
+        ])
+    if renderer is _render_status_hook_block:
+        expected_blocks.extend([
+            _render_v464_status_hook_block(indent, newline),
+            _render_turn_context_hook_block(_render_v464_status_hook_block, indent, newline),
+        ])
+    if renderer is _render_stable_tool_lifecycle_hook_block:
+        # v4.5.2 installed blocks predate the dedicated reasoning callback.
+        expected_blocks.extend([
+            [line for line in block if "_hfc_bind_reasoning" not in line]
+            for block in list(expected_blocks)
+        ])
+    if renderer is _render_clarify_hook_block:
+        # The extracted ``_ask_clarify_question`` seam answers with ``(answer, True)``,
+        # so its block is the same hook carrying the answered flag.
+        expected_blocks.append(
+            _render_turn_context_hook_block(
+                _render_extracted_clarify_hook_block, indent, newline
+            )
+        )
+    actual = lines[begin_index : end_index + 1]
+    if actual not in expected_blocks:
+        raise ValueError(f"corrupt {error_label}")
+    return begin_index, end_index
+
+
+def _find_simple_marker_block(
+    content: str,
+    begin_marker: str,
+    end_marker: str,
+    error_label: str,
+):
+    begin_count = content.count(begin_marker)
+    end_count = content.count(end_marker)
+    if begin_count == 0 and end_count == 0:
+        return None
+    if begin_count != 1 or end_count != 1:
+        raise ValueError(f"corrupt {error_label}")
+
+    lines = content.splitlines(keepends=True)
+    begin_index = _exact_marker_line_index(lines, begin_marker)
+    end_index = _exact_marker_line_index(lines, end_marker)
+    if begin_index is None or end_index is None or begin_index >= end_index:
+        raise ValueError(f"corrupt {error_label}")
+    return begin_index, end_index
+
+
+def _find_owned_exact_base_blocks(content: str, *, strict: bool):
+    error_label = "exact base patch markers"
+    no_text = _find_simple_marker_block(
+        content,
+        EXACT_BASE_NO_TEXT_PATCH_BEGIN,
+        EXACT_BASE_NO_TEXT_PATCH_END,
+        error_label,
+    )
+    final = _find_simple_marker_block(
+        content,
+        EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN,
+        EXACT_BASE_FINAL_DELIVERY_PATCH_END,
+        error_label,
+    )
+    if no_text is None and final is None:
+        return None
+    if no_text is None or final is None:
+        raise ValueError("corrupt exact base patch markers")
+
+    if strict:
+        lines = content.splitlines(keepends=True)
+        no_text_indent = _leading_whitespace(
+            _strip_line_ending(lines[no_text[0]])
+        )
+        no_text_newline = _line_ending(lines[no_text[0]]) or _detect_newline(content)
+        final_indent = _leading_whitespace(_strip_line_ending(lines[final[0]]))
+        final_newline = _line_ending(lines[final[0]]) or _detect_newline(content)
+        if lines[no_text[0] : no_text[1] + 1] not in (
+            _render_exact_base_no_text_hook_block(no_text_indent, no_text_newline),
+            _render_decomposed_base_no_text_hook_block(no_text_indent, no_text_newline),
+        ):
+            raise ValueError("corrupt exact base patch markers")
+        if lines[final[0] : final[1] + 1] not in (
+            _render_exact_base_final_delivery_hook_block(final_indent, final_newline),
+            _render_split_base_final_delivery_hook_block(final_indent, final_newline),
+            _render_decomposed_base_final_hook_block(final_indent, final_newline),
+            _render_decomposed_split_base_final_hook_block(final_indent, final_newline),
+        ):
+            raise ValueError("corrupt exact base patch markers")
+    return no_text, final
+
+
+def _validate_exact_base_owned_locations(
+    owned,
+    *,
+    no_text_location,
+    final_location,
+) -> None:
+    no_text, final = owned
+    if (
+        no_text[1] + 1 != no_text_location[0]
+        or final[1] + 1 != final_location[0]
+    ):
+        raise ValueError("corrupt exact base patch markers")
+
+
+def _remove_exact_base_blocks(content: str, owned) -> str:
+    lines = content.splitlines(keepends=True)
+    for begin_index, end_index in sorted(owned, reverse=True):
+        lines[begin_index : end_index + 1] = []
+    return "".join(lines)
+
+
+def _exact_marker_line_index(lines, marker: str):
+    for index, line in enumerate(lines):
+        body = _strip_line_ending(line)
+        if body == _leading_whitespace(body) + marker:
+            return index
+    return None
+
+
+def _render_hook_exception_handler(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}except Exception as _hfc_exc:{newline}",
+        f"{inner_indent}try:{newline}",
+        f"{deeper_indent}import sys as _hfc_sys{newline}",
+        (
+            f"{deeper_indent}print(\"[hermes-feishu-card] hook failed: \" "
+            f"+ _hfc_exc.__class__.__name__ + \": \" + str(_hfc_exc), "
+            f"file=_hfc_sys.stderr){newline}"
+        ),
+        f"{inner_indent}except Exception:{newline}",
+        f"{deeper_indent}pass{newline}",
+    ]
+
+
+def _render_silent_exception_handler(indent: str, newline: str):
+    return [
+        f"{indent}except Exception:{newline}",
+        f"{_child_indent(indent)}pass{newline}",
+    ]
+
+
+def _with_silent_exception_handler(block: list[str], indent: str, newline: str):
+    diagnostic = _render_hook_exception_handler(indent, newline)
+    silent = _render_silent_exception_handler(indent, newline)
+    result: list[str] = []
+    index = 0
+    while index < len(block):
+        if block[index : index + len(diagnostic)] == diagnostic:
+            result.extend(silent)
+            index += len(diagnostic)
+        else:
+            result.append(block[index])
+            index += 1
+    return result
+
+
+def _render_exact_base_no_text_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{EXACT_BASE_NO_TEXT_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import finalize_exact_base_no_text as "
+            f"_hfc_finalize_exact_base_no_text{newline}"
+        ),
+        f"{inner_indent}if not text_content or _tts_caption_delivered:{newline}",
+        f"{deeper_indent}await _hfc_finalize_exact_base_no_text({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": event.source,{newline}",
+        f"{deeper_indent}}}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{EXACT_BASE_NO_TEXT_PATCH_END}{newline}",
+    ]
+
+
+def _render_exact_base_final_delivery_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import prepare_exact_base_final_delivery as "
+            f"_hfc_prepare_exact_base_final_delivery{newline}"
+        ),
+        (
+            f"{inner_indent}delivery_adapter, text_content, _reply_anchor, "
+            f"_final_thread_metadata = await "
+            f"_hfc_prepare_exact_base_final_delivery({{{newline}"
+        ),
+        f"{inner_indent}    **locals(),{newline}",
+        f"{inner_indent}    \"source\": event.source,{newline}",
+        f"{inner_indent}    \"delivery_adapter\": delivery_adapter,{newline}",
+        f"{inner_indent}    \"content\": text_content,{newline}",
+        f"{inner_indent}    \"obligation_id\": _obligation_id,{newline}",
+        f"{inner_indent}    \"reply_to\": _reply_anchor,{newline}",
+        f"{inner_indent}    \"metadata\": _final_thread_metadata,{newline}",
+        f"{inner_indent}}}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{EXACT_BASE_FINAL_DELIVERY_PATCH_END}{newline}",
+    ]
+
+
+def _render_split_base_final_delivery_hook_block(indent: str, newline: str):
+    """Render the final hook at Hermes' extracted ledger helper seam."""
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import prepare_exact_base_final_delivery as "
+            f"_hfc_prepare_exact_base_final_delivery{newline}"
+        ),
+        (
+            f"{inner_indent}delivery_adapter, text_content, reply_to, metadata "
+            f"= await _hfc_prepare_exact_base_final_delivery({{{newline}"
+        ),
+        f"{inner_indent}    **locals(),{newline}",
+        f"{inner_indent}    \"source\": event.source,{newline}",
+        f"{inner_indent}    \"delivery_adapter\": delivery_adapter,{newline}",
+        f"{inner_indent}    \"content\": text_content,{newline}",
+        f"{inner_indent}    \"obligation_id\": obligation_id,{newline}",
+        f"{inner_indent}    \"reply_to\": reply_to,{newline}",
+        f"{inner_indent}    \"metadata\": metadata,{newline}",
+        f"{inner_indent}}}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{EXACT_BASE_FINAL_DELIVERY_PATCH_END}{newline}",
+    ]
+
+
+def _render_hook_block_without_commands(
+    indent: str, newline: str, strategy: str = "legacy_gateway_run"
+):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    block = [
+        f"{indent}{PATCH_BEGIN}{newline}",
+    ]
+    if strategy == "gateway_run_013_plus":
+        block.extend(
+            [
+                f"{indent}# HERMES_FEISHU_CARD_STRATEGY gateway_run_013_plus{newline}",
+                f"{indent}try:{newline}",
+                (
+                    f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                    f"import emit_from_hermes_locals as _hfc_emit{newline}"
+                ),
+                f"{inner_indent}_hfc_started_message_id = None{newline}",
+                f"{inner_indent}try:{newline}",
+                # Use the REAL incoming message id for message.started so every
+                # new user message opens its own card session. The reply anchor
+                # (topic root / quoted message) must NOT be used here: in Feishu
+                # threads, consecutive quoted replies to the same message would
+                # otherwise share one message_id and overwrite the same card.
+                # Stream events still carry the reply anchor, and the sidecar
+                # resolves them back to this session via the reply_to alias.
+                f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None) or self._reply_anchor_for_event(event){newline}",
+                f"{inner_indent}except Exception:{newline}",
+                f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None){newline}",
+                f"{inner_indent}_hfc_emit({{**locals(), \"message_id\": _hfc_started_message_id}}){newline}",
+            ]
+        )
+    else:
+        block.extend(
+            [
+                f"{indent}try:{newline}",
+                (
+                    f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                    f"import emit_from_hermes_locals as _hfc_emit{newline}"
+                ),
+                f"{inner_indent}_hfc_emit(locals()){newline}",
+            ]
+        )
+    block.extend(_render_hook_exception_handler(indent, newline))
+    block.append(f"{indent}{PATCH_END}{newline}")
+    return block
+
+
+def _render_hook_block(indent: str, newline: str, strategy: str = "legacy_gateway_run", *, isolate_turn: bool = True):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    block = [
+        f"{indent}{PATCH_BEGIN}{newline}",
+    ]
+    if strategy == "gateway_run_013_plus":
+        block.extend(
+            [
+                f"{indent}# HERMES_FEISHU_CARD_STRATEGY gateway_run_013_plus{newline}",
+                f"{indent}try:{newline}",
+                (
+                    f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                    f"import emit_from_hermes_locals as _hfc_emit{newline}"
+                ),
+                (
+                    f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                    f"import handle_hfc_command_from_hermes_locals as _hfc_handle_command{newline}"
+                ),
+                f"{inner_indent}_hfc_started_message_id = None{newline}",
+                f"{inner_indent}try:{newline}",
+                # Use the REAL incoming message id for message.started so every
+                # new user message opens its own card session. The reply anchor
+                # (topic root / quoted message) must NOT be used here: in Feishu
+                # threads, consecutive quoted replies to the same message would
+                # otherwise share one message_id and overwrite the same card.
+                # Stream events still carry the reply anchor, and the sidecar
+                # resolves them back to this session via the reply_to alias.
+                f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None) or self._reply_anchor_for_event(event){newline}",
+                f"{inner_indent}except Exception:{newline}",
+                f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None){newline}",
+                # Publish the SAME canonical anchor onto the core's own ``source.message_id``.
+                # The gateway fills HERMES_SESSION_MESSAGE_ID from that field alone, but the
+                # Feishu adapter never populates it, so every consumer of that variable (cron
+                # origin anchors, background-task completion notices, notification plugins)
+                # silently falls back to the chat's main message stream instead of the topic.
+                # This block runs before ``_hmwa_prepare_turn`` snapshots the source, and the
+                # value matches the field's documented meaning ("triggering message").
+                f"{inner_indent}_hfc_anchor_source = locals().get(\"source\"){newline}",
+                f"{inner_indent}_hfc_anchor_platform = str(getattr(getattr(_hfc_anchor_source, \"platform\", None), \"value\", getattr(_hfc_anchor_source, \"platform\", None))).lower(){newline}",
+                f"{inner_indent}if _hfc_started_message_id and _hfc_anchor_source is not None and _hfc_anchor_platform == \"feishu\":{newline}",
+                f"{deeper_indent}_hfc_anchor_source.message_id = _hfc_started_message_id{newline}",
+                f"{inner_indent}if _hfc_handle_command({{**locals(), \"message_id\": _hfc_started_message_id}}):{newline}",
+                f"{deeper_indent}return None{newline}",
+                f"{inner_indent}_hfc_emit({{**locals(), \"message_id\": _hfc_started_message_id}}){newline}",
+            ]
+        )
+    else:
+        block.extend(
+            [
+                f"{indent}try:{newline}",
+                (
+                    f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                    f"import emit_from_hermes_locals as _hfc_emit{newline}"
+                ),
+                (
+                    f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                    f"import handle_hfc_command_from_hermes_locals as _hfc_handle_command{newline}"
+                ),
+                f"{inner_indent}if _hfc_handle_command(locals()):{newline}",
+                f"{deeper_indent}return None{newline}",
+                f"{inner_indent}_hfc_emit(locals()){newline}",
+            ]
+        )
+    if isolate_turn and strategy == "gateway_run_013_plus":
+        # Ordinary idle notifications enter this hook, not the queued hook.
+        # Copy and bind before command/policy/startup can fail; source.message_id
+        # remains a real platform anchor, never the synthetic lifecycle identity.
+        import_index = next(i for i, line in enumerate(block) if "import emit_from_hermes_locals as" in line)
+        block[import_index + 1:import_index + 1] = [
+            f"{inner_indent}if str(getattr(getattr(source, \"platform\", None), \"value\", getattr(source, \"platform\", None))).lower() == \"feishu\":{newline}",
+            f"{deeper_indent}from hermes_feishu_card.hook_runtime import queued_followup_source as _hfc_turn_source{newline}",
+            f"{deeper_indent}source = _hfc_turn_source(source, event){newline}",
+        ]
+    block.extend(_render_hook_exception_handler(indent, newline))
+    block.append(f"{indent}{PATCH_END}{newline}")
+    return block
+
+
+def _render_complete_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    deepest_indent = _child_indent(deeper_indent)
+    return [
+        f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import build_event as _hfc_build_event{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import can_stage_exact_base_completion as _hfc_can_stage_exact{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import stage_message_completed_from_hermes_locals_async as _hfc_stage_exact{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import should_suppress_native_response as _hfc_should_suppress{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import native_media_only_response as _hfc_media_only{newline}"
+        ),
+        f"{inner_indent}_hfc_completed_locals = {{{newline}",
+        f"{deeper_indent}**locals(),{newline}",
+        f"{deeper_indent}\"answer\": response,{newline}",
+        f"{deeper_indent}\"duration\": _response_time,{newline}",
+        f"{deeper_indent}\"model\": agent_result.get(\"model\", \"\"),{newline}",
+        f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{deeper_indent}\"context\": {{{newline}",
+        f"{deeper_indent}    \"used_tokens\": agent_result.get(\"last_prompt_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"max_tokens\": agent_result.get(\"context_length\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{inner_indent}}}{newline}",
+        f"{inner_indent}if agent_result.get(\"_hfc_queued_final_attempted\") is True and agent_result.get(\"_hfc_queued_final_delivered\") is not True:{newline}",
+        # The outer handler still owns the original turn. A failed queued
+        # final must fall back with its complete response, including media,
+        # rather than completing that old, already-terminal card again.
+        f"{deeper_indent}return response{newline}",
+        f"{inner_indent}if agent_result.get(\"_hfc_queued_final_delivered\") is True:{newline}",
+        f"{deeper_indent}_hfc_queued_preview = _hfc_build_event(\"message.completed\", _hfc_completed_locals, preview=True){newline}",
+        f"{deeper_indent}if _hfc_queued_preview and _hfc_queued_preview.get(\"data\", {{}}).get(\"native_delivery\") == \"required\":{newline}",
+        f"{deepest_indent}return _hfc_media_only(response){newline}",
+        f"{deeper_indent}return None{newline}",
+        f"{inner_indent}from hermes_feishu_card.hook_runtime import admission_completion_mode as _hfc_admission_mode{newline}",
+        f"{inner_indent}_hfc_admission = _hfc_admission_mode(_hfc_completed_locals){newline}",
+        f"{inner_indent}if _hfc_admission == \"native\":{newline}",
+        f"{deeper_indent}return response{newline}",
+        f"{inner_indent}_hfc_exact_staged = False{newline}",
+        f"{inner_indent}if _hfc_can_stage_exact(_hfc_completed_locals):{newline}",
+        f"{deeper_indent}_hfc_exact_staged = await _hfc_stage_exact(_hfc_completed_locals){newline}",
+        f"{inner_indent}if _hfc_admission == \"handoff\" and not _hfc_exact_staged:{newline}",
+        f"{deeper_indent}return response{newline}",
+        f"{inner_indent}if not _hfc_exact_staged:{newline}",
+        f"{deeper_indent}_hfc_completed_event = _hfc_build_event(\"message.completed\", _hfc_completed_locals, preview=True){newline}",
+        f"{deeper_indent}_hfc_attachments = []{newline}",
+        f"{deeper_indent}_hfc_native_delivery = \"allowed\"{newline}",
+        f"{deeper_indent}if _hfc_completed_event is not None:{newline}",
+        f"{deepest_indent}_hfc_completed_data = _hfc_completed_event.get(\"data\", {{}}){newline}",
+        f"{deepest_indent}_hfc_attachments = _hfc_completed_data.get(\"attachments\", []){newline}",
+        f"{deepest_indent}_hfc_native_delivery = _hfc_completed_data.get(\"native_delivery\", \"required\" if _hfc_attachments else \"allowed\"){newline}",
+        f"{deeper_indent}_hfc_card_delivered = await _hfc_emit_async(_hfc_completed_locals, event_name=\"message.completed\"){newline}",
+        f"{deeper_indent}_hfc_platform = getattr(source.platform, \"value\", source.platform){newline}",
+        f"{deeper_indent}if str(_hfc_platform).lower() == \"feishu\" and _hfc_card_delivered and _hfc_native_delivery == \"required\":{newline}",
+        f"{deepest_indent}response = _hfc_media_only(response){newline}",
+        f"{deeper_indent}if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments, _hfc_native_delivery):{newline}",
+        f"{deepest_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_complete_hook_block_with_reply_anchor(indent: str, newline: str):
+    """Completion hook for gateway_run_013_plus handlers.
+
+    Derives an explicit message_id from the same reply anchor the started and
+    delta hooks use, so the terminal event always lands on the session that
+    owns the card instead of relying on the ambiguous terminal fallback cache
+    (which can make build_event return None on streamed turns).
+    """
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    block = list(_render_complete_hook_block(indent, newline))
+    anchor_lines = [
+        f"{inner_indent}_hfc_completed_message_id = None{newline}",
+        f"{inner_indent}try:{newline}",
+        f"{deeper_indent}_hfc_completed_message_id = self._reply_anchor_for_event(event){newline}",
+        f"{inner_indent}except Exception:{newline}",
+        f"{deeper_indent}_hfc_completed_message_id = getattr(event, \"message_id\", None){newline}",
+    ]
+    import_index = next(
+        index
+        for index, line in enumerate(block)
+        if "native_media_only_response as _hfc_media_only" in line
+    )
+    block[import_index + 1 : import_index + 1] = anchor_lines
+    locals_index = next(
+        index for index, line in enumerate(block) if "**locals()," in line
+    )
+    block[locals_index + 1 : locals_index + 1] = [
+        f"{deeper_indent}\"message_id\": _hfc_completed_message_id,{newline}"
+    ]
+    return block
+
+
+def _render_pre_exact_complete_hook_block(indent: str, newline: str):
+    """Render the last V4.1 block for narrow, owned upgrade migration only."""
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import build_event as _hfc_build_event{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import should_suppress_native_response as _hfc_should_suppress{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import native_media_only_response as _hfc_media_only{newline}"
+        ),
+        f"{inner_indent}_hfc_completed_locals = {{{newline}",
+        f"{deeper_indent}**locals(),{newline}",
+        f"{deeper_indent}\"answer\": response,{newline}",
+        f"{deeper_indent}\"duration\": _response_time,{newline}",
+        f"{deeper_indent}\"model\": agent_result.get(\"model\", \"\"),{newline}",
+        f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{deeper_indent}\"context\": {{{newline}",
+        f"{deeper_indent}    \"used_tokens\": agent_result.get(\"last_prompt_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"max_tokens\": agent_result.get(\"context_length\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{inner_indent}}}{newline}",
+        f"{inner_indent}_hfc_completed_event = _hfc_build_event(\"message.completed\", _hfc_completed_locals, preview=True){newline}",
+        f"{inner_indent}_hfc_attachments = []{newline}",
+        f"{inner_indent}_hfc_native_delivery = \"allowed\"{newline}",
+        f"{inner_indent}if _hfc_completed_event is not None:{newline}",
+        f"{deeper_indent}_hfc_completed_data = _hfc_completed_event.get(\"data\", {{}}){newline}",
+        f"{deeper_indent}_hfc_attachments = _hfc_completed_data.get(\"attachments\", []){newline}",
+        f"{deeper_indent}_hfc_native_delivery = _hfc_completed_data.get(\"native_delivery\", \"required\" if _hfc_attachments else \"allowed\"){newline}",
+        f"{inner_indent}_hfc_card_delivered = await _hfc_emit_async(_hfc_completed_locals, event_name=\"message.completed\"){newline}",
+        f"{inner_indent}_hfc_platform = getattr(source.platform, \"value\", source.platform){newline}",
+        f"{inner_indent}if str(_hfc_platform).lower() == \"feishu\" and _hfc_card_delivered and _hfc_native_delivery == \"required\":{newline}",
+        f"{deeper_indent}response = _hfc_media_only(response){newline}",
+        f"{inner_indent}if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments, _hfc_native_delivery):{newline}",
+        f"{deeper_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_pre_exact_complete_hook_block_with_reply_anchor(
+    indent: str,
+    newline: str,
+):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    block = list(_render_pre_exact_complete_hook_block(indent, newline))
+    import_index = next(
+        index
+        for index, line in enumerate(block)
+        if "native_media_only_response as _hfc_media_only" in line
+    )
+    block[import_index + 1 : import_index + 1] = [
+        f"{inner_indent}_hfc_completed_message_id = None{newline}",
+        f"{inner_indent}try:{newline}",
+        f"{deeper_indent}_hfc_completed_message_id = self._reply_anchor_for_event(event){newline}",
+        f"{inner_indent}except Exception:{newline}",
+        f"{deeper_indent}_hfc_completed_message_id = getattr(event, \"message_id\", None){newline}",
+    ]
+    locals_index = next(
+        index for index, line in enumerate(block) if "**locals()," in line
+    )
+    block[locals_index + 1 : locals_index + 1] = [
+        f"{deeper_indent}\"message_id\": _hfc_completed_message_id,{newline}"
+    ]
+    return block
+
+
+def _render_pre_exact_v400_complete_hook_block(indent: str, newline: str):
+    return [
+        line
+        for line in _render_pre_exact_complete_hook_block(indent, newline)
+        if "native_media_only_response as _hfc_media_only" not in line
+        and '_hfc_native_delivery == "required"' not in line
+        and "response = _hfc_media_only(response)" not in line
+    ]
+
+
+def _render_v400_complete_hook_block(indent: str, newline: str):
+    return [
+        line
+        for line in _render_complete_hook_block(indent, newline)
+        if "native_media_only_response as _hfc_media_only" not in line
+        and '_hfc_native_delivery == "required"' not in line
+        and "response = _hfc_media_only(response)" not in line
+    ]
+
+
+def _render_queued_complete_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{QUEUED_COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import build_event as _hfc_build_event{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import should_suppress_native_response as _hfc_should_suppress{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import native_media_only_response as _hfc_media_only{newline}"
+        ),
+        f"{inner_indent}if first_response and not _already_streamed:{newline}",
+        f"{deeper_indent}_hfc_turn_ctx = locals().get(\"turn_ctx\"){newline}",
+        f"{deeper_indent}_hfc_source = locals().get(\"source\") or getattr(_hfc_turn_ctx, \"source\", None){newline}",
+        f"{deeper_indent}_hfc_message_id = locals().get(\"event_message_id\") or getattr(_hfc_turn_ctx, \"event_message_id\", None){newline}",
+        f"{deeper_indent}_hfc_delivery_result = locals().get(\"_delivery_result\"){newline}",
+        f"{deeper_indent}if not isinstance(_hfc_delivery_result, dict):{newline}",
+        f"{deeper_indent}    _hfc_delivery_result = result if isinstance(result, dict) else {{}}{newline}",
+        f"{deeper_indent}_hfc_completed_locals = {{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": _hfc_source,{newline}",
+        f"{deeper_indent}    \"message_id\": _hfc_message_id,{newline}",
+        f"{deeper_indent}    \"answer\": first_response,{newline}",
+        # Without the turn result this completed event carries no turn_outcome, so the sidecar
+        # takes its success branch: the answer that already streamed to the user gets archived
+        # into the reasoning panel and the raw provider error is left as the card body. Passing
+        # the result through lets the sidecar render the interrupted turn correctly instead.
+        f"{deeper_indent}    \"agent_result\": _hfc_delivery_result,{newline}",
+        f"{deeper_indent}    \"duration\": result.get(\"duration\", 0.0) if isinstance(result, dict) else 0.0,{newline}",
+        f"{deeper_indent}    \"model\": result.get(\"model\", \"\") if isinstance(result, dict) else \"\",{newline}",
+        f"{deeper_indent}    \"tokens\": {{{newline}",
+        f"{deeper_indent}        \"input_tokens\": result.get(\"input_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
+        f"{deeper_indent}        \"output_tokens\": result.get(\"output_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
+        f"{deeper_indent}    }},{newline}",
+        f"{deeper_indent}    \"context\": {{{newline}",
+        f"{deeper_indent}        \"used_tokens\": result.get(\"last_prompt_tokens\", 0) if isinstance(result, dict) else 0,{newline}",
+        f"{deeper_indent}        \"max_tokens\": result.get(\"context_length\", 0) if isinstance(result, dict) else 0,{newline}",
+        f"{deeper_indent}    }},{newline}",
+        f"{deeper_indent}}}{newline}",
+        f"{deeper_indent}_hfc_completed_event = _hfc_build_event(\"message.completed\", _hfc_completed_locals, preview=True){newline}",
+        f"{deeper_indent}_hfc_attachments = []{newline}",
+        f"{deeper_indent}_hfc_native_delivery = \"allowed\"{newline}",
+        f"{deeper_indent}if _hfc_completed_event is not None:{newline}",
+        f"{deeper_indent}    _hfc_completed_data = _hfc_completed_event.get(\"data\", {{}}){newline}",
+        f"{deeper_indent}    _hfc_attachments = _hfc_completed_data.get(\"attachments\", []){newline}",
+        f"{deeper_indent}    _hfc_native_delivery = _hfc_completed_data.get(\"native_delivery\", \"required\" if _hfc_attachments else \"allowed\"){newline}",
+        f"{deeper_indent}_hfc_card_delivered = await _hfc_emit_async(_hfc_completed_locals, event_name=\"message.completed\"){newline}",
+        f"{deeper_indent}_hfc_platform = getattr(getattr(_hfc_source, \"platform\", None), \"value\", getattr(_hfc_source, \"platform\", None)){newline}",
+        f"{deeper_indent}if str(_hfc_platform).lower() == \"feishu\" and _hfc_card_delivered and _hfc_native_delivery == \"required\":{newline}",
+        f"{deeper_indent}    first_response = _hfc_media_only(first_response){newline}",
+        f"{deeper_indent}if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments, _hfc_native_delivery):{newline}",
+        f"{deeper_indent}    _already_streamed = True{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{QUEUED_COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_queued_followup_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    deepest_indent = _child_indent(deeper_indent)
+    return [
+        f"{indent}{QUEUED_FOLLOWUP_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import interrupted_turn_locals as _hfc_interrupted_locals{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        f"{inner_indent}if pending_event is not None:{newline}",
+        f"{deeper_indent}_hfc_turn_ctx = locals().get(\"turn_ctx\"){newline}",
+        f"{deeper_indent}_hfc_followup_message_id = str(getattr(pending_event, \"message_id\", \"\") or \"\"){newline}",
+        f"{deeper_indent}_hfc_original_message_id = str(locals().get(\"event_message_id\") or getattr(_hfc_turn_ctx, \"event_message_id\", None) or \"\"){newline}",
+        f"{deeper_indent}_hfc_was_interrupted = bool(locals().get(\"was_interrupted\") or (result.get(\"interrupted\") if isinstance(result, dict) else False)){newline}",
+        f"{deeper_indent}if _hfc_was_interrupted and (_hfc_original_message_id or getattr(source, \"_hfc_internal_turn_id\", None)):{newline}",
+        (
+            f"{deepest_indent}await _hfc_emit_async("
+            f"_hfc_interrupted_locals(source, _hfc_original_message_id, result), "
+            f"event_name=\"message.failed\"){newline}"
+        ),
+        f"{deeper_indent}if _hfc_followup_message_id or getattr(pending_event, \"internal\", False) is True:{newline}",
+        f"{deepest_indent}from hermes_feishu_card.hook_runtime import queued_followup_source as _hfc_queued_source{newline}",
+        f"{deepest_indent}next_source = _hfc_queued_source(next_source, pending_event){newline}",
+        (
+            f"{deepest_indent}await _hfc_emit_async({{"
+            f"\"source\": next_source, \"event\": pending_event, \"message\": pending_event, "
+            f"\"chat_id\": getattr(next_source, \"chat_id\", None), "
+            f"\"message_id\": _hfc_followup_message_id, "
+            f"\"reply_to_message_id\": getattr(pending_event, \"reply_to_message_id\", \"\") or _hfc_followup_message_id"
+            f"}}, event_name=\"message.started\"){newline}"
+        ),
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{QUEUED_FOLLOWUP_PATCH_END}{newline}",
+    ]
+
+def _render_v468_queued_followup_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    deepest_indent = _child_indent(deeper_indent)
+    return [
+        f"{indent}{QUEUED_FOLLOWUP_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import interrupted_turn_locals as _hfc_interrupted_locals{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        f"{inner_indent}if pending_event is not None:{newline}",
+        f"{deeper_indent}_hfc_turn_ctx = locals().get(\"turn_ctx\"){newline}",
+        f"{deeper_indent}_hfc_followup_message_id = str(getattr(pending_event, \"message_id\", \"\") or \"\"){newline}",
+        f"{deeper_indent}_hfc_original_message_id = str(locals().get(\"event_message_id\") or getattr(_hfc_turn_ctx, \"event_message_id\", None) or \"\"){newline}",
+        f"{deeper_indent}_hfc_was_interrupted = bool(locals().get(\"was_interrupted\") or (result.get(\"interrupted\") if isinstance(result, dict) else False)){newline}",
+        f"{deeper_indent}if _hfc_was_interrupted and _hfc_original_message_id:{newline}",
+        (
+            f"{deepest_indent}await _hfc_emit_async("
+            f"_hfc_interrupted_locals(source, _hfc_original_message_id, result), "
+            f"event_name=\"message.failed\"){newline}"
+        ),
+        f"{deeper_indent}if _hfc_followup_message_id:{newline}",
+        f"{deepest_indent}from copy import copy as _hfc_copy{newline}",
+        f"{deepest_indent}next_source = _hfc_copy(next_source){newline}",
+        (
+            f"{deepest_indent}await _hfc_emit_async({{"
+            f"\"source\": next_source, \"event\": pending_event, \"message\": pending_event, "
+            f"\"chat_id\": getattr(next_source, \"chat_id\", None), "
+            f"\"message_id\": _hfc_followup_message_id, "
+            f"\"reply_to_message_id\": getattr(pending_event, \"reply_to_message_id\", \"\") or _hfc_followup_message_id"
+            f"}}, event_name=\"message.started\"){newline}"
+        ),
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{QUEUED_FOLLOWUP_PATCH_END}{newline}",
+    ]
+
+
+def _render_v462_queued_followup_hook_block(indent: str, newline: str):
+    """Exact pre-4.6.3 generated body, retained only for verified removal."""
+    block = _render_v468_queued_followup_hook_block(indent, newline)
+    return [line.replace(
+        "_hfc_interrupted_locals(source, _hfc_original_message_id, result)",
+        '{"source": source, "chat_id": getattr(source, "chat_id", None), '
+        '"message_id": _hfc_original_message_id, "error": "用户已打断当前任务"}',
+    ) for line in block if "import interrupted_turn_locals as _hfc_interrupted_locals" not in line]
+
+
+def _render_v452_queued_final_hook_block(indent: str, newline: str):
+    inner = _child_indent(indent)
+    deeper = _child_indent(inner)
+    return [
+        f"{indent}{QUEUED_FINAL_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner}from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_async as _hfc_emit_async{newline}",
+        f"{inner}if pending_event is not None and isinstance(followup_result, dict) and not followup_result.get(\"_hfc_queued_final_delivered\") and not followup_result.get(\"_hfc_queued_final_attempted\"):{newline}",
+        f"{deeper}followup_result = {{**followup_result, \"_hfc_queued_final_attempted\": True}}{newline}",
+        f"{deeper}_hfc_final_locals = {{\"source\": next_source, \"message_id\": getattr(pending_event, \"message_id\", None) or next_message_id, \"answer\": followup_result.get(\"final_response\", \"\"), \"error\": followup_result.get(\"error\") or \"任务已中断\", \"agent_result\": followup_result}}{newline}",
+        f"{deeper}_hfc_final_event_name = \"message.failed\" if followup_result.get(\"failed\") or followup_result.get(\"interrupted\") else \"message.completed\"{newline}",
+        f"{deeper}if await _hfc_emit_async(_hfc_final_locals, event_name=_hfc_final_event_name):{newline}",
+        f"{deeper}    followup_result = {{**followup_result, \"_hfc_queued_final_delivered\": True}}{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{QUEUED_FINAL_PATCH_END}{newline}",
+    ]
+
+
+def _render_pr310_queued_final_hook_block(indent: str, newline: str):
+    inner = _child_indent(indent)
+    deeper = _child_indent(inner)
+    return [
+        f"{indent}{QUEUED_FINAL_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner}from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_async as _hfc_emit_async{newline}",
+        f"{inner}if pending_event is not None and isinstance(followup_result, dict) and not followup_result.get(\"_hfc_queued_final_delivered\") and not followup_result.get(\"_hfc_queued_final_attempted\"):{newline}",
+        f"{deeper}followup_result = {{**followup_result, \"_hfc_queued_final_attempted\": True}}{newline}",
+        f"{deeper}_hfc_final_answer = followup_result.get(\"final_response\") or followup_result.get(\"error\") or \"任务已中断\"{newline}",
+        f"{deeper}_hfc_final_metrics = {{\"duration\": followup_result.get(\"_hfc_turn_seconds\"), \"model\": followup_result.get(\"model\", \"\"), \"tokens\": {{\"input_tokens\": followup_result.get(\"input_tokens\", 0), \"output_tokens\": followup_result.get(\"output_tokens\", 0)}}, \"context\": {{\"used_tokens\": followup_result.get(\"last_prompt_tokens\", 0), \"max_tokens\": followup_result.get(\"context_length\", 0)}}}}{newline}",
+        f"{deeper}_hfc_final_locals = {{\"source\": next_source, \"message_id\": getattr(pending_event, \"message_id\", None) or next_message_id, \"answer\": _hfc_final_answer, \"error\": followup_result.get(\"error\") or \"任务已中断\", \"agent_result\": followup_result, **_hfc_final_metrics}}{newline}",
+        f"{deeper}# A queued follow-up ends with the completed envelope even when it failed. Only that{newline}",
+        f"{deeper}# branch reads duration/model/tokens/context, and the failure still reaches the card{newline}",
+        f"{deeper}# because the turn result travels as agent_result (the sidecar derives turn_outcome{newline}",
+        f"{deeper}# from it). Emitting message.failed here produced a context-free card - no tool count,{newline}",
+        f"{deeper}# no duration, no model - so it said nothing about where the run stopped.{newline}",
+        f"{deeper}_hfc_final_event_name = \"message.completed\"{newline}",
+        f"{deeper}if await _hfc_emit_async(_hfc_final_locals, event_name=_hfc_final_event_name):{newline}",
+        f"{deeper}    followup_result = {{**followup_result, \"_hfc_queued_final_delivered\": True}}{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{QUEUED_FINAL_PATCH_END}{newline}",
+    ]
+
+
+def _render_queued_final_hook_block(indent: str, newline: str):
+    inner = _child_indent(indent)
+    deeper = _child_indent(inner)
+    return [
+        f"{indent}{QUEUED_FINAL_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner}from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_async as _hfc_emit_async{newline}",
+        f"{inner}if pending_event is not None and isinstance(followup_result, dict) and not followup_result.get(\"_hfc_queued_final_delivered\") and not followup_result.get(\"_hfc_queued_final_attempted\"):{newline}",
+        f"{deeper}followup_result = {{**followup_result, \"_hfc_queued_final_attempted\": True}}{newline}",
+        f"{deeper}_hfc_final_answer = followup_result.get(\"final_response\") or followup_result.get(\"error\") or \"\"{newline}",
+        f"{deeper}_hfc_final_metrics = {{\"duration\": followup_result.get(\"_hfc_turn_seconds\"), \"model\": followup_result.get(\"model\", \"\"), \"tokens\": {{\"input_tokens\": followup_result.get(\"input_tokens\", 0), \"output_tokens\": followup_result.get(\"output_tokens\", 0)}}, \"context\": {{\"used_tokens\": followup_result.get(\"last_prompt_tokens\", 0), \"max_tokens\": followup_result.get(\"context_length\", 0)}}}}{newline}",
+        f"{deeper}_hfc_final_locals = {{\"source\": next_source, \"message_id\": getattr(pending_event, \"message_id\", None) or next_message_id, \"answer\": _hfc_final_answer, \"error\": followup_result.get(\"error\") or \"任务已中断\", \"agent_result\": followup_result, **_hfc_final_metrics}}{newline}",
+        f"{deeper}# A queued follow-up ends with the completed envelope even when it failed. Only that{newline}",
+        f"{deeper}# branch reads duration/model/tokens/context, and the failure still reaches the card{newline}",
+        f"{deeper}# because the turn result travels as agent_result (the sidecar derives turn_outcome{newline}",
+        f"{deeper}# from it). Emitting message.failed here produced a context-free card - no tool count,{newline}",
+        f"{deeper}# no duration, no model - so it said nothing about where the run stopped.{newline}",
+        f"{deeper}_hfc_final_event_name = \"message.completed\"{newline}",
+        f"{deeper}if await _hfc_emit_async(_hfc_final_locals, event_name=_hfc_final_event_name):{newline}",
+        f"{deeper}    followup_result = {{**followup_result, \"_hfc_queued_final_delivered\": True}}{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{QUEUED_FINAL_PATCH_END}{newline}",
+    ]
+
+
+def _render_redirect_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    deepest_indent = _child_indent(deeper_indent)
+    return [
+        f"{indent}{REDIRECT_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        f"{inner_indent}if bool(locals().get(\"redirected\")):{newline}",
+        f"{deeper_indent}_hfc_redirect_message_id = str(getattr(event, \"message_id\", \"\") or \"\"){newline}",
+        f"{deeper_indent}from hermes_feishu_card.hook_runtime import redirect_turn_id_for_agent as _hfc_redirect_turn{newline}",
+        f"{deeper_indent}from hermes_feishu_card.hook_runtime import redirect_conversation_id_for_agent as _hfc_redirect_conversation{newline}",
+        f"{deeper_indent}_hfc_redirect_from_turn_id = _hfc_redirect_turn(locals().get(\"running_agent\"), event.source){newline}",
+        # Unknown callback ownership must retain the current card. Emitting a
+        # fresh started event would abandon it and strand its future callbacks.
+        f"{deeper_indent}if _hfc_redirect_message_id and _hfc_redirect_from_turn_id:{newline}",
+        f"{deepest_indent}from copy import copy as _hfc_copy{newline}",
+        f"{deepest_indent}_hfc_redirect_source = _hfc_copy(event.source){newline}",
+        (
+            f"{deepest_indent}await _hfc_emit_async({{"
+            f"\"source\": _hfc_redirect_source, \"event\": event, \"message\": event, "
+            f"\"chat_id\": getattr(event.source, \"chat_id\", None), "
+            f"\"message_id\": _hfc_redirect_message_id, "
+            f"\"reply_to_message_id\": getattr(event, \"reply_to_message_id\", \"\") or _hfc_redirect_message_id, "
+            f"\"conversation_id\": _hfc_redirect_conversation(locals().get(\"running_agent\"), event.source), "
+            f"\"redirect_from_turn_id\": _hfc_redirect_from_turn_id, "
+            f"\"redirect_followup\": True}}, event_name=\"message.started\"){newline}"
+        ),
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{REDIRECT_PATCH_END}{newline}",
+    ]
+
+
+def _render_legacy_complete_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals as _hfc_emit{newline}"
+        ),
+        f"{inner_indent}_hfc_emit({{{newline}",
+        f"{deeper_indent}**locals(),{newline}",
+        f"{deeper_indent}\"answer\": response,{newline}",
+        f"{deeper_indent}\"duration\": _response_time,{newline}",
+        f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{inner_indent}}}, event_name=\"message.completed\"){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_previous_async_complete_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        f"{inner_indent}_hfc_card_delivered = await _hfc_emit_async({{{newline}",
+        f"{deeper_indent}**locals(),{newline}",
+        f"{deeper_indent}\"answer\": response,{newline}",
+        f"{deeper_indent}\"duration\": _response_time,{newline}",
+        f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{inner_indent}}}, event_name=\"message.completed\"){newline}",
+        f"{inner_indent}if _hfc_card_delivered and source.platform.value == \"feishu\":{newline}",
+        f"{deeper_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_previous_async_complete_hook_block_without_platform_guard(
+    indent: str, newline: str
+):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        f"{inner_indent}_hfc_card_delivered = await _hfc_emit_async({{{newline}",
+        f"{deeper_indent}**locals(),{newline}",
+        f"{deeper_indent}\"answer\": response,{newline}",
+        f"{deeper_indent}\"duration\": _response_time,{newline}",
+        f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{inner_indent}}}, event_name=\"message.completed\"){newline}",
+        f"{inner_indent}if _hfc_card_delivered:{newline}",
+        f"{deeper_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_turn_context_hook_block(renderer, indent: str, newline: str):
+    """Adapt a legacy closure hook to Hermes' ``TurnRunner`` context seam."""
+    block = renderer(indent, newline)
+    replacements = (
+        ("_hfc_bind_reasoning(agent, source, event_message_id, _loop_for_step, _run_still_current)",
+         "_hfc_bind_reasoning(agent, _hfc_turn_ctx.source, _hfc_turn_ctx.event_message_id, _hfc_turn_ctx._loop_for_step, _hfc_turn_ctx._run_still_current)"),
+        ("_hfc_platform_name({}, source)", "_hfc_platform_name({}, _hfc_turn_ctx.source)"),
+        ("_hfc_bind_agent_turn(agent, source)", "_hfc_bind_agent_turn(agent, _hfc_turn_ctx.source)"),
+        ("_run_still_current()", "_hfc_turn_ctx._run_still_current()"),
+        ('"source": source,', '"source": _hfc_turn_ctx.source,'),
+        (
+            '"message_id": event_message_id,',
+            '"message_id": _hfc_turn_ctx.event_message_id,',
+        ),
+        ('"_hfc_loop": _loop_for_step,', '"_hfc_loop": _hfc_turn_ctx._loop_for_step,'),
+        (
+            '"_hfc_loop": locals().get("_loop_for_step"),',
+            '"_hfc_loop": _hfc_turn_ctx._loop_for_step,',
+        ),
+        ('"chat_id": _status_chat_id,', '"chat_id": _hfc_turn_ctx._status_chat_id,'),
+        (
+            '"conversation_id": session_key or _status_chat_id,',
+            '"conversation_id": _hfc_turn_ctx.session_key or _hfc_turn_ctx._status_chat_id,',
+        ),
+        (
+            '"conversation_id": _approval_session_key or _status_chat_id,',
+            '"conversation_id": _approval_session_key or _hfc_turn_ctx._status_chat_id,',
+        ),
+    )
+    adapted = []
+    for line in block:
+        for old, new in replacements:
+            line = line.replace(old, new)
+        adapted.append(line)
+    adapted.insert(1, f"{indent}_hfc_turn_ctx = ctx{newline}")
+    if renderer in (_render_approval_hook_block, _render_generation_approval_hook_block):
+        adapted.insert(2, f"{indent}_approval_session_key = ctx.session_key or \"\"{newline}")
+    return adapted
+
+
+def _render_tool_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{TOOL_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_threadsafe as _hfc_emit_threadsafe{newline}"
+        ),
+        f"{inner_indent}from hermes_feishu_card.hook_runtime import _platform_name as _hfc_platform_name{newline}",
+        f"{inner_indent}_hfc_stable_tool_progress_owned = _hfc_platform_name({{}}, source) == \"feishu\"{newline}",
+        f"{inner_indent}_hfc_stable_tool_callbacks = False{newline}",
+        f"{inner_indent}_hfc_force_tool_progress_fallback = bool(kwargs.get(\"_hfc_force_tool_progress_fallback\")){newline}",
+        f"{inner_indent}if not _hfc_force_tool_progress_fallback:{newline}",
+        f"{deeper_indent}try:{newline}",
+        f"{deeper_indent}    _hfc_stable_tool_callbacks = bool({newline}",
+        f"{deeper_indent}        getattr(agent.tool_start_callback, \"_hfc_stable_wrapper\", False){newline}",
+        f"{deeper_indent}        and getattr(agent.tool_complete_callback, \"_hfc_stable_wrapper\", False){newline}",
+        f"{deeper_indent}    ){newline}",
+        f"{deeper_indent}except (NameError, AttributeError):{newline}",
+        f"{deeper_indent}    pass{newline}",
+        f"{deeper_indent}if not _hfc_stable_tool_callbacks:{newline}",
+        f"{deeper_indent}    try:{newline}",
+        f"{deeper_indent}        _hfc_stable_tool_callbacks = bool(_hfc_stable_tool_callbacks_available[0]){newline}",
+        f"{deeper_indent}    except (NameError, TypeError, IndexError):{newline}",
+        f"{deeper_indent}        pass{newline}",
+        f"{inner_indent}if event_type in (\"tool.started\", \"tool.completed\") and _run_still_current():{newline}",
+        f"{deeper_indent}if _hfc_stable_tool_callbacks and _hfc_stable_tool_progress_owned:{newline}",
+        f"{deeper_indent}    if event_type == \"tool.started\":{newline}",
+        f"{deeper_indent}        _hfc_tool_key = tool_name or \"tool\"{newline}",
+        f"{deeper_indent}        _hfc_pending_tool_previews.setdefault(_hfc_tool_key, []).append(preview or \"\"){newline}",
+        f"{deeper_indent}    return{newline}",
+        f"{deeper_indent}if _hfc_emit_threadsafe({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"message_id\": event_message_id,{newline}",
+        f"{deeper_indent}    \"_hfc_loop\": _loop_for_step,{newline}",
+        f"{deeper_indent}    \"tool_id\": tool_name or \"tool\",{newline}",
+        f"{deeper_indent}    \"name\": tool_name or \"tool\",{newline}",
+        f"{deeper_indent}    \"status\": \"completed\" if event_type == \"tool.completed\" else \"running\",{newline}",
+        f"{deeper_indent}    \"detail\": preview or \"\",{newline}",
+        f"{deeper_indent}}}, event_name=\"tool.updated\"):{newline}",
+        f"{deeper_indent}    return{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{TOOL_PATCH_END}{newline}",
+    ]
+
+
+def _render_stable_tool_lifecycle_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    callback_indent = _child_indent(deeper_indent)
+    payload_indent = _child_indent(callback_indent)
+    return [
+        f"{indent}{STABLE_TOOL_PATCH_BEGIN}{newline}",
+        f"{indent}_hfc_stable_tool_callbacks_available = [False]{newline}",
+        f"{indent}_hfc_pending_tool_previews = {{}}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner_indent}from hermes_feishu_card.hook_runtime import bind_agent_turn_identity as _hfc_bind_agent_turn{newline}",
+        f"{inner_indent}_hfc_bind_agent_turn(agent, source){newline}",
+        f"{inner_indent}from hermes_feishu_card.hook_runtime import bind_agent_reasoning as _hfc_bind_reasoning{newline}",
+        f"{inner_indent}_hfc_bind_reasoning(agent, source, event_message_id, _loop_for_step, _run_still_current){newline}",
+        f"{inner_indent}from hermes_feishu_card.hook_runtime import _platform_name as _hfc_platform_name{newline}",
+        f"{inner_indent}_hfc_stable_tool_progress_owned = _hfc_platform_name({{}}, source) == \"feishu\"{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_threadsafe as _hfc_emit_stable_threadsafe{newline}"
+        ),
+        f"{inner_indent}_hfc_original_tool_progress_callback = getattr(agent, \"tool_progress_callback\", None){newline}",
+        f"{inner_indent}if getattr(_hfc_original_tool_progress_callback, \"_hfc_stable_wrapper\", False):{newline}",
+        f"{deeper_indent}_hfc_original_tool_progress_callback = getattr(_hfc_original_tool_progress_callback, \"_hfc_original_callback\", None){newline}",
+        f"{inner_indent}_hfc_original_tool_start_callback = getattr(agent, \"tool_start_callback\", None){newline}",
+        f"{inner_indent}if getattr(_hfc_original_tool_start_callback, \"_hfc_stable_wrapper\", False):{newline}",
+        f"{deeper_indent}_hfc_original_tool_start_callback = getattr(_hfc_original_tool_start_callback, \"_hfc_original_callback\", None){newline}",
+        f"{inner_indent}_hfc_original_tool_complete_callback = getattr(agent, \"tool_complete_callback\", None){newline}",
+        f"{inner_indent}if getattr(_hfc_original_tool_complete_callback, \"_hfc_stable_wrapper\", False):{newline}",
+        f"{deeper_indent}_hfc_original_tool_complete_callback = getattr(_hfc_original_tool_complete_callback, \"_hfc_original_callback\", None){newline}",
+        f"{inner_indent}def _hfc_tool_progress_callback(event_type, tool_name=None, preview=None, args=None, **kwargs):{newline}",
+        f"{deeper_indent}if event_type in (\"tool.started\", \"tool.completed\") and _hfc_stable_tool_progress_owned and _run_still_current():{newline}",
+        f"{callback_indent}if event_type == \"tool.started\":{newline}",
+        f"{payload_indent}_hfc_tool_key = tool_name or \"tool\"{newline}",
+        f"{payload_indent}_hfc_pending_tool_previews.setdefault(_hfc_tool_key, []).append(preview or \"\"){newline}",
+        f"{callback_indent}return None{newline}",
+        f"{deeper_indent}if callable(_hfc_original_tool_progress_callback):{newline}",
+        f"{callback_indent}return _hfc_original_tool_progress_callback(event_type, tool_name, preview, args, **kwargs){newline}",
+        f"{deeper_indent}return None{newline}",
+        f"{inner_indent}def _hfc_tool_start_callback(call_id, tool_name, args):{newline}",
+        f"{deeper_indent}try:{newline}",
+        f"{callback_indent}if callable(_hfc_original_tool_start_callback):{newline}",
+        f"{payload_indent}_hfc_original_tool_start_callback(call_id, tool_name, args){newline}",
+        f"{deeper_indent}except Exception:{newline}",
+        f"{callback_indent}pass{newline}",
+        f"{deeper_indent}_hfc_tool_key = tool_name or \"tool\"{newline}",
+        f"{deeper_indent}_hfc_preview_queue = _hfc_pending_tool_previews.get(_hfc_tool_key) or []{newline}",
+        f"{deeper_indent}_hfc_tool_preview = _hfc_preview_queue.pop(0) if _hfc_preview_queue else \"\"{newline}",
+        f"{deeper_indent}if not _hfc_preview_queue:{newline}",
+        f"{callback_indent}_hfc_pending_tool_previews.pop(_hfc_tool_key, None){newline}",
+        f"{deeper_indent}if not _run_still_current():{newline}",
+        f"{callback_indent}return{newline}",
+        f"{deeper_indent}_hfc_delivered = _hfc_emit_stable_threadsafe({{{newline}",
+        f"{callback_indent}**locals(),{newline}",
+        f"{callback_indent}\"source\": source,{newline}",
+        f"{callback_indent}\"message_id\": event_message_id,{newline}",
+        f"{callback_indent}\"_hfc_loop\": _loop_for_step,{newline}",
+        f"{callback_indent}\"tool_id\": str(call_id or tool_name or \"tool\"),{newline}",
+        f"{callback_indent}\"name\": tool_name or \"tool\",{newline}",
+        f"{callback_indent}\"status\": \"running\",{newline}",
+        f"{callback_indent}\"detail\": _hfc_tool_preview,{newline}",
+        f"{callback_indent}\"arguments\": args,{newline}",
+        f"{deeper_indent}}}, event_name=\"tool.updated\"){newline}",
+        f"{deeper_indent}if not _hfc_delivered:{newline}",
+        f"{callback_indent}_hfc_stable_tool_callbacks_available[0] = False{newline}",
+        f"{callback_indent}try:{newline}",
+        f"{payload_indent}if callable(_hfc_original_tool_progress_callback):{newline}",
+        f"{payload_indent}    _hfc_original_tool_progress_callback(\"tool.started\", tool_name, _hfc_tool_preview, args, _hfc_force_tool_progress_fallback=True){newline}",
+        f"{callback_indent}finally:{newline}",
+        f"{payload_indent}_hfc_stable_tool_callbacks_available[0] = True{newline}",
+        f"{inner_indent}def _hfc_tool_complete_callback(call_id, tool_name, args, result):{newline}",
+        f"{deeper_indent}try:{newline}",
+        f"{callback_indent}if callable(_hfc_original_tool_complete_callback):{newline}",
+        f"{payload_indent}_hfc_original_tool_complete_callback(call_id, tool_name, args, result){newline}",
+        f"{deeper_indent}except Exception:{newline}",
+        f"{callback_indent}pass{newline}",
+        f"{deeper_indent}if not _run_still_current():{newline}",
+        f"{callback_indent}return{newline}",
+        f"{deeper_indent}_hfc_delivered = _hfc_emit_stable_threadsafe({{{newline}",
+        f"{callback_indent}**locals(),{newline}",
+        f"{callback_indent}\"source\": source,{newline}",
+        f"{callback_indent}\"message_id\": event_message_id,{newline}",
+        f"{callback_indent}\"_hfc_loop\": _loop_for_step,{newline}",
+        f"{callback_indent}\"tool_id\": str(call_id or tool_name or \"tool\"),{newline}",
+        f"{callback_indent}\"name\": tool_name or \"tool\",{newline}",
+        f"{callback_indent}\"status\": \"completed\",{newline}",
+        f"{callback_indent}\"detail\": \"\",{newline}",
+        f"{deeper_indent}}}, event_name=\"tool.updated\"){newline}",
+        f"{deeper_indent}if not _hfc_delivered:{newline}",
+        f"{callback_indent}_hfc_stable_tool_callbacks_available[0] = False{newline}",
+        f"{callback_indent}try:{newline}",
+        f"{payload_indent}if callable(_hfc_original_tool_progress_callback):{newline}",
+        f"{payload_indent}    _hfc_original_tool_progress_callback(\"tool.completed\", tool_name, None, None, _hfc_force_tool_progress_fallback=True){newline}",
+        f"{callback_indent}finally:{newline}",
+        f"{payload_indent}_hfc_stable_tool_callbacks_available[0] = True{newline}",
+        f"{inner_indent}_hfc_tool_progress_callback._hfc_stable_wrapper = True{newline}",
+        f"{inner_indent}_hfc_tool_progress_callback._hfc_original_callback = _hfc_original_tool_progress_callback{newline}",
+        f"{inner_indent}_hfc_tool_start_callback._hfc_stable_wrapper = True{newline}",
+        f"{inner_indent}_hfc_tool_start_callback._hfc_original_callback = _hfc_original_tool_start_callback{newline}",
+        f"{inner_indent}_hfc_tool_complete_callback._hfc_stable_wrapper = True{newline}",
+        f"{inner_indent}_hfc_tool_complete_callback._hfc_original_callback = _hfc_original_tool_complete_callback{newline}",
+        f"{inner_indent}agent.tool_progress_callback = _hfc_tool_progress_callback{newline}",
+        f"{inner_indent}agent.tool_start_callback = _hfc_tool_start_callback{newline}",
+        f"{inner_indent}agent.tool_complete_callback = _hfc_tool_complete_callback{newline}",
+        f"{inner_indent}_hfc_stable_tool_callbacks_available[0] = True{newline}",
+        f"{indent}except Exception:{newline}",
+        f"{inner_indent}_hfc_stable_tool_callbacks_available[0] = False{newline}",
+        f"{indent}{STABLE_TOOL_PATCH_END}{newline}",
+    ]
+
+
+def _render_answer_delta_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{ANSWER_DELTA_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_threadsafe as _hfc_emit_threadsafe{newline}"
+        ),
+        f"{inner_indent}if text and _run_still_current():{newline}",
+        f"{deeper_indent}if _hfc_emit_threadsafe({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"message_id\": event_message_id,{newline}",
+        f"{deeper_indent}    \"_hfc_loop\": _loop_for_step,{newline}",
+        f"{deeper_indent}    \"text\": text,{newline}",
+        f"{deeper_indent}}}, event_name=\"answer.delta\"):{newline}",
+        f"{deeper_indent}    return{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{ANSWER_DELTA_PATCH_END}{newline}",
+    ]
+
+
+def _render_thinking_delta_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{THINKING_DELTA_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_threadsafe as _hfc_emit_threadsafe{newline}"
+        ),
+        f"{inner_indent}if text and not already_streamed and _run_still_current():{newline}",
+        f"{deeper_indent}if _hfc_emit_threadsafe({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"message_id\": event_message_id,{newline}",
+        f"{deeper_indent}    \"_hfc_loop\": _loop_for_step,{newline}",
+        f"{deeper_indent}    \"text\": text,{newline}",
+        f"{deeper_indent}    \"mode\": \"append_block\",{newline}",
+        f"{deeper_indent}}}, event_name=\"thinking.delta\"):{newline}",
+        f"{deeper_indent}    return{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{THINKING_DELTA_PATCH_END}{newline}",
+    ]
+
+
+def _render_clarify_hook_block(indent: str, newline: str, *, returns_tuple: bool = False):
+    """Render the clarify interception block.
+
+    ``returns_tuple`` targets Hermes' extracted ``_ask_clarify_question`` seam
+    (commit 242ff24ff7, 2026-09-16): that helper's contract is
+    ``(response, answered)`` and its caller unpacks both values, so an intercepted
+    answer has to come back as ``(answer, True)``. The pre-extraction seam returned
+    the answer string itself.
+    """
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{CLARIFY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import request_clarify_response_from_hermes_locals as _hfc_request_clarify{newline}"
+        ),
+        f"{inner_indent}from uuid import uuid4 as _hfc_uuid4{newline}",
+        f"{inner_indent}if choices and _run_still_current():{newline}",
+        f"{deeper_indent}_hfc_clarify_response = _hfc_request_clarify({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"chat_id\": _status_chat_id,{newline}",
+        f"{deeper_indent}    \"conversation_id\": session_key or _status_chat_id,{newline}",
+        f"{deeper_indent}    \"message_id\": event_message_id,{newline}",
+        f"{deeper_indent}    \"_hfc_loop\": locals().get(\"_loop_for_step\"),{newline}",
+        f"{deeper_indent}    \"kind\": \"clarify\",{newline}",
+        f"{deeper_indent}}}, interaction_id=\"clarify_\" + _hfc_uuid4().hex[:10], question=question, choices=choices, multi_select=locals().get(\"multi_select\", False)){newline}",
+        f"{deeper_indent}if _hfc_clarify_response is not None:{newline}",
+        (
+            f"{deeper_indent}    return _hfc_clarify_response, True{newline}"
+            if returns_tuple
+            else f"{deeper_indent}    return _hfc_clarify_response{newline}"
+        ),
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{CLARIFY_PATCH_END}{newline}",
+    ]
+
+
+def _render_extracted_clarify_hook_block(indent: str, newline: str):
+    """Clarify hook for Hermes' extracted ``_ask_clarify_question`` seam."""
+    return _render_clarify_hook_block(indent, newline, returns_tuple=True)
+
+
+def _locate_extracted_clarify_helper(content: str):
+    """Return the extracted clarify helper when this Hermes routes clarify there.
+
+    Hermes ``242ff24ff7`` (2026-09-16) moved the clarify body out of
+    ``_clarify_callback_sync`` into ``_ask_clarify_question``; both the
+    single-question path and every batch question go through that helper. The
+    extraction took the ``ctx = self._ctx`` binding with it, which is exactly what
+    the legacy seam is located by, so the seam has to be identified from the helper.
+
+    ``None`` means the pre-extraction layout. Drift raises: the hook has to know
+    which contract to answer, and silently installing nothing would leave a
+    half-patched gateway that loses clarify cards without saying so.
+    """
+    tree = _parse_content(content)
+    turn_runner = _find_turn_runner_node(tree)
+    if turn_runner is None:
+        return None
+    helper = _find_direct_class_function_node(turn_runner, EXTRACTED_CLARIFY_HELPER)
+    if helper is None:
+        return None
+    caller = _find_direct_class_function_node(turn_runner, "_clarify_callback_sync")
+    tuple_call = caller is not None and any(
+        isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], (ast.Tuple, ast.List))
+        and len(node.targets[0].elts) == 2
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and isinstance(node.value.func.value, ast.Name)
+        and node.value.func.value.id == "self"
+        and node.value.func.attr == EXTRACTED_CLARIFY_HELPER
+        for node in ast.walk(caller)
+    )
+    if not isinstance(helper, ast.FunctionDef) or not tuple_call:
+        raise ValueError("Hermes extracted clarify return/call contract changed")
+    if not _binds_turn_context(helper):
+        raise ValueError(
+            "Hermes extracted clarify seam no longer binds the TurnRunner context "
+            f"({EXTRACTED_CLARIFY_HELPER})"
+        )
+    missing = [
+        name
+        for name in EXTRACTED_CLARIFY_ARGS
+        if name not in _function_argument_names(helper)
+    ]
+    if missing:
+        raise ValueError(
+            "Hermes extracted clarify seam signature changed "
+            f"({EXTRACTED_CLARIFY_HELPER} lost {', '.join(missing)})"
+        )
+    return helper
+
+
+def _apply_clarify_patch(content: str) -> str:
+    """Install the clarify hook on whichever seam this Hermes exposes.
+
+    The seam is chosen from the source rather than from what is already installed:
+    a repeat install must keep the spelling that matches the seam, because the
+    extracted helper is unpacked as ``(response, answered)`` while the
+    pre-extraction callback returns the answer string itself.
+    """
+    if _locate_extracted_clarify_helper(content) is not None:
+        return _apply_callback_patch(
+            content,
+            callback_name=EXTRACTED_CLARIFY_HELPER,
+            begin_marker=CLARIFY_PATCH_BEGIN,
+            end_marker=CLARIFY_PATCH_END,
+            renderer=_render_extracted_clarify_hook_block,
+            required_callback_args=EXTRACTED_CLARIFY_ARGS,
+            allow_turn_context=True,
+        )
+    return _apply_callback_patch(
+        content,
+        callback_name="_clarify_callback_sync",
+        begin_marker=CLARIFY_PATCH_BEGIN,
+        end_marker=CLARIFY_PATCH_END,
+        renderer=_render_clarify_hook_block,
+        required_outer_names=(
+            "source",
+            "event_message_id",
+            "_status_chat_id",
+            "session_key",
+            "_run_still_current",
+        ),
+        required_callback_args=("question", "choices"),
+        allow_turn_context=True,
+    )
+
+
+def _render_approval_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{APPROVAL_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import request_approval_choice_from_hermes_locals as _hfc_request_approval{newline}"
+        ),
+        f"{inner_indent}from uuid import uuid4 as _hfc_uuid4{newline}",
+        f"{inner_indent}if _run_still_current():{newline}",
+        f"{deeper_indent}_hfc_approval_choice = _hfc_request_approval({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"chat_id\": _status_chat_id,{newline}",
+        f"{deeper_indent}    \"conversation_id\": _approval_session_key or _status_chat_id,{newline}",
+        f"{deeper_indent}    \"message_id\": event_message_id,{newline}",
+        f"{deeper_indent}    \"_hfc_loop\": locals().get(\"_loop_for_step\"),{newline}",
+        f"{deeper_indent}}}, approval_data, interaction_id=\"approval_\" + _hfc_uuid4().hex[:10]){newline}",
+        f"{deeper_indent}if _hfc_approval_choice:{newline}",
+        f"{deeper_indent}    from hermes_feishu_card.hook_runtime import resolve_approval_choice as _hfc_resolve_gateway_approval{newline}",
+        f"{deeper_indent}    _hfc_resolve_gateway_approval(approval_data, _approval_session_key, _hfc_approval_choice){newline}",
+        f"{deeper_indent}    return{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{APPROVAL_PATCH_END}{newline}",
+    ]
+
+
+def _render_generation_approval_hook_block(indent: str, newline: str):
+    block = _render_approval_hook_block(indent, newline)
+    inner = _child_indent(indent)
+    deeper = _child_indent(inner)
+    guard = [
+        f"{inner}def _hfc_approval_current():{newline}",
+        f'{deeper}if not getattr(ctx, "_run_still_current")():{newline}',
+        f"{deeper}    return False{newline}",
+        f"{deeper}try:{newline}",
+        f"{deeper}    if self._approval_owner is not None:{newline}",
+        f"{deeper}        _authority, _session, _generation = self._approval_owner{newline}",
+        f"{deeper}        _authority.check_approval_generation(_session, _generation){newline}",
+        f"{deeper}except Exception:{newline}",
+        f"{deeper}    return False{newline}",
+        f"{deeper}return True{newline}",
+    ]
+    block[2:2] = guard
+    block = [line.replace('_run_still_current()', '_hfc_approval_current()')
+             if 'ctx._run_still_current()' not in line else line for line in block]
+    block = [line.replace('if _hfc_approval_choice:',
+                          'if _hfc_approval_choice and _hfc_approval_current():') for line in block]
+    index = next(i for i, line in enumerate(block) if '**locals(),' in line)
+    block.insert(index + 1, f'{deeper}    "_run_still_current": _hfc_approval_current,{newline}')
+    return block
+
+
+def _render_status_hook_block(indent: str, newline: str, *, suppress_owned: bool = True):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{STATUS_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import handle_status_from_hermes_locals as _hfc_handle_status{newline}"
+        ),
+        f"{inner_indent}if _run_still_current():{newline}",
+        f"{deeper_indent}{'if ' if suppress_owned else ''}_hfc_handle_status({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"chat_id\": _status_chat_id,{newline}",
+        f"{deeper_indent}    \"message_id\": event_message_id,{newline}",
+        f"{deeper_indent}    \"_hfc_loop\": _loop_for_step,{newline}",
+        f"{deeper_indent}}}, event_type=event_type, message=message){':' if suppress_owned else ''}{newline}",
+        *([f"{deeper_indent}    return{newline}"] if suppress_owned else []),
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{STATUS_PATCH_END}{newline}",
+    ]
+
+
+def _render_v464_status_hook_block(indent: str, newline: str):
+    return _render_status_hook_block(indent, newline, suppress_owned=False)
+
+
+def _render_slash_confirm_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{SLASH_CONFIRM_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import request_slash_confirm_from_hermes_locals_async as _hfc_request_slash_confirm{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import complete_command_card_from_hermes_locals_async as _hfc_complete_command_card{newline}"
+        ),
+        f"{inner_indent}from hashlib import sha256 as _hfc_sha256{newline}",
+        f"{inner_indent}_hfc_slash_reply_to = None{newline}",
+        f"{inner_indent}try:{newline}",
+        f"{deeper_indent}_hfc_slash_reply_to = self._reply_anchor_for_event(event){newline}",
+        f"{inner_indent}except Exception:{newline}",
+        f"{deeper_indent}_hfc_slash_reply_to = getattr(event, \"message_id\", None){newline}",
+        (
+            f"{inner_indent}_hfc_slash_interaction_seed = "
+            f"(str(session_key) + \":\" + str(confirm_id)).encode(\"utf-8\")"
+            f"{newline}"
+        ),
+        (
+            f"{inner_indent}_hfc_slash_interaction_id = \"slash_\" "
+            f"+ _hfc_sha256(_hfc_slash_interaction_seed).hexdigest()[:16]{newline}"
+        ),
+        f"{inner_indent}_hfc_slash_choice = await _hfc_request_slash_confirm({{{newline}",
+        f"{inner_indent}    **locals(),{newline}",
+        f"{inner_indent}    \"source\": source,{newline}",
+        f"{inner_indent}    \"chat_id\": getattr(source, \"chat_id\", \"\"),{newline}",
+        f"{inner_indent}    \"conversation_id\": session_key,{newline}",
+        f"{inner_indent}    \"message_id\": _hfc_slash_reply_to,{newline}",
+        f"{inner_indent}    \"reply_to_message_id\": _hfc_slash_reply_to,{newline}",
+        f"{inner_indent}}}, command=command, title=title, message=message, interaction_id=_hfc_slash_interaction_id){newline}",
+        f"{inner_indent}if _hfc_slash_choice in {{\"once\", \"always\", \"cancel\"}}:{newline}",
+        f"{deeper_indent}_hfc_slash_result = await handler(_hfc_slash_choice){newline}",
+        f"{deeper_indent}if await _hfc_complete_command_card({{{newline}",
+        f"{deeper_indent}    \"source\": source,{newline}",
+        f"{deeper_indent}    \"chat_id\": getattr(source, \"chat_id\", \"\"),{newline}",
+        f"{deeper_indent}    \"conversation_id\": session_key,{newline}",
+        f"{deeper_indent}    \"message_id\": _hfc_slash_reply_to,{newline}",
+        f"{deeper_indent}}}, answer=_hfc_slash_result):{newline}",
+        f"{deeper_indent}    return None{newline}",
+        f"{deeper_indent}return _hfc_slash_result{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{SLASH_CONFIRM_PATCH_END}{newline}",
+    ]
+
+
+def _render_command_card_adapter_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{COMMAND_CARD_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import install_feishu_command_card_adapter_methods as _hfc_install_command_cards{newline}"
+        ),
+        f"{inner_indent}_hfc_install_command_cards(self, event=event){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMMAND_CARD_PATCH_END}{newline}",
+    ]
+
+
+def _render_command_card_startup_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{COMMAND_CARD_STARTUP_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import install_feishu_command_card_adapter_methods as _hfc_install_command_cards{newline}"
+        ),
+        f"{inner_indent}_hfc_install_command_cards(self){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMMAND_CARD_STARTUP_PATCH_END}{newline}",
+    ]
+
+
+def _render_native_redelivery_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{NATIVE_REDELIVERY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import prepare_native_handoff_recovery as _hfc_prepare_native_handoff_recovery{newline}"
+        ),
+        f"{inner_indent}await _hfc_prepare_native_handoff_recovery({newline}",
+        f"{inner_indent}    adapter=adapter,{newline}",
+        f"{inner_indent}    obligation_id=row.get(\"obligation_id\"),{newline}",
+        f"{inner_indent}    chat_id=row.get(\"chat_id\"),{newline}",
+        f"{inner_indent}    content=content,{newline}",
+        f"{inner_indent}    original_content=row.get(\"content\"),{newline}",
+        f"{inner_indent}    thread_id=row.get(\"thread_id\") or \"\",{newline}",
+        f"{inner_indent}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{NATIVE_REDELIVERY_PATCH_END}{newline}",
+    ]
+
+
+def _render_legacy_command_card_adapter_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{COMMAND_CARD_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import install_feishu_command_card_adapter_methods as _hfc_install_command_cards{newline}"
+        ),
+        f"{inner_indent}_hfc_install_command_cards(self){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMMAND_CARD_PATCH_END}{newline}",
+    ]
+
+
+def _render_platform_notice_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{PLATFORM_NOTICE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import handle_platform_notice_from_hermes as _hfc_handle_platform_notice{newline}"
+        ),
+        f"{inner_indent}if _hfc_handle_platform_notice(self, source, content):{newline}",
+        f"{deeper_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{PLATFORM_NOTICE_PATCH_END}{newline}",
+    ]
+
+
+def _render_hfc_command_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{HFC_COMMAND_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import maintenance_admission_from_hermes_locals as _hfc_enforce_maintenance_admission{newline}"
+        ),
+        f"{inner_indent}if await _hfc_enforce_maintenance_admission(locals()):{newline}",
+        f"{deeper_indent}return None{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import handle_hfc_command_from_hermes_locals as _hfc_handle_command{newline}"
+        ),
+        f"{inner_indent}_hfc_command_message_id = None{newline}",
+        f"{inner_indent}try:{newline}",
+        f"{deeper_indent}_hfc_command_message_id = self._reply_anchor_for_event(event){newline}",
+        f"{inner_indent}except Exception:{newline}",
+        f"{deeper_indent}_hfc_command_message_id = getattr(event, \"message_id\", None){newline}",
+        f"{inner_indent}if _hfc_handle_command({{**locals(), \"message_id\": _hfc_command_message_id}}):{newline}",
+        f"{deeper_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{HFC_COMMAND_PATCH_END}{newline}",
+    ]
+
+
+def _render_cron_hook_block(
+    indent: str,
+    newline: str,
+    *,
+    media_aware: bool = False,
+):
+    inner_indent = _child_indent(indent)
+    if media_aware:
+        return [
+            f"{indent}{CRON_PATCH_BEGIN}{newline}",
+            f"{indent}try:{newline}",
+            (
+                f"{inner_indent}from hermes_feishu_card.hook_runtime "
+                f"import emit_cron_delivery as _hfc_emit_cron{newline}"
+            ),
+            f"{inner_indent}_hfc_cron_metadata = {{\"delivery_kind\": \"cron\"}}{newline}",
+            (
+                f"{inner_indent}if _hfc_emit_cron({{**locals(), "
+                f"\"_hfc_resolved_targets\": locals().get(\"targets\", [])}}):{newline}"
+            ),
+            f"{_child_indent(inner_indent)}if media_files:{newline}",
+            f"{_child_indent(_child_indent(inner_indent))}cleaned_delivery_content = \"\"{newline}",
+            f"{_child_indent(inner_indent)}else:{newline}",
+            f"{_child_indent(_child_indent(inner_indent))}return None{newline}",
+            *_render_hook_exception_handler(indent, newline),
+            f"{indent}{CRON_PATCH_END}{newline}",
+        ]
+    return [
+        f"{indent}{CRON_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_cron_delivery as _hfc_emit_cron{newline}"
+        ),
+        f"{inner_indent}_hfc_cron_metadata = {{\"delivery_kind\": \"cron\"}}{newline}",
+        f"{inner_indent}# Pre-resolve targets so build_cron_event can discover feishu chat_id{newline}",
+        f"{inner_indent}_hfc_resolve_targets = locals().get(\"_resolve_delivery_targets\") or globals().get(\"_resolve_delivery_targets\"){newline}",
+        f"{inner_indent}if callable(_hfc_resolve_targets):{newline}",
+        f"{_child_indent(inner_indent)}try:{newline}",
+        f"{_child_indent(_child_indent(inner_indent))}job[\"_hfc_resolved_targets\"] = _hfc_resolve_targets(job){newline}",
+        f"{_child_indent(inner_indent)}except Exception:{newline}",
+        f"{_child_indent(_child_indent(inner_indent))}pass{newline}",
+        f"{inner_indent}if _hfc_emit_cron(locals()):{newline}",
+        f"{_child_indent(inner_indent)}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{CRON_PATCH_END}{newline}",
+    ]
+
+
+def _render_placeholder_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner_indent}pass{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{PATCH_END}{newline}",
+    ]
+
+
+def _child_indent(indent: str) -> str:
+    if indent.endswith("\t"):
+        return indent + "\t"
+    return indent + " " * 4
+
+
+def _needs_leading_newline(lines, insert_at: int) -> bool:
+    return insert_at == len(lines) and bool(lines) and _line_ending(lines[-1]) == ""
+
+
+def _has_no_final_newline_sentinel(lines, begin_index: int) -> bool:
+    if begin_index <= 1:
+        return False
+    sentinel_line = _strip_line_ending(lines[begin_index - 1])
+    return sentinel_line == _leading_whitespace(sentinel_line) + _NO_FINAL_NEWLINE
+
+
+def _detect_newline(content: str) -> str:
+    crlf_index = content.find("\r\n")
+    lf_index = content.find("\n")
+    if crlf_index != -1 and crlf_index == lf_index - 1:
+        return "\r\n"
+    return "\n"
+
+
+def _render_legacy_run_target(content: str) -> str:
+    return apply_patch(
+        content,
+        strategy="gateway_run_013_plus",
+        integration_mode="legacy-patch",
+    )
+
+
+def _render_legacy_cron_target(content: str) -> str:
+    return apply_cron_patch(content, integration_mode="legacy-patch")
+
+
+def _render_legacy_base_target(content: str) -> str:
+    return apply_base_patch(content, integration_mode="legacy-patch")
+
+
+LEGACY_TARGET_PATCH_ADAPTERS = (
+    LegacyTargetPatchAdapter(
+        target="gateway/run.py",
+        renderer=_render_legacy_run_target,
+        strict_remover=remove_patch,
+        owned_markers=(
+            (PATCH_BEGIN, PATCH_END),
+            (COMPLETE_PATCH_BEGIN, COMPLETE_PATCH_END),
+            (QUEUED_COMPLETE_PATCH_BEGIN, QUEUED_COMPLETE_PATCH_END),
+            (TOOL_PATCH_BEGIN, TOOL_PATCH_END),
+            (STABLE_TOOL_PATCH_BEGIN, STABLE_TOOL_PATCH_END),
+            (ANSWER_DELTA_PATCH_BEGIN, ANSWER_DELTA_PATCH_END),
+            (THINKING_DELTA_PATCH_BEGIN, THINKING_DELTA_PATCH_END),
+            (CLARIFY_PATCH_BEGIN, CLARIFY_PATCH_END),
+            (APPROVAL_PATCH_BEGIN, APPROVAL_PATCH_END),
+            (STATUS_PATCH_BEGIN, STATUS_PATCH_END),
+            (CRON_PATCH_BEGIN, CRON_PATCH_END),
+            (SLASH_CONFIRM_PATCH_BEGIN, SLASH_CONFIRM_PATCH_END),
+            (COMMAND_CARD_PATCH_BEGIN, COMMAND_CARD_PATCH_END),
+            (COMMAND_CARD_STARTUP_PATCH_BEGIN, COMMAND_CARD_STARTUP_PATCH_END),
+            (NATIVE_REDELIVERY_PATCH_BEGIN, NATIVE_REDELIVERY_PATCH_END),
+            (PLATFORM_NOTICE_PATCH_BEGIN, PLATFORM_NOTICE_PATCH_END),
+            (HFC_COMMAND_PATCH_BEGIN, HFC_COMMAND_PATCH_END),
+        ),
+    ),
+    LegacyTargetPatchAdapter(
+        target="cron/scheduler.py",
+        renderer=_render_legacy_cron_target,
+        strict_remover=remove_cron_patch,
+        owned_markers=((CRON_PATCH_BEGIN, CRON_PATCH_END),),
+    ),
+    LegacyTargetPatchAdapter(
+        target="gateway/platforms/base.py",
+        renderer=_render_legacy_base_target,
+        strict_remover=remove_base_patch,
+        owned_markers=(
+            (stop_cancellation.BEGIN, stop_cancellation.END),
+            (EXACT_BASE_NO_TEXT_PATCH_BEGIN, EXACT_BASE_NO_TEXT_PATCH_END),
+            (
+                EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN,
+                EXACT_BASE_FINAL_DELIVERY_PATCH_END,
+            ),
+        ),
+    ),
+)
+
+
+from .hybrid_renderers import reviewed_descriptors as _reviewed_hybrid_descriptors
+
+
+HYBRID_PATCH_DESCRIPTORS = _reviewed_hybrid_descriptors(HYBRID_PATCH_DESCRIPTORS)
+HYBRID_PATCH_REGISTRY = PatchDescriptorRegistry(
+    descriptors=HYBRID_PATCH_DESCRIPTORS,
+    required_groups=HYBRID_PATCH_GROUPS,
+)
+
+
+# September 2026 facade layout. Keep this separate from the fixed-tag Hybrid
+# descriptor registry: source layout is not evidence of native hook support.
+DECOMPOSED_LAYOUT_MARKERS = {
+    "message_handler": PATCH_BEGIN,
+    "completion_return": COMPLETE_PATCH_BEGIN,
+    "tool_callback": STABLE_TOOL_PATCH_BEGIN,
+    "answer_delta_callback": ANSWER_DELTA_PATCH_BEGIN,
+    "thinking_delta_callback": THINKING_DELTA_PATCH_BEGIN,
+    "status_callback": STATUS_PATCH_BEGIN,
+    "clarify_callback": CLARIFY_PATCH_BEGIN,
+    "approval_callback": APPROVAL_PATCH_BEGIN,
+    "command_card": COMMAND_CARD_PATCH_BEGIN,
+    "hfc_command": HFC_COMMAND_PATCH_BEGIN,
+    "slash_confirm": SLASH_CONFIRM_PATCH_BEGIN,
+    "startup": COMMAND_CARD_STARTUP_PATCH_BEGIN,
+    "redelivery": NATIVE_REDELIVERY_PATCH_BEGIN,
+    "platform_notice": PLATFORM_NOTICE_PATCH_BEGIN,
+}
+
+
+def apply_gateway_fragment(content: str, target: str, *, strategy="gateway_run_013_plus",
+                           completion_sources=None) -> str:
+    """Render one routed legacy fragment; never infer an integration mode."""
+    if target not in ("gateway/run.py", *DECOMPOSED_GATEWAY_TARGETS):
+        raise ValueError("unknown Gateway patch target")
+    tree = _parse_content(content)
+    split_node = (_split_completion_node({**completion_sources, target: content}, target)
+                  if completion_sources is not None else None)
+    if _find_handler_node(tree) is not None:
+        content = _apply_start_patch(content, strategy=strategy)
+        if split_node is None:
+            content = _apply_complete_patch(content, strategy=strategy)
+        content = _apply_turn_timing_patch(content, validated_split=split_node is not None)
+        content = _apply_stale_interrupted_patch(content)
+    elif split_node is not None:
+        content = _apply_complete_patch(content, strategy=strategy,
+                                        completion_sources=completion_sources, target=target)
+    content = _apply_queued_complete_patch(content)
+    content = _apply_queued_followup_patch(content)
+    content = _apply_redirect_patch(content)
+    content = _apply_busy_recall_patch(content)
+    content = _apply_long_running_recall_patch(content)
+    content = _apply_task_heartbeat_patch(content)
+    for apply in (_apply_command_card_adapter_patch, _apply_hfc_command_patch,
+                  _apply_slash_confirm_patch, _apply_command_card_startup_patch,
+                  _apply_native_redelivery_patch, _apply_platform_notice_patch):
+        content = apply(content)
+    return _apply_turn_callbacks(content, strategy=strategy)
+
+
+def _find_startup_boot_send(func):
+    if func.name not in {"_start_finish_wiring", "start"}:
+        return None
+    return next((node for node in func.body if isinstance(node, ast.Expr)
+                 and isinstance(node.value, ast.Await)
+                 and isinstance(node.value.value, ast.Call)
+                 and _same_expression(node.value.value.func, "self._await_startup_boot_sends")), None)
+
+
+def _approval_callback_name(content):
+    """The extracted renderer runs only AFTER Hermes' original generation check."""
+    tree = _parse_content(remove_patch(content))
+    runner = _find_turn_runner_node(tree)
+    if runner is None:
+        return "_approval_notify_sync"
+    renderers = [n for n in runner.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_render_approval_sync"]
+    if not renderers:
+        return "_approval_notify_sync"
+    expected = ast.parse('''def _approval_notify_sync(self, approval_data: dict) -> None:
+    if self._approval_owner is not None:
+        authority, session_id, generation = self._approval_owner
+        authority.check_approval_generation(session_id, generation)
+    self._render_approval_sync(approval_data)
+    if self._approval_owner is not None:
+        from gateway import local_viewer_events
+        authority.register_approval(session_id, generation, self._ctx.session_key, approval_data,
+                                    timeout_s=local_viewer_events.prompt_timeout_s(self, "approval"))
+''').body[0]
+    notifiers = [n for n in runner.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_approval_notify_sync"]
+    calls = [n for n in ast.walk(runner) if isinstance(n, ast.Call)
+             and _same_expression(n.func, "register_gateway_notify")]
+    expected_call = ast.parse("register_gateway_notify(session_key, self._approval_notify_sync)").body[0].value
+    if (len(renderers) != 1 or len(notifiers) != 1
+            or ast.dump(notifiers[0]) != ast.dump(expected)
+            or not _binds_turn_context(renderers[0]) or len(calls) != 1
+            or ast.dump(calls[0]) != ast.dump(expected_call)):
+        raise ValueError("extracted approval generation/notify contract changed")
+    return "_render_approval_sync"
+
+
+def _split_completion_node(sources, target):
+    """Resolve the verified inherited owner, never a same-named dead method."""
+    persistence = "gateway/run_turn_persistence.py"
+    if persistence not in sources:
+        return None
+    if target not in {"gateway/run_turn.py", persistence}:
+        return None
+    import copy
+    handler_tree = _parse_content(remove_patch(sources.get("gateway/run_turn.py", "")))
+    peer_tree = _parse_content(remove_patch(sources[persistence]))
+    owners = [node for node in handler_tree.body if isinstance(node, ast.ClassDef)
+              and node.name == "GatewayTurnMixin"]
+    peers = [node for node in peer_tree.body if isinstance(node, ast.ClassDef)
+             and node.name == "GatewayTurnPersistenceMixin"]
+    imports = [node for node in handler_tree.body if isinstance(node, ast.ImportFrom)
+               and node.module == "gateway.run_turn_persistence" and node.level == 0
+               and any(alias.name == "GatewayTurnPersistenceMixin" and alias.asname is None
+                       for alias in node.names)]
+    methods = _COMPLETION_METHODS
+    if (len(owners) != 1 or len(peers) != 1 or len(imports) != 1
+            or tuple(ast.unparse(base) for base in owners[0].bases) not in {
+                ("GatewayTurnPersistenceMixin",),
+                ("GatewayTurnPrepareMixin", "GatewayTurnHygieneMixin", "GatewayTurnPersistenceMixin")}
+            or any(getattr(node, "name", None) in methods for node in owners[0].body)):
+        raise ValueError("inherited completion ownership contract changed")
+    # Earlier bases must be proven not to shadow persistence. Bind their
+    # imports, class definitions and absence of rebinding, not just their names.
+    for base in owners[0].bases:
+        if not isinstance(base, ast.Name):
+            raise ValueError("inherited completion base is not a direct name")
+        name = base.id
+        module = {"GatewayTurnPrepareMixin": "gateway.run_turn_prepare",
+                  "GatewayTurnHygieneMixin": "gateway.run_turn_hygiene",
+                  "GatewayTurnPersistenceMixin": "gateway.run_turn_persistence"}[name]
+        bindings = [node for node in handler_tree.body if isinstance(node, ast.ImportFrom)
+                    and node.module == module and node.level == 0
+                    and any(alias.name == name and alias.asname is None for alias in node.names)]
+        all_imports = [alias for n in ast.walk(handler_tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+                       for alias in n.names if (alias.asname or alias.name.split('.')[0]) == name]
+        if len(bindings) != 1 or len(all_imports) != 1 or any(
+                isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
+                or isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store) and n.attr in methods
+                for n in ast.walk(handler_tree)):
+            raise ValueError("inherited completion base binding changed")
+        base_tree = _parse_content(remove_patch(sources.get(module.replace(".", "/") + ".py", "")))
+        classes = [n for n in base_tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+        if (len(classes) != 1 or classes[0].bases or classes[0].keywords or classes[0].decorator_list
+                or any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
+                       for n in ast.walk(base_tree))
+                or any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id in methods
+                       or isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store) and n.attr in methods
+                       for n in ast.walk(base_tree))
+                or any(getattr(n, "name", None) in {"__getattribute__", "__getattr__"} for n in classes[0].body)
+                or (name != "GatewayTurnPersistenceMixin" and any(
+                    getattr(n, "name", None) in methods for n in classes[0].body))):
+            raise ValueError("inherited completion earlier base shadow or rebinding")
+    combined = copy.deepcopy(handler_tree)
+    owner = next(node for node in combined.body if isinstance(node, ast.ClassDef)
+                 and node.name == "GatewayTurnMixin")
+    owner.body.extend(node for node in peers[0].body if getattr(node, "name", None) in methods)
+    delivery = _find_decomposed_completion_node(combined)
+    if delivery is None:
+        raise ValueError("inherited completion/agent:end contract missing")
+    return delivery
+
+
+def _find_decomposed_completion_node(tree):
+    handler = _find_handler_node(tree)
+    owners = [node for node in tree.body if isinstance(node, ast.ClassDef)
+              and handler in node.body]
+    if handler is None or len(owners) != 1:
+        return None
+    methods = []
+    for name, parameters in (
+        (_COMPLETION_DELIVERY, ("self", *_COMPLETION_DELIVERY_ARGS)),
+        (_COMPLETION_POST_HOOK, ("self", "hook_ctx", "agent_result", "response")),
+    ):
+        candidates = [node for node in owners[0].body
+                      if isinstance(node, ast.AsyncFunctionDef) and node.name == name]
+        if len(candidates) != 1:
+            return None
+        if candidates[0].decorator_list:
+            return None
+        args = candidates[0].args
+        if (tuple(arg.arg for arg in (*args.posonlyargs, *args.args)) != parameters
+                or args.kwonlyargs or args.vararg is not None or args.kwarg is not None):
+            return None
+        methods.append(candidates[0])
+    delivery, post = methods
+    wrappers = [
+        node
+        for node in owners[0].body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == _COMPLETION_WRAPPER
+    ]
+    if len(wrappers) > 1:
+        return None
+    wrapper = wrappers[0] if wrappers else None
+    # Both seams must actually be called by the handler, with the same result
+    # and response; a facade import or a similarly named dead method is not enough.
+    expected_post = ast.parse('await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)').body[0]
+    same = lambda a, b: ast.dump(a) == ast.dump(b)
+    direct_returns = [
+        n for n in ast.walk(handler)
+        if _completion_return_matches(n, _COMPLETION_DELIVERY, _COMPLETION_DELIVERY_ARGS)
+    ]
+    wrapper_returns = [
+        n for n in ast.walk(handler)
+        if _completion_return_matches(n, _COMPLETION_WRAPPER, _COMPLETION_DELIVERY_ARGS)
+    ]
+    if wrapper is None:
+        if wrapper_returns or len(direct_returns) != 1:
+            return None
+        completion_return = direct_returns[0]
+    else:
+        if direct_returns or len(wrapper_returns) != 1 or not _completion_wrapper_is_exact(wrapper):
+            return None
+        completion_return = wrapper_returns[0]
+    posts = [n for n in ast.walk(handler) if same(n, expected_post)]
+    emits = [n for n in ast.walk(post) if isinstance(n, ast.Await)
+             and isinstance(n.value, ast.Call)
+             and _same_expression(n.value.func, 'self.hooks.emit')
+             and n.value.args and _same_expression(n.value.args[0], '"agent:end"')]
+    if len(posts) != 1 or len(emits) != 1 or posts[0].lineno >= completion_return.lineno:
+        return None
+    return delivery
+
+
+def _render_decomposed_complete_hook_block(indent, newline):
+    # Timing is copied from the caller without mutating its original result.
+    return [line.replace('"duration": _response_time,', '"duration": agent_result.get("_hfc_turn_seconds"),')
+            for line in _render_complete_hook_block_with_reply_anchor(indent, newline)]
+
+
+
+
+def _render_decomposed_base_final_hook_block(indent, newline):
+    block = _render_exact_base_final_delivery_hook_block(indent, newline)
+    block = [line.replace("prepare_exact_base_final_delivery as", "prepare_decomposed_base_final_delivery as")
+             .replace("_final_thread_metadata", "metadata") for line in block]
+    block.insert(2, f'{_child_indent(indent)}_reply_anchor = _reply_anchor_for_event(event){newline}')
+    return block
+
+
+def _render_decomposed_split_base_final_hook_block(indent, newline):
+    """Render the split ledger hook while preserving decomposed context."""
+    return [
+        line.replace(
+            "prepare_exact_base_final_delivery as",
+            "prepare_decomposed_base_final_delivery as",
+        )
+        for line in _render_split_base_final_delivery_hook_block(indent, newline)
+    ]
+
+
+def _render_decomposed_base_no_text_hook_block(indent, newline):
+    block = _render_exact_base_no_text_hook_block(indent, newline)
+    inner = _child_indent(indent)
+    block[2:2] = [
+        f'{inner}from hermes_feishu_card.hook_runtime import capture_decomposed_base_context as _hfc_capture_base{newline}',
+        f'{inner}images, local_files = extracted.images, extracted.local_files{newline}',
+        f'{inner}_hfc_capture_base(locals()){newline}',
+    ]
+    return block
+
+
+def _render_turn_timing_hook_block(indent, newline):
+    return [f"{indent}{TURN_TIMING_PATCH_BEGIN}{newline}",
+            f"{indent}try:{newline}",
+            f'{_child_indent(indent)}agent_result = {{**agent_result, "_hfc_turn_seconds": _turn_seconds}}{newline}',
+            *_render_hook_exception_handler(indent, newline),
+            f"{indent}{TURN_TIMING_PATCH_END}{newline}"]
+
+
+def _render_stale_interrupted_hook_block(indent, newline):
+    inner = _child_indent(indent)
+    return [
+        f"{indent}{STALE_INTERRUPTED_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        f"{inner}from hermes_feishu_card.hook_runtime import emit_stale_interrupted_turn_async as _hfc_emit_interrupted{newline}",
+        f"{inner}await _hfc_emit_interrupted(locals()){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{STALE_INTERRUPTED_PATCH_END}{newline}",
+    ]
+
+
+def _apply_stale_interrupted_patch(content):
+    """Observe only the exact discarded result; never infer stop from a command."""
+    content = _remove_simple_owned_patch(
+        content, STALE_INTERRUPTED_PATCH_BEGIN, STALE_INTERRUPTED_PATCH_END,
+        _render_stale_interrupted_hook_block, "stale interrupted patch markers")
+    lines = content.splitlines(keepends=True)
+    location = find_stale_interrupted_location(
+        _find_handler_node(_parse_content(content)), lines,
+    )
+    if location is None:
+        return content
+    index, indent = location
+    lines[index:index] = _render_stale_interrupted_hook_block(
+        indent, _detect_newline(content))
+    return "".join(lines)
+
+def _apply_turn_timing_patch(content, *, validated_split=False):
+    content = _remove_simple_owned_patch(content, TURN_TIMING_PATCH_BEGIN, TURN_TIMING_PATCH_END,
+                                         _render_turn_timing_hook_block, "turn timing patch markers")
+    tree = _parse_content(content)
+    if not validated_split and _find_decomposed_completion_node(tree) is None:
+        return content
+    handler = _find_handler_node(tree)
+    if "_turn_seconds" not in _function_scope_names(handler):
+        raise ValueError("decomposed completion timing missing")
+    target = _completion_dispatch_return(handler)
+    if target is None:
+        raise ValueError("decomposed completion timing missing")
+    lines = content.splitlines(keepends=True)
+    index = target.lineno - 1
+    lines[index:index] = _render_turn_timing_hook_block(_line_indent(lines, index), _detect_newline(content))
+    return "".join(lines)

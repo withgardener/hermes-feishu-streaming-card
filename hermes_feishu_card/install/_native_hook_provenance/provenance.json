@@ -1,0 +1,86 @@
+{
+  "commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
+  "files": [
+    {
+      "anchors": [
+        {"line_end": 270, "line_start": 243, "name": "enabled_allowlist", "slice_path": "slices/plugin_manager__enabled_allowlist.py", "slice_sha256": "sha256:ad4aaaff708f924b35b3ee27d7dfea27443099f6b105c88d84e9bbe00430d25c"},
+        {"line_end": 1192, "line_start": 1177, "name": "register_hook", "slice_path": "slices/plugin_manager__register_hook.py", "slice_sha256": "sha256:1bd2ee6014b447f8b3d291d8e776f25548fc7b2d3b5d7e3eceb0c31ad1546090"},
+        {"line_end": 1495, "line_start": 1336, "name": "discover_and_enable", "slice_path": "slices/plugin_manager__discover_and_enable.py", "slice_sha256": "sha256:33d9d996e181d9ac31caefd07962f7de9c795ea7168104afec6267f856dd7204"},
+        {"line_end": 1701, "line_start": 1677, "name": "entrypoint_scan", "slice_path": "slices/plugin_manager__entrypoint_scan.py", "slice_sha256": "sha256:bc93df18c5d3a496e35792a3c47f3123e917fdd1e8b11a56b0c5d52e9a7dfdea"},
+        {"line_end": 1849, "line_start": 1767, "name": "entrypoint_register", "slice_path": "slices/plugin_manager__entrypoint_register.py", "slice_sha256": "sha256:3a028d17ad60f9af1627dfc744874007682b097754e104a46e2df24c583de496"},
+        {"line_end": 1905, "line_start": 1889, "name": "entrypoint_load", "slice_path": "slices/plugin_manager__entrypoint_load.py", "slice_sha256": "sha256:15b1b64f061e36c3b47d02ff1afd36c623d3c0e43f0f5e9edf6befc13d1cbd60"},
+        {"line_end": 1946, "line_start": 1911, "name": "invoke_semantics", "slice_path": "slices/plugin_manager__invoke_semantics.py", "slice_sha256": "sha256:ab5fe3bac9978b2ccd23f61f7061928a921d50ca28417d53f01937e68ab2304e"}
+      ],
+      "relative_path": "hermes_cli/plugins.py",
+      "sha256": "sha256:2cb8c309ce7747331669f22060a7e357e9c7a865f07cc779f30f17f8ce90daf5",
+      "target": "plugin_manager"
+    },
+    {
+      "anchors": [
+        {"line_end": 450, "line_start": 436, "name": "turn_id_publish", "slice_path": "slices/turn_context__turn_id_publish.py", "slice_sha256": "sha256:a7359103fd307ee338b9755d9af391dc451f2d8378a603dba6433655f1244a87"},
+        {"line_end": 1103, "line_start": 1051, "name": "pre_llm_call", "slice_path": "slices/turn_context__pre_llm_call.py", "slice_sha256": "sha256:9e4490ff85c2bbf9674313949b75bd52f9614cf6077b9c81696a7ba5a4196cc9"}
+      ],
+      "relative_path": "agent/turn_context.py",
+      "sha256": "sha256:a0e136367b64007d7b49ea006ab0aa7dcc66b12134b512a463a03bd69fb8a90c",
+      "target": "turn_context"
+    },
+    {
+      "anchors": [
+        {"line_end": 584, "line_start": 565, "name": "post_llm_call", "slice_path": "slices/turn_finalizer__post_llm_call.py", "slice_sha256": "sha256:9d57a6cc97f5659db62702e7f208dccb630102b057d229a422bcb08d5f69c016"},
+        {"line_end": 667, "line_start": 641, "name": "result_build", "slice_path": "slices/turn_finalizer__result_build.py", "slice_sha256": "sha256:b1f8d8b32f240ef495331ff9c1ad8f5b151c47a3e0c074da77dfc354c83ed64a"},
+        {"line_end": 756, "line_start": 733, "name": "on_session_end", "slice_path": "slices/turn_finalizer__on_session_end.py", "slice_sha256": "sha256:d171b1838cda41a52ac6d55ff776bde3c93a1b561ba3723b41445a2a9412d011"}
+      ],
+      "relative_path": "agent/turn_finalizer.py",
+      "sha256": "sha256:8ac4e0f6529e0142fc2c53cef9089ac99107063d79968197cabc368dd11f4115",
+      "target": "turn_finalizer"
+    },
+    {
+      "anchors": [
+        {"line_end": 1093, "line_start": 1045, "name": "post_tool_call", "slice_path": "slices/tool_hooks__post_tool_call.py", "slice_sha256": "sha256:8e681d0566ed5791eda59465b21a2e9f114a4616e59536f2d4c1f5614849e585"},
+        {"line_end": 1290, "line_start": 1250, "name": "pre_tool_call", "slice_path": "slices/tool_hooks__pre_tool_call.py", "slice_sha256": "sha256:a9d19b941f85274b0536049b227d943e08b2f16a9a7342b23317b07deb2e8729"},
+        {"line_end": 1390, "line_start": 1315, "name": "approval_context_and_dispatch", "slice_path": "slices/tool_hooks__approval_context_and_dispatch.py", "slice_sha256": "sha256:c010a20e4e4b53dce63ad18f5e294d3dec443f173bdb3b623c28dd0d6e14b144"}
+      ],
+      "relative_path": "model_tools.py",
+      "sha256": "sha256:17b0c5d8da096227754d5dd6a83cbe188ae862e8a8ff16bc9ce4f311e68e5a90",
+      "target": "tool_hooks"
+    },
+    {
+      "anchors": [
+        {"line_end": 52, "line_start": 41, "name": "approval_contextvars", "slice_path": "slices/approval__approval_contextvars.py", "slice_sha256": "sha256:937a99a5b8ae0fcabc73c3afcd3716df372c05f11634805d878d4e8784808bc4"},
+        {"line_end": 120, "line_start": 96, "name": "approval_hook_dispatch", "slice_path": "slices/approval__approval_hook_dispatch.py", "slice_sha256": "sha256:f1d3bf9b9257de9423cf76bb29980b47b82ca83a400e24ff39ad9664643ea083"},
+        {"line_end": 199, "line_start": 177, "name": "approval_context_bind", "slice_path": "slices/approval__approval_context_bind.py", "slice_sha256": "sha256:748456dac37bfdb0b0232756b4847c49dbf1ef1219c504e6a6b418f505a817f1"},
+        {"line_end": 3529, "line_start": 3417, "name": "approval_fifo_wait", "slice_path": "slices/approval__approval_fifo_wait.py", "slice_sha256": "sha256:adae0d3edd4c432807982e049969adf7bff1337157b5d9abe0470de164f79fcc"}
+      ],
+      "relative_path": "tools/approval.py",
+      "sha256": "sha256:651b2ad8041aad4c862ff793937646c3541de9786b8fbabc8301665ef7c3cfbc",
+      "target": "approval"
+    },
+    {
+      "anchors": [
+        {"line_end": 1611, "line_start": 1553, "name": "subagent_start", "slice_path": "slices/subagent__subagent_start.py", "slice_sha256": "sha256:285e300322f19806b3aa0bd61b9a078f694851f483396558fba1067146992b81"},
+        {"line_end": 2713, "line_start": 2679, "name": "subagent_stop", "slice_path": "slices/subagent__subagent_stop.py", "slice_sha256": "sha256:811d742f1bca614f87f485d5f97ea65045891829b7caace457f4827b241fcb5d"}
+      ],
+      "relative_path": "tools/delegate_tool.py",
+      "sha256": "sha256:c8b028d4199064ceb3d5aeead076afd81006d1cf3faa88e8395ba539073929d4",
+      "target": "subagent"
+    },
+    {
+      "anchors": [{"line_end": 14335, "line_start": 14238, "name": "preauth_gateway_hook", "slice_path": "slices/gateway__preauth_gateway_hook.py", "slice_sha256": "sha256:5a042567b58e48ca064abe55d38b0582d8c2a14bd05c872993bfa6d058007822"}],
+      "relative_path": "gateway/run.py",
+      "sha256": "sha256:0b749a90ff5740b5c8ce9d138f869aca19295f4c458e3b680e9be9fd7b0fb2ec",
+      "target": "gateway"
+    },
+    {
+      "anchors": [{"line_end": 2104, "line_start": 1461, "name": "cron_delivery", "slice_path": "slices/cron__cron_delivery.py", "slice_sha256": "sha256:627c7054c5ba13102c020a86f783e1dde77ed5c608ff6a9ffcc9b41e9460358a"}],
+      "relative_path": "cron/scheduler.py",
+      "sha256": "sha256:aba4c2b9c8691ccc86518cfa10dcd92e55d7b2103c1c6807f54ddf58919f3f48",
+      "target": "cron"
+    },
+    {
+      "anchors": [{"line_end": 5131, "line_start": 5042, "name": "native_send_retry", "slice_path": "slices/base__native_send_retry.py", "slice_sha256": "sha256:eb0e3950cdab0c973a34854e106fd70f940ac159b5d0e6e03eb8904b9424ccd6"}],
+      "relative_path": "gateway/platforms/base.py",
+      "sha256": "sha256:67262c97333b9e8274d269229ae6d0adecee104eaf5729208d0ea9b0ae8b814c",
+      "target": "base"
+    }
+  ]
+}

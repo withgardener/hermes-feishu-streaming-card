@@ -1,0 +1,146 @@
+name: release-assets
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_ref:
+        description: "Full annotated release tag ref, for example refs/tags/v4.2.8"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+
+    steps:
+      - name: Checkout resolver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve and verify annotated tag
+        id: resolve
+        shell: bash
+        env:
+          DISPATCH_TAG_REF: ${{ inputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          tag_ref="$GITHUB_REF"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag_ref="$DISPATCH_TAG_REF"
+          fi
+          [[ "$tag_ref" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "release gate failed: invalid_tag_ref" >&2
+            exit 2
+          }
+          tag="${tag_ref#refs/tags/}"
+          git fetch --force origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+$tag_ref:$tag_ref"
+          [ "$(git cat-file -t "$tag_ref")" = "tag" ] || {
+            echo "release gate failed: tag_not_annotated" >&2
+            exit 2
+          }
+          commit="$(git rev-parse "$tag_ref^{commit}")"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "release gate failed: expected_commit_invalid" >&2
+            exit 2
+          }
+          git checkout --detach "$commit"
+          python scripts/verify_release.py \
+            --tag "$tag" \
+            --expected-commit "$commit" \
+            --require-main-ancestor
+          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
+
+  release-gate:
+    needs: resolve-release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+    with:
+      checkout_ref: ${{ needs.resolve-release.outputs.commit }}
+
+  package:
+    needs: [resolve-release, release-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout tested release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Reverify immutable release input
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git checkout --detach "$RELEASE_COMMIT"
+          python scripts/verify_release.py \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$RELEASE_COMMIT" \
+            --require-main-ancestor
+
+      - name: Build install packages
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python scripts/release_archives.py build --tag "$RELEASE_TAG" --output dist
+
+      - name: Reverify tag immediately before upload
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          python scripts/verify_release.py \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$RELEASE_COMMIT" \
+            --require-main-ancestor
+
+      - name: Validate actual assets immediately before upload
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: python scripts/release_archives.py validate --tag "$RELEASE_TAG" --output dist
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "$RELEASE_TAG" --generate-notes --draft
+          fi

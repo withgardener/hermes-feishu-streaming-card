@@ -1,0 +1,12048 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+from collections import OrderedDict
+import copy
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from hashlib import sha256
+from ipaddress import ip_address
+import importlib
+import inspect
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import queue
+import re
+import secrets
+import sys
+from types import CodeType, SimpleNamespace
+import threading
+import time
+from typing import Any, Callable, Optional
+import weakref
+from urllib import error as urlerror
+from urllib import parse
+from urllib import request
+
+from . import __version__
+from . import completion_diagnostics as _completion_diagnostics
+from .card_limits import serialize_card_for_delivery
+from .canonical_turn import (
+    publish_canonical_turn_id,
+    clear_canonical_turn_id,
+    consume_canonical_turn_id,
+    canonical_turn_context_limit,
+    _canonical_turn_registry_size,
+    reset_canonical_turn_for_tests,
+)
+from .command_cards import (
+    model_picker_options as _model_picker_options,
+    model_picker_provider_tree as _model_picker_provider_tree,
+    model_picker_provider as _model_picker_provider,
+    hfc_native_model_picker_card as _hfc_native_model_picker_card,
+    resume_picker_options as _resume_picker_options,
+    parse_model_picker_choice as _parse_model_picker_choice,
+    hfc_slash_confirm_detail as _hfc_slash_confirm_detail,
+    hfc_button as _hfc_button,
+    hfc_select_static as _hfc_select_static,
+    hfc_command_result_card as _hfc_command_result_card,
+    hfc_command_result_title as _hfc_command_result_title,
+    hfc_command_result_template as _hfc_command_result_template,
+)
+from .events import completion_turn_outcome
+from .event_auth import (
+    sign_event_request,
+    sign_native_handoff_ack_request,
+    sign_native_handoff_recovery_request,
+    sign_policy_request,
+    sign_sidecar_request,
+)
+from .operations import sign_transport_proof
+from .operations_transport import (
+    derive_operation_transport_secret,
+    read_transport_root_secret,
+    sign_command_transport_proof,
+)
+from .native_handoff import (
+    derive_native_handoff_content_hash,
+    derive_native_handoff_target_hash,
+    derive_native_handoff_uuid_seed,
+    is_exact_native_text_scope,
+)
+from .native_commands import (
+    NATIVE_RESULT_COMMANDS,
+    build_command_center_card,
+    build_native_result_card,
+    collect_hermes_command_catalog,
+    command_is_safe_quick_action,
+)
+from .profile_sources import (
+    TRUSTED_PROFILE_SOURCES,
+    legacy_profile_identity,
+    legacy_safe_profile_id,
+    profile_from_hermes_home_path,
+    validate_trusted_profile_identity,
+)
+from .status import normalize_display_status
+from .transient_notices import (
+    BUSY_REDIRECT_ACK_PREFIX,
+    BUSY_REDIRECT_ACK_RECALL_SECONDS,
+    BUSY_INTERRUPT_ACK_PREFIX,
+    BUSY_INTERRUPT_ACK_RECALL_SECONDS,
+    BUSY_STEER_ACK_PREFIX,
+    BUSY_STEER_ACK_RECALL_SECONDS,
+    STATUS_NOTICE_PREFIX,
+    STATUS_NOTICE_RECALL_SECONDS,
+    is_transient_busy_ack,
+    transient_notice_recall_seconds,
+)
+from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
+DEFAULT_TIMEOUT_SECONDS = 0.8
+INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
+TERMINAL_TIMEOUT_SECONDS = 10.0
+# A terminal event is the last thing that will ever update a card, and the sidecar's session table
+# is memory-only, so a terminal event that never lands leaves that card wrong forever. Measured
+# live (issue 320): a gateway restart auto-resumed the session it interrupted, and that turn's
+# `message.completed` was POSTed while the sidecar was 28s into a stop/start window — the send
+# failed, the exception was swallowed, and the card stayed on "执行中" with no way to repair it.
+# Retry only while the failure means "the sidecar never ruled on this request", and keep a total
+# budget because this await sits inline in the gateway's turn path.
+#
+# The window has to outlast a real sidecar restart, not the 28s that one incident happened to hit:
+# a stop/start cycle measures 34-42s end to end (the `start` half alone spends ~30s on integrity
+# checks before /health reports ready), and a gateway restart may take the sidecar down with it.
+# 68s of backoff under a 75s budget covers that with margin; the cost is only paid on a delivery
+# that would otherwise strand the card.
+TERMINAL_DELIVERY_RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+TERMINAL_DELIVERY_RETRY_BUDGET_SECONDS = 75.0
+NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v2"
+NATIVE_HANDOFF_MAX_LIFETIME_SECONDS = 3600.0
+NATIVE_HANDOFF_PLAN_PROTOCOL = "hfc-feishu-delivery-plan-v1"
+_NOTICE_UNCERTAIN_WARNING = (
+    "⚠️ 一条运行提示的卡片投递结果无法确认，请稍后查看 /hfc status。"
+)
+OPERATIONS_ACTION_TIMEOUT_SECONDS = 10.0
+OPERATIONS_ACTION_FORWARD_ATTEMPTS = 2
+OPERATIONS_ACTION_RETRY_DELAY_SECONDS = 0.1
+# Feishu requires callback acknowledgement within three seconds.
+INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS = 2.0
+INTERACTION_ACTION_FORWARD_ATTEMPTS = 3
+INTERACTION_ACTION_RETRY_DELAY_SECONDS = 0.1
+OPERATIONS_ACTION_WORKERS = 4
+OPERATIONS_ACTION_QUEUE_LIMIT = 64
+COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS = 600.0
+POLICY_QUERY_TIMEOUT_SECONDS = 0.25
+POLICY_CACHE_TTL_SECONDS = 1.0
+POLICY_CACHE_LIMIT = 1024
+_FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
+_CONTEXT_COMPACTION_STATUS_RE = re.compile(
+    r"\bCompacting\s+context\b",
+    re.IGNORECASE,
+)
+MEDIA_RE = re.compile(r"MEDIA:([^\s\]]+)")
+LOCAL_FILE_RE = re.compile(
+    r"(?<![:\w/])(/[^\s`]+\.(?:png|jpg|jpeg|webp|gif|pdf|txt|md|csv|xlsx|docx|mp3|wav|ogg|mp4|mov|webm))"
+)
+BACKGROUND_PROCESS_FINISHED_RE = re.compile(
+    r"\A\[Background process "
+    r"(?P<process_id>proc_[0-9a-f]{12}) "
+    r"finished with exit code (?P<exit_code>-?\d+|None)~ "
+    r"Here's the final output:\n[\s\S]*\]\Z"
+)
+BACKGROUND_PROCESS_RUNNING_RE = re.compile(
+    r"\A\[Background process "
+    r"(?P<process_id>proc_[0-9a-f]{12}) "
+    r"is still running~ New output:\n[\s\S]*\]\Z"
+)
+BACKGROUND_TASK_COMPLETED_RE = re.compile(
+    r"\A✅ Background task complete\n"
+    r'Prompt: "(?:[\s\S]{60}\.\.\.|[\s\S]{0,60})"\n\n'
+    r"[\s\S]*\Z"
+)
+BACKGROUND_TASK_STARTED_RE = re.compile(
+    r'\A🔄 Background task started: "[\s\S]*"\n'
+    r"Task ID: (?P<task_id>bg_\d{6}_[0-9a-f]{6})\n"
+    r"You can keep chatting — results will appear when done\.\Z"
+)
+BACKGROUND_TASK_FAILED_RE = re.compile(
+    r"\A❌ Background task "
+    r"(?P<task_id>bg_\d{6}_[0-9a-f]{6}) "
+    r"failed:(?:[ \t\r\n][\s\S]*)?\Z"
+)
+ATTACHMENT_TRAILING_PUNCTUATION = ",.;:)]}，。；：）】}"
+NATIVE_DELIVERY_MARKERS = ("[[as_document]]", "[[audio_as_voice]]")
+NATIVE_DELIVERY_ATTACHMENT_FIELDS = (
+    "files",
+    "file",
+    "media_files",
+    "media",
+    "images",
+    "image_files",
+    "audio_files",
+    "video_files",
+)
+NATIVE_DELIVERY_OUTPUT_ATTACHMENT_FIELDS = (
+    "media_files",
+    "media",
+    "image_files",
+    "audio_files",
+    "video_files",
+)
+
+SUPPORTED_RUNTIME_EVENTS = {
+    "message.started",
+    "thinking.delta",
+    "answer.delta",
+    "tool.updated",
+    "message.completed",
+    "message.failed",
+    "system.notice",
+    "interaction.requested",
+    "interaction.completed",
+    "interaction.failed",
+}
+
+_CANONICAL_TURN_ATTR = "_hfc_turn_id"
+_THIN_INTERACTION_KINDS = frozenset({"approval", "clarify", "slash"})
+_THIN_CONTEXT_COMPACTION_MESSAGES = frozenset(
+    {
+        "Compacting context",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    }
+)
+_THIN_STATUS_MESSAGE_MAX_BYTES = 1024
+_LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, repr=False)
+class HybridTerminalRecord:
+    """Detached one-shot terminal evidence; it carries no suppress decision."""
+
+    terminal_kind: str
+    payload: dict[str, Any]
+    response: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    enabled: bool
+    event_url: str
+    timeout_seconds: float
+    delta_coalesce_ms: int
+    delta_coalesce_chars: int
+    delta_coalesce_max_pending: int
+
+
+@dataclass
+class _PendingDelta:
+    event_name: str
+    event_url: str
+    timeout_seconds: float
+    loop: Any
+    base_locals: dict[str, Any]
+    text_parts: list[str]
+    char_count: int = 0
+    scheduled: bool = False
+
+
+@dataclass(frozen=True)
+class _NativeMediaTextSuppression:
+    chat_id: str
+    content: str
+
+
+@dataclass(frozen=True)
+class _PolicyIdentity:
+    endpoint: str
+    profile_id: str
+    chat_id: str
+    conversation_id: str
+    message_id: str
+    turn_id: str
+    scope_key: tuple[str, str, str, str]
+    turn_key: tuple[str, str, str, str]
+    is_new_turn: bool
+    home_binding: tuple[Path, Path] | None
+
+
+@dataclass(frozen=True)
+class _PolicyGateResult:
+    card: bool
+    identity: _PolicyIdentity | None
+
+
+@dataclass(frozen=True)
+class _PolicyCacheEntry:
+    disposition: str
+    expires_at: float
+    home_binding: tuple[Path, Path] | None = None
+
+
+@dataclass(frozen=True)
+class _PinnedPolicyDecision:
+    disposition: str
+    home_binding: tuple[Path, Path] | None
+
+
+_SEQUENCES: dict[str, int] = {}
+_SEQUENCE_LOCK = threading.Lock()
+_ACTIVE_FALLBACK_MESSAGE_IDS: dict[tuple[str, str, str | None], str] = {}
+_CURRENT_FALLBACK_KEYS: dict[tuple[str, str], tuple[str, str, str | None]] = {}
+_FALLBACK_LIFECYCLE_COUNTS: dict[tuple[str, str], int] = {}
+_AMBIGUOUS_TERMINAL = object()
+_SEND_LOCKS: dict[tuple[int, str, str], asyncio.Lock] = {}
+_SEND_LOCKS_GUARD = threading.Lock()
+_POST_FAILED = object()
+_PENDING_DELTAS: dict[tuple[int, str, str, str, str], _PendingDelta] = {}
+_PENDING_DELTAS_LOCK = threading.Lock()
+_POLICY_LOCK = threading.RLock()
+_POLICY_CACHE: OrderedDict[tuple[str, str, str], _PolicyCacheEntry] = OrderedDict()
+_TURN_POLICY_DECISIONS: OrderedDict[
+    tuple[str, str, str, str], _PinnedPolicyDecision
+] = OrderedDict()
+_ACTIVE_POLICY_TURNS: dict[
+    tuple[str, str, str, str], tuple[str, str, str, str]
+] = {}
+_TERMINAL_POLICY_DECISIONS: OrderedDict[
+    tuple[str, str, str, str], _PolicyCacheEntry
+] = OrderedDict()
+_POLICY_QUERY_LOCKS: OrderedDict[
+    tuple[str, str, str, str], threading.Lock
+] = OrderedDict()
+_POLICY_ASYNC_QUERY_LOCKS: OrderedDict[
+    tuple[int, str, str, str, str], asyncio.Lock
+] = OrderedDict()
+_POLICY_ASYNC_EVENT_LOCKS: OrderedDict[
+    tuple[int, str, str, str, str], asyncio.Lock
+] = OrderedDict()
+_HFC_FEISHU_COMMAND_RESULT_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_feishu_command_result_context",
+    default=None,
+)
+_HFC_FEISHU_NOTICE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar(
+    "hfc_feishu_notice_context",
+    default=None,
+)
+_HFC_FEISHU_DELIVERY_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_feishu_delivery_context",
+    default=None,
+)
+_HFC_NATIVE_MEDIA_TEXT_SUPPRESSION: ContextVar[
+    _NativeMediaTextSuppression | None
+] = ContextVar(
+    "hfc_native_media_text_suppression",
+    default=None,
+)
+_HFC_NATIVE_HANDOFF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_native_handoff_context",
+    default=None,
+)
+_HFC_EXACT_COMPLETION_STAGE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_exact_completion_stage",
+    default=None,
+)
+_HFC_NATIVE_HANDOFF_SEND_TRACKER: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_native_handoff_send_tracker",
+    default=None,
+)
+_HFC_NATIVE_HANDOFF_CHUNK: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_native_handoff_chunk",
+    default=None,
+)
+_HFC_NATIVE_HANDOFF_ROUTE: ContextVar[str | None] = ContextVar(
+    "hfc_native_handoff_route",
+    default=None,
+)
+_NATIVE_HANDOFF_ACK_TASKS: set[asyncio.Task[Any]] = set()
+_NATIVE_HANDOFF_PLAN_FINGERPRINTS: dict[tuple[type, int, str, str], str] = {}
+_OPERATION_TRANSPORT_SECRETS: dict[str, tuple[bytes, str, float]] = {}
+_OPERATION_TRANSPORT_SECRETS_LOCK = threading.Lock()
+_OPERATION_TRANSPORT_SECRET_TTL_SECONDS = 600.0
+_OPERATION_TRANSPORT_SECRET_LIMIT = 256
+_GATEWAY_RUNNER_LOCK = threading.Lock()
+_GATEWAY_RUNNER_REF: weakref.ReferenceType[Any] | None = None
+
+
+class _OperationsActionDispatcher:
+    def __init__(self, *, workers: int, max_pending: int):
+        self._workers = workers
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue(
+            maxsize=max_pending
+        )
+        self._start_lock = threading.Lock()
+        self._started = False
+
+    def submit(self, task: Callable[[], None]) -> bool:
+        self._ensure_started()
+        try:
+            self._queue.put_nowait(task)
+        except queue.Full:
+            return False
+        return True
+
+    def wait(self) -> None:
+        self._queue.join()
+
+    def _ensure_started(self) -> None:
+        if self._started:
+            return
+        with self._start_lock:
+            if self._started:
+                return
+            for index in range(self._workers):
+                threading.Thread(
+                    target=self._run,
+                    name=f"hfc-operations-action-{index + 1}",
+                    daemon=True,
+                ).start()
+            self._started = True
+
+    def _run(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                task()
+            except Exception as exc:
+                _hfc_warn(
+                    "operations.select background worker failed: "
+                    f"{exc.__class__.__name__}"
+                )
+            finally:
+                self._queue.task_done()
+
+
+_OPERATIONS_ACTION_DISPATCHER = _OperationsActionDispatcher(
+    workers=OPERATIONS_ACTION_WORKERS,
+    max_pending=OPERATIONS_ACTION_QUEUE_LIMIT,
+)
+
+
+def reset_runtime_state() -> None:
+    global _GATEWAY_RUNNER_REF
+    with _SEQUENCE_LOCK:
+        _SEQUENCES.clear()
+    _ACTIVE_FALLBACK_MESSAGE_IDS.clear()
+    _CURRENT_FALLBACK_KEYS.clear()
+    _FALLBACK_LIFECYCLE_COUNTS.clear()
+    with _SEND_LOCKS_GUARD:
+        _SEND_LOCKS.clear()
+    with _PENDING_DELTAS_LOCK:
+        _PENDING_DELTAS.clear()
+    with _POLICY_LOCK:
+        _POLICY_CACHE.clear()
+        _TURN_POLICY_DECISIONS.clear()
+        _ACTIVE_POLICY_TURNS.clear()
+        _TERMINAL_POLICY_DECISIONS.clear()
+        _POLICY_QUERY_LOCKS.clear()
+        _POLICY_ASYNC_QUERY_LOCKS.clear()
+        _POLICY_ASYNC_EVENT_LOCKS.clear()
+    _completion_diagnostics.reset()
+    with _OPERATION_TRANSPORT_SECRETS_LOCK:
+        _OPERATION_TRANSPORT_SECRETS.clear()
+    _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
+    _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+    _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+    _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    _HFC_EXACT_COMPLETION_STAGE.set(None)
+    _HFC_NATIVE_HANDOFF_SEND_TRACKER.set(None)
+    _HFC_NATIVE_HANDOFF_CHUNK.set(None)
+    _HFC_NATIVE_HANDOFF_ROUTE.set(None)
+    reset_canonical_turn_for_tests()
+    for task in list(_NATIVE_HANDOFF_ACK_TASKS):
+        task.cancel()
+    _NATIVE_HANDOFF_ACK_TASKS.clear()
+    _NATIVE_HANDOFF_PLAN_FINGERPRINTS.clear()
+    with _GATEWAY_RUNNER_LOCK:
+        _GATEWAY_RUNNER_REF = None
+    reset_runtime_control_for_tests()
+
+
+def _plugin_runtime() -> Any | None:
+    """Use only the production runtime's explicit process-level getter."""
+    try:
+        from . import hermes_plugin_runtime
+
+        getter = getattr(hermes_plugin_runtime, "active_plugin_runtime", None)
+        if not callable(getter):
+            return None
+        return getter()
+    except Exception:
+        return None
+
+
+def _thin_bridge_turn(local_vars: object) -> str | None:
+    if type(local_vars) is not dict:
+        return None
+    if not all(type(key) is str for key in local_vars):
+        return None
+    if local_vars.get("_hfc_authorized") is not True:
+        return None
+    platform = local_vars.get("platform")
+    if type(platform) is not str or platform != "feishu":
+        return None
+    return consume_canonical_turn_id(local_vars.get("turn_id"))
+
+
+def _exact_nonblank_string(value: object) -> bool:
+    return type(value) is str and bool(value.strip())
+
+
+def bind_ingress_from_hermes_locals(local_vars: object) -> bool:
+    """Delegate authenticated ingress values without producing lifecycle events."""
+    try:
+        if type(local_vars) is not dict:
+            return False
+        if not all(type(key) is str for key in local_vars):
+            return False
+        if local_vars.get("_hfc_authorized") is not True:
+            return False
+        platform = local_vars.get("platform")
+        if type(platform) is not str or platform != "feishu":
+            return False
+        explicit_turn_id = local_vars.get("turn_id")
+        if explicit_turn_id is not None and consume_canonical_turn_id(
+            explicit_turn_id
+        ) is None:
+            return False
+        names = (
+            "profile_id",
+            "profile_source",
+            "session_id",
+            "gateway_session_key",
+            "generation",
+            "chat_id",
+            "incoming_message_id",
+            "reply_to_message_id",
+        )
+        values = tuple(local_vars.get(name) for name in names)
+        if not all(_exact_nonblank_string(value) for value in values):
+            return False
+        if values[1] not in TRUSTED_PROFILE_SOURCES:
+            return False
+        profile_identity = validate_trusted_profile_identity(
+            values[0],
+            values[1],
+            hermes_home_membership_verified=local_vars.get(
+                "hermes_home_membership_verified", False
+            ),
+        )
+        if profile_identity != values[:2]:
+            return False
+        thread_id = local_vars.get("thread_id", "")
+        if type(thread_id) is not str:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "bind_ingress_from_values", None)
+        if not callable(method):
+            return False
+        return method(*values, thread_id) is True
+    except Exception:
+        return False
+
+
+class _HybridProgressOwnership:
+    """Bounded presentation receipt owned by a single Hermes TurnContext."""
+
+    def __init__(self, owner: object, runtime: object, route: tuple[object, ...]):
+        self.owner = owner
+        self.runtime = runtime
+        self.route = route
+
+
+def suppress_hybrid_native_progress(local_vars: object, *, owner: object = None) -> bool:
+    """Read current card ownership; unknown routing always keeps native delivery."""
+    try:
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return False
+        assert type(local_vars) is dict
+        values = tuple(local_vars.get(name) for name in (
+            "gateway_session_key", "generation", "chat_id", "profile_id",
+        ))
+        thread_id = local_vars.get("thread_id")
+        if not all(_exact_nonblank_string(value) for value in values):
+            return False
+        if type(thread_id) is not str:
+            return False
+        runtime = _plugin_runtime()
+        if runtime is None or runtime.progress_owner_live() is not True:
+            return False
+        route = (turn_id, *values, thread_id)
+        previous = getattr(owner, "_hfc_progress_ownership", None)
+        if (type(previous) is _HybridProgressOwnership and previous.owner is owner
+                and previous.runtime is runtime and previous.route == route):
+            return True
+        method = getattr(runtime, "owns_native_progress", None)
+        accepted = callable(method) and method(*route) is True
+        if accepted and owner is not None:
+            owner._hfc_progress_ownership = _HybridProgressOwnership(owner, runtime, route)
+        return accepted
+    except Exception:
+        return False
+
+
+def emit_delta_from_hermes_locals_threadsafe(
+    local_vars: object,
+    event_name: object,
+) -> bool:
+    """Delegate one exact Hybrid delta; never enter the Legacy emitter path."""
+    try:
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None or type(event_name) is not str:
+            return False
+        if event_name not in {"thinking.delta", "answer.delta"}:
+            return False
+        assert type(local_vars) is dict
+        text = local_vars.get("text")
+        if type(text) is not str or not text:
+            return False
+        mode = "append_block" if event_name == "thinking.delta" else "delta"
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "submit_patch_delta", None)
+        if not callable(method):
+            return False
+        return method(turn_id, event_name, text, mode) is True
+    except Exception:
+        return False
+
+
+def submit_status_notice_from_hermes_locals(
+    local_vars: object,
+    *,
+    event_type: object,
+    message: object,
+) -> bool:
+    """Classify one fixed Hermes status and submit only sanitized tags."""
+    try:
+        if (
+            type(event_type) is not str
+            or event_type != "context"
+            or type(message) is not str
+            or len(message) > _THIN_STATUS_MESSAGE_MAX_BYTES
+            or len(message.encode("utf-8")) > _THIN_STATUS_MESSAGE_MAX_BYTES
+            or message not in _THIN_CONTEXT_COMPACTION_MESSAGES
+        ):
+            return False
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "submit_patch_status_notice", None)
+        if not callable(method):
+            return False
+        return method(
+            turn_id,
+            notice_kind="context-compaction",
+            notice_id="context-compaction:active",
+        ) is True
+    except Exception:
+        return False
+
+
+def _thin_interaction_values(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+) -> tuple[str, str, str, str, str, object] | None:
+    turn_id = _thin_bridge_turn(local_vars)
+    if turn_id is None or type(kind) is not str or kind not in _THIN_INTERACTION_KINDS:
+        return None
+    if type(interaction_data) is not dict or set(interaction_data) != {
+        "session_identity",
+        "interaction_id",
+        "fingerprint",
+    }:
+        return None
+    if not all(type(key) is str for key in interaction_data):
+        return None
+    session_identity = interaction_data.get("session_identity")
+    interaction_id = interaction_data.get("interaction_id")
+    fingerprint = interaction_data.get("fingerprint")
+    if not all(
+        _exact_nonblank_string(value)
+        for value in (session_identity, interaction_id, fingerprint)
+    ):
+        return None
+    if _LOWER_SHA256_RE.fullmatch(fingerprint) is None or pending_handle is None:
+        return None
+    return (
+        kind,
+        session_identity,
+        turn_id,
+        interaction_id,
+        fingerprint,
+        pending_handle,
+    )
+
+
+def _delegate_pending_interaction(
+    operation: str,
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    selected_value: object = None,
+) -> bool:
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if values is None:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, f"{operation}_patch_interaction", None)
+        if not callable(method):
+            return False
+        if operation == "resolve":
+            if not _exact_nonblank_string(selected_value):
+                return False
+            return method(*values, selected_value) is True
+        return method(*values) is True
+    except Exception:
+        return False
+
+
+def register_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+) -> bool:
+    return _delegate_pending_interaction(
+        "register", local_vars, kind, interaction_data, pending_handle
+    )
+
+
+def resolve_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    selected_value: object,
+) -> bool:
+    return _delegate_pending_interaction(
+        "resolve",
+        local_vars,
+        kind,
+        interaction_data,
+        pending_handle,
+        selected_value,
+    )
+
+
+def wait_for_owned_clarify(
+    local_vars, interaction_data, pending_handle, waiter, timeout,
+):
+    """Observe original wait facts without changing its return or exceptions."""
+    observer = None
+    runtime = None
+    values = None
+    correlation = None
+    tool_observation = None
+    try:
+        values = _thin_interaction_values(
+            local_vars, "clarify", interaction_data, pending_handle,
+        )
+        from tools import approval
+        if values is not None and approval._approval_session_key.get() == values[1]:
+            runtime = _plugin_runtime()
+            correlation = (
+                approval._approval_session_key.get(), approval._approval_turn_id.get(),
+                approval._approval_tool_call_id.get(),
+            )
+            call = correlation[2]
+            if correlation[1:] == ("", ""):
+                # Hermes' specialized clarify executor bypasses the generic
+                # dispatcher's approval ContextVars. Require its exact official
+                # pre-tool observation on this execution thread and handle.
+                tool_observation = runtime.clarify_tool_call_for_wait(*values[1:])
+                call = None if tool_observation is None else tool_observation.tool_call_id
+            elif correlation[1] != values[2]:
+                call = None
+            if call:
+                observer = runtime.clarify_timeout_observer(*values[1:], call, timeout)
+    except Exception:
+        observer = None
+    # Deliberately outside the observer guard: owned wait failures propagate.
+    response = waiter(interaction_data["interaction_id"], timeout=float(timeout))
+    try:
+        if (observer is not None and _plugin_runtime() is runtime
+                and correlation == (
+                    approval._approval_session_key.get(), approval._approval_turn_id.get(),
+                    approval._approval_tool_call_id.get(),
+                )
+                and _thin_interaction_values(
+                    local_vars, "clarify", interaction_data, pending_handle,
+                ) == values
+                and (tool_observation is None or runtime.clarify_tool_call_is_current(
+                    values[1], values[2], tool_observation,
+                ))):
+            observer(response)
+    except Exception:
+        pass
+    return response
+
+
+def admit_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    resolver: object,
+    ui_data: object,
+) -> bool:
+    """Attempt one synchronous HFC UI admission for an existing Hermes handle."""
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if (
+            values is None
+            or not callable(resolver)
+            or type(ui_data) is not dict
+            or not all(type(key) is str for key in ui_data)
+            or set(ui_data)
+            != {
+                "prompt",
+                "description",
+                "allow_custom_input",
+                "multi_select",
+                "timeout_seconds",
+                "options",
+            }
+            or type(ui_data.get("prompt")) is not str
+            or type(ui_data.get("description")) is not str
+            or type(ui_data.get("allow_custom_input")) is not bool
+            or type(ui_data.get("multi_select")) is not bool
+            or type(ui_data.get("timeout_seconds")) not in (int, float)
+            or type(ui_data.get("options")) is not list
+            or not _is_ordinary_json_value(ui_data)
+        ):
+            return False
+        runtime = _plugin_runtime()
+        register = getattr(runtime, "register_patch_interaction", None)
+        method = getattr(runtime, "admit_patch_interaction", None)
+        if not callable(register) or not callable(method):
+            return False
+        if register(*values) is not True:
+            return False
+        return method(
+            *values,
+            resolver,
+            copy.deepcopy(ui_data),
+        ) is True
+    except Exception:
+        return False
+
+
+def claim_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+) -> str | None:
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if values is None:
+            return None
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "claim_patch_interaction", None)
+        if not callable(method):
+            return None
+        selected_value = method(*values)
+        if (
+            type(selected_value) is not str
+            or not selected_value
+            or len(selected_value) > 4096
+            or not selected_value.strip()
+            or len(selected_value.encode("utf-8")) > 4096
+        ):
+            return None
+        return selected_value
+    except Exception:
+        return None
+
+
+def _is_ordinary_json_value(value: object) -> bool:
+    if value is None or type(value) in (str, int, bool):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_is_ordinary_json_value(item) for item in value)
+    if type(value) is dict:
+        return all(
+            type(key) is str and _is_ordinary_json_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def consume_terminal_record_from_hermes_locals(
+    local_vars: object,
+) -> HybridTerminalRecord | None:
+    """Consume detached PluginRuntime evidence without deciding native suppression."""
+    try:
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return None
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "take_terminal_record", None)
+        if not callable(method):
+            return None
+        record = method(turn_id)
+        if (
+            type(record) is not dict
+            or not all(type(key) is str for key in record)
+            or set(record) != {"payload", "response"}
+        ):
+            return None
+        payload = record.get("payload")
+        response = record.get("response")
+        if type(payload) is not dict or not _is_ordinary_json_value(payload):
+            return None
+        if response is not None and (
+            type(response) is not dict or not _is_ordinary_json_value(response)
+        ):
+            return None
+        event = payload.get("event")
+        if type(event) is not str or event not in {
+            "message.completed",
+            "message.failed",
+        }:
+            return None
+        payload_turn_id = payload.get("turn_id")
+        if type(payload_turn_id) is not str or payload_turn_id != turn_id:
+            return None
+        return HybridTerminalRecord(
+            terminal_kind=(
+                "completed" if event == "message.completed" else "failed"
+            ),
+            payload=copy.deepcopy(payload),
+            response=copy.deepcopy(response),
+        )
+    except Exception:
+        return None
+
+
+def apply_hybrid_terminal_record(record: object) -> str | None:
+    """Turn detached terminal evidence into one exact delivery decision."""
+    try:
+        if type(record) is not HybridTerminalRecord:
+            return None
+        if record.terminal_kind != "completed":
+            return None
+        if type(record.payload) is not dict or not _is_ordinary_json_value(
+            record.payload
+        ):
+            return None
+        response = record.response
+        if (
+            type(response) is not dict
+            or not all(type(key) is str for key in response)
+        ):
+            return None
+        keys = set(response)
+        if keys == {"ok", "applied"}:
+            return (
+                "card"
+                if response.get("ok") is True
+                and response.get("applied") is True
+                else None
+            )
+        if keys not in (
+            {"ok", "applied", "disposition"},
+            {"ok", "applied", "disposition", "native_handoff"},
+        ):
+            return None
+        if (
+            response.get("ok") is not True
+            or response.get("applied") is not False
+            or type(response.get("disposition")) is not str
+            or response.get("disposition") != "native"
+        ):
+            return None
+        if "native_handoff" in response and not _register_native_handoff_descriptor(
+            record.payload,
+            response,
+        ):
+            return None
+        return "native"
+    except Exception:
+        return None
+
+
+def _ensure_runtime_control_started(config: RuntimeConfig | None = None) -> bool:
+    try:
+        resolved = config or load_runtime_config()
+        if not resolved.enabled:
+            return False
+        return start_runtime_control(
+            event_url=resolved.event_url,
+            package_version=__version__,
+            active_work_snapshot_provider=gateway_active_work_snapshot,
+            admission_draining_provider=gateway_external_drain_active,
+            drain_home_verified_provider=gateway_drain_home_verified,
+        )
+    except Exception:
+        return False
+
+
+def _remember_gateway_runner(runner: Any) -> None:
+    global _GATEWAY_RUNNER_REF
+    if runner is None:
+        return
+    try:
+        reference = weakref.ref(runner)
+    except TypeError:
+        return
+    with _GATEWAY_RUNNER_LOCK:
+        _GATEWAY_RUNNER_REF = reference
+
+
+def gateway_active_work_snapshot() -> tuple[int, bool]:
+    with _GATEWAY_RUNNER_LOCK:
+        reference = _GATEWAY_RUNNER_REF
+    runner = reference() if reference is not None else None
+    if runner is None:
+        return 0, False
+    aggregate = getattr(runner, "_active_work_count", None)
+    if callable(aggregate):
+        try:
+            value = aggregate()
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value, True
+        except Exception:
+            pass
+    running_agents = getattr(runner, "_running_agents", {})
+    agent_count = len(running_agents) if isinstance(running_agents, dict) else 0
+    adapters: list[Any] = []
+    primary = getattr(runner, "adapters", {})
+    if isinstance(primary, dict):
+        adapters.extend(primary.values())
+    profile_maps = getattr(runner, "_profile_adapters", {})
+    if isinstance(profile_maps, dict):
+        for profile_map in profile_maps.values():
+            if isinstance(profile_map, dict):
+                adapters.extend(profile_map.values())
+    seen: set[int] = set()
+    adapter_count = 0
+    for adapter in adapters:
+        identity = id(adapter)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        active = getattr(adapter, "_active_sessions", {})
+        if isinstance(active, dict):
+            adapter_count += len(active)
+    return max(0, agent_count, adapter_count), False
+
+
+def gateway_active_session_count() -> int:
+    return gateway_active_work_snapshot()[0]
+
+
+def gateway_external_drain_active() -> bool:
+    with _GATEWAY_RUNNER_LOCK:
+        reference = _GATEWAY_RUNNER_REF
+    runner = reference() if reference is not None else None
+    return bool(runner is not None and getattr(runner, "_external_drain_active", False))
+
+
+def gateway_drain_home_verified() -> bool:
+    from .instance_binding import gateway_process_binding
+    # Sidecar admission additionally matches the authenticated source/HOME hash.
+    return gateway_process_binding() is not None
+
+
+async def maintenance_admission_from_hermes_locals(
+    local_vars: dict[str, Any],
+) -> bool:
+    runner = local_vars.get("self") if isinstance(local_vars, dict) else None
+    _remember_gateway_runner(runner)
+    try:
+        from .maintenance_store import (
+            MaintenanceRefused,
+            load_active_drain_lease,
+            maintenance_paths,
+        )
+
+        try:
+            lease = load_active_drain_lease(maintenance_paths())
+            blocked = lease is not None
+            message = "Hermes 正在维护升级中，请稍后再试。"
+        except MaintenanceRefused:
+            blocked = True
+            message = "Hermes 维护状态需要本机检查，暂不接入新任务。"
+        if not blocked:
+            return False
+        event = local_vars.get("event")
+        source = local_vars.get("source") or getattr(event, "source", None)
+        adapter_for_source = _hfc_delivery_resolver(runner)
+        adapter = adapter_for_source(source) if callable(adapter_for_source) else None
+        send = getattr(adapter, "send", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        if callable(send) and chat_id:
+            try:
+                await send(chat_id, message)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def load_runtime_config() -> RuntimeConfig:
+    enabled_value = os.environ.get("HERMES_FEISHU_CARD_ENABLED", "1").strip().lower()
+    enabled = enabled_value not in {"0", "false", "no", "off"}
+    if enabled:
+        from .install.legacy_home_revocation import hook_disabled
+        enabled = not hook_disabled()
+    event_url = os.environ.get("HERMES_FEISHU_CARD_EVENT_URL", DEFAULT_EVENT_URL).strip()
+    if not event_url:
+        event_url = DEFAULT_EVENT_URL
+    timeout_seconds = _timeout_from_env(os.environ.get("HERMES_FEISHU_CARD_TIMEOUT_MS"))
+    delta_coalesce_ms = _int_from_env(
+        os.environ.get("HERMES_FEISHU_CARD_DELTA_COALESCE_MS"),
+        default=250,
+        minimum=0,
+        maximum=5000,
+    )
+    delta_coalesce_chars = _int_from_env(
+        os.environ.get("HERMES_FEISHU_CARD_DELTA_COALESCE_CHARS"),
+        default=600,
+        minimum=1,
+        maximum=20000,
+    )
+    delta_coalesce_max_pending = _int_from_env(
+        os.environ.get("HERMES_FEISHU_CARD_DELTA_COALESCE_MAX_PENDING"),
+        default=128,
+        minimum=1,
+        maximum=5000,
+    )
+    return RuntimeConfig(
+        enabled=enabled,
+        event_url=event_url,
+        timeout_seconds=timeout_seconds,
+        delta_coalesce_ms=delta_coalesce_ms,
+        delta_coalesce_chars=delta_coalesce_chars,
+        delta_coalesce_max_pending=delta_coalesce_max_pending,
+    )
+
+
+def _config_for_terminal(
+    config: RuntimeConfig, local_vars: dict[str, Any], event_name: str,
+) -> RuntimeConfig:
+    """Let an already-owned turn finish when HOME revocation appeared mid-turn."""
+    if config.enabled or event_name not in {"message.completed", "message.failed"}:
+        return config
+    enabled_value = os.environ.get("HERMES_FEISHU_CARD_ENABLED", "1").strip().lower()
+    if enabled_value in {"0", "false", "no", "off"}:
+        return config
+    from .install.legacy_home_revocation import hook_disabled
+    if not hook_disabled():
+        return config
+    identity = _policy_identity(config, local_vars, event_name)
+    if (identity is not None and not identity.is_new_turn and identity.home_binding is not None
+            and _pinned_policy_disposition(identity, require_home=True) == "card"):
+        return replace(config, enabled=True)
+    return config
+
+
+def _timeout_from_env(value: str | None) -> float:
+    if value is None:
+        return DEFAULT_TIMEOUT_SECONDS
+    try:
+        timeout_ms = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_SECONDS
+    if not 50 <= timeout_ms <= 5000:
+        return DEFAULT_TIMEOUT_SECONDS
+    return timeout_ms / 1000.0
+
+
+def _int_from_env(
+    value: str | None,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if not minimum <= parsed <= maximum:
+        return default
+    return parsed
+
+
+def _first_card_admission_guard(
+    local_vars: dict[str, Any], event_name: str
+) -> Callable[[], bool] | None:
+    if event_name not in SUPPORTED_RUNTIME_EVENTS:
+        return None
+    mode = admission_completion_mode(local_vars)
+    if mode == "ordinary":
+        return None
+    if mode == "handoff":
+        from .admission_completion import first_card_guard, _prepare_failed
+
+        profile, source = _profile_identity(
+            local_vars, local_vars.get("source"), local_vars.get("message")
+        )
+        if not source.startswith("sanitized_"):
+            guard = first_card_guard(local_vars, profile)
+            if guard is not None:
+                return guard
+        _prepare_failed("authority-unverified")
+    return lambda: False
+
+
+def _policy_gate_sync(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+    *,
+    _admission_guard: Callable[[], bool] | None = None,
+) -> _PolicyGateResult:
+    identity = _policy_identity(config, local_vars, event_name)
+    if identity is None:
+        _cleanup_native_policy_state(local_vars)
+        return _PolicyGateResult(False, None)
+    disposition = _pinned_policy_disposition(identity)
+    if disposition is None:
+        query_lock = _policy_query_lock(identity)
+        with query_lock:
+            disposition = _pinned_policy_disposition(identity)
+            if disposition is None:
+                guard = _admission_guard
+                if guard is None:
+                    guard = _first_card_admission_guard(local_vars, event_name)
+                if guard is not None and not guard():
+                    # Refuse before any card event claims this turn. The
+                    # existing turn policy owns this decision, never the chat.
+                    disposition = "native"
+                else:
+                    cached = _cached_policy_disposition(identity)
+                    if cached is None:
+                        payload = _policy_payload(identity)
+                        try:
+                            fetched = _fetch_delivery_policy_sync(
+                                f"{_summary_base_url(config.event_url)}/delivery/policy",
+                                payload,
+                                min(config.timeout_seconds, POLICY_QUERY_TIMEOUT_SECONDS),
+                            )
+                        except Exception:
+                            fetched = None
+                        disposition, ttl_seconds = _normalize_policy_response(fetched)
+                        _cache_policy_disposition(identity, disposition, ttl_seconds)
+                    else:
+                        disposition = cached
+                    # A route can move while the sidecar policy request waits.
+                    # Recheck under the same single-flight lock before pinning.
+                    if disposition == "card" and guard is not None and not guard():
+                        disposition = "native"
+                _pin_policy_disposition(identity, disposition)
+    result = _PolicyGateResult(disposition == "card", identity)
+    if not result.card:
+        _cleanup_native_policy_state(local_vars)
+    if event_name in {"message.completed", "message.failed"}:
+        _finish_policy_turn(identity, disposition)
+    return result
+
+
+async def _policy_gate_async(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> _PolicyGateResult:
+    identity = _policy_identity(config, local_vars, event_name)
+    if identity is None:
+        result = _PolicyGateResult(False, None)
+        _cleanup_native_policy_state(local_vars)
+        return result
+    disposition = _pinned_policy_disposition(identity)
+    if disposition is not None:
+        result = _PolicyGateResult(disposition == "card", identity)
+        if not result.card:
+            _cleanup_native_policy_state(local_vars)
+        if event_name in {"message.completed", "message.failed"}:
+            _finish_policy_turn(identity, disposition)
+        return result
+
+    # Preserve callback arrival order before dispatching the blocking query to
+    # a worker. This asyncio lock is never shared with synchronous callbacks;
+    # the worker still uses the common threading.Lock single-flight.
+    async_lock = _policy_async_query_lock(identity)
+    async with async_lock:
+        disposition = _pinned_policy_disposition(identity)
+        if disposition is not None:
+            result = _PolicyGateResult(disposition == "card", identity)
+            if event_name in {"message.completed", "message.failed"}:
+                _finish_policy_turn(identity, disposition)
+        else:
+            # Never hold the shared threading.Lock in the event-loop thread
+            # across an await: a synchronous callback on that loop could block
+            # waiting for it and prevent the async owner from resuming.
+            # Borrow the native frame in its original Task before moving the
+            # policy query to a worker; the worker rechecks before pinning.
+            guard = _first_card_admission_guard(local_vars, event_name)
+            kwargs = {"_admission_guard": guard} if guard is not None else {}
+            result = await asyncio.to_thread(
+                _policy_gate_sync, config, local_vars, event_name, **kwargs
+            )
+    if not result.card:
+        # ContextVar writes in the worker's copied context do not flow back to
+        # this task, so repeat the idempotent native cleanup here.
+        _cleanup_native_policy_state(local_vars)
+    return result
+
+
+def _policy_identity(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> _PolicyIdentity | None:
+    if local_vars.get("_hfc_profile_invalid") is True:
+        return None
+    source_obj = local_vars.get("source")
+    if _platform_name(local_vars, source_obj) != "feishu":
+        return None
+    message_obj = local_vars.get("message")
+    gateway_event_obj = local_vars.get("event")
+    chat_id = _first_string(local_vars, ("chat_id", "open_chat_id", "receive_id"))
+    if chat_id is None:
+        chat_id = _first_attr_string(
+            message_obj, ("chat_id", "open_chat_id", "receive_id")
+        )
+    if chat_id is None:
+        chat_id = _first_attr_string(
+            source_obj, ("chat_id", "open_chat_id", "receive_id")
+        )
+    if not chat_id:
+        return None
+    profile_id, profile_source = _profile_identity(
+        local_vars, source_obj, message_obj
+    )
+    if profile_source.startswith("sanitized_"):
+        return None
+    conversation_id = (
+        _first_string(local_vars, ("conversation_id", "thread_id", "session_id"))
+        or _first_attr_string(
+            message_obj, ("conversation_id", "thread_id", "session_id")
+        )
+        or _first_attr_string(
+            source_obj, ("conversation_id", "thread_id", "session_id")
+        )
+        or chat_id
+    )
+    message_id = (
+        _first_string(local_vars, ("message_id", "msg_id", "event_message_id"))
+        or _first_attr_string(message_obj, ("message_id", "msg_id"))
+        or _first_attr_string(gateway_event_obj, ("message_id", "msg_id"))
+        or ""
+    )
+    turn_id = _turn_id_for_runtime_event(event_name, local_vars) or ""
+    canonical_id = turn_id or message_id
+    endpoint = _summary_base_url(config.event_url)
+    scope_key = (endpoint, profile_id, chat_id, conversation_id)
+    with _POLICY_LOCK:
+        active_turn = _ACTIVE_POLICY_TURNS.get(scope_key)
+    if canonical_id:
+        turn_token = f"message:{canonical_id}"
+    elif event_name != "message.started" and active_turn is not None:
+        turn_token = active_turn[3]
+    else:
+        created_token = _created_at_lifecycle_token(local_vars.get("created_at"))
+        turn_token = (
+            f"created:{created_token}"
+            if created_token is not None
+            else f"turn:{time.monotonic_ns()}"
+        )
+    turn_key = (endpoint, profile_id, chat_id, turn_token)
+    with _POLICY_LOCK:
+        _prune_policy_state_locked(time.monotonic())
+        terminal_known = turn_key in _TERMINAL_POLICY_DECISIONS
+    stream_reopens_turn = event_name in {
+        "thinking.delta",
+        "answer.delta",
+        "tool.updated",
+    }
+    is_new_turn = event_name == "message.started" or (
+        active_turn != turn_key
+        and (not terminal_known or stream_reopens_turn)
+        and (bool(message_id) or active_turn is None)
+    )
+    from .install.legacy_home_revocation import _authoritative_binding
+    return _PolicyIdentity(
+        endpoint=endpoint,
+        profile_id=profile_id,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        turn_id=turn_id,
+        scope_key=scope_key,
+        turn_key=turn_key,
+        is_new_turn=is_new_turn,
+        home_binding=_authoritative_binding(),
+    )
+
+
+def _policy_payload(identity: _PolicyIdentity) -> dict[str, str]:
+    payload = {
+        "schema_version": "1",
+        "chat_id": identity.chat_id,
+        "profile_id": identity.profile_id,
+        "conversation_id": identity.conversation_id,
+    }
+    if identity.message_id:
+        payload["message_id"] = identity.message_id
+    if identity.turn_id:
+        payload["turn_id"] = identity.turn_id
+    return payload
+
+
+def _pinned_policy_disposition(identity: _PolicyIdentity, *, require_home: bool = False) -> str | None:
+    now = time.monotonic()
+    with _POLICY_LOCK:
+        _prune_policy_state_locked(now)
+        terminal = (
+            None
+            if identity.is_new_turn
+            else _TERMINAL_POLICY_DECISIONS.get(identity.turn_key)
+        )
+        if terminal is not None:
+            if require_home and terminal.home_binding != identity.home_binding:
+                return None
+            _TERMINAL_POLICY_DECISIONS.move_to_end(identity.turn_key)
+            return terminal.disposition
+        decision = _TURN_POLICY_DECISIONS.get(identity.turn_key)
+        if (
+            decision is None
+            and not identity.message_id
+            and not identity.is_new_turn
+        ):
+            active_turn = _ACTIVE_POLICY_TURNS.get(identity.scope_key)
+            if active_turn is not None:
+                decision = _TURN_POLICY_DECISIONS.get(active_turn)
+        if decision is not None:
+            if require_home and decision.home_binding != identity.home_binding:
+                return None
+            _TURN_POLICY_DECISIONS.move_to_end(
+                identity.turn_key
+                if identity.turn_key in _TURN_POLICY_DECISIONS
+                else _ACTIVE_POLICY_TURNS[identity.scope_key]
+            )
+        return decision.disposition if decision is not None else None
+
+
+def _cached_policy_disposition(identity: _PolicyIdentity) -> str | None:
+    if identity.is_new_turn:
+        return None
+    key = (identity.endpoint, identity.profile_id, identity.chat_id)
+    now = time.monotonic()
+    with _POLICY_LOCK:
+        _prune_policy_state_locked(now)
+        entry = _POLICY_CACHE.get(key)
+        if entry is None:
+            return None
+        _POLICY_CACHE.move_to_end(key)
+        return entry.disposition
+
+
+def _cache_policy_disposition(
+    identity: _PolicyIdentity,
+    disposition: str,
+    ttl_seconds: float,
+) -> None:
+    key = (identity.endpoint, identity.profile_id, identity.chat_id)
+    with _POLICY_LOCK:
+        _POLICY_CACHE[key] = _PolicyCacheEntry(
+            disposition,
+            time.monotonic() + max(0.0, min(ttl_seconds, POLICY_CACHE_TTL_SECONDS)),
+        )
+        _POLICY_CACHE.move_to_end(key)
+        _bound_ordered_dict(_POLICY_CACHE)
+
+
+def _pin_policy_disposition(identity: _PolicyIdentity, disposition: str) -> None:
+    with _POLICY_LOCK:
+        if identity.is_new_turn:
+            _TERMINAL_POLICY_DECISIONS.pop(identity.turn_key, None)
+        _TURN_POLICY_DECISIONS[identity.turn_key] = _PinnedPolicyDecision(disposition, identity.home_binding)
+        _TURN_POLICY_DECISIONS.move_to_end(identity.turn_key)
+        _ACTIVE_POLICY_TURNS[identity.scope_key] = identity.turn_key
+        _bound_ordered_dict(_TURN_POLICY_DECISIONS)
+        while len(_ACTIVE_POLICY_TURNS) > POLICY_CACHE_LIMIT:
+            _ACTIVE_POLICY_TURNS.pop(next(iter(_ACTIVE_POLICY_TURNS)))
+
+
+def _finish_policy_turn(identity: _PolicyIdentity, disposition: str) -> None:
+    with _POLICY_LOCK:
+        previous = _TURN_POLICY_DECISIONS.pop(identity.turn_key, None)
+        prior_terminal = _TERMINAL_POLICY_DECISIONS.get(identity.turn_key)
+        home_binding = (previous.home_binding if previous is not None else
+                        prior_terminal.home_binding if prior_terminal is not None else identity.home_binding)
+        if _ACTIVE_POLICY_TURNS.get(identity.scope_key) == identity.turn_key:
+            _ACTIVE_POLICY_TURNS.pop(identity.scope_key, None)
+        _TERMINAL_POLICY_DECISIONS[identity.turn_key] = _PolicyCacheEntry(
+            disposition,
+            math.inf,
+            home_binding,
+        )
+        _TERMINAL_POLICY_DECISIONS.move_to_end(identity.turn_key)
+        _bound_ordered_dict(_TERMINAL_POLICY_DECISIONS)
+
+
+def _prune_policy_state_locked(now: float) -> None:
+    for key, entry in list(_POLICY_CACHE.items()):
+        if entry.expires_at <= now:
+            _POLICY_CACHE.pop(key, None)
+
+
+def _bound_ordered_dict(mapping: OrderedDict[Any, Any]) -> None:
+    while len(mapping) > POLICY_CACHE_LIMIT:
+        mapping.popitem(last=False)
+
+
+def _policy_query_lock(identity: _PolicyIdentity) -> threading.Lock:
+    with _POLICY_LOCK:
+        lock = _POLICY_QUERY_LOCKS.get(identity.turn_key)
+        if lock is None:
+            lock = threading.Lock()
+            _POLICY_QUERY_LOCKS[identity.turn_key] = lock
+        _POLICY_QUERY_LOCKS.move_to_end(identity.turn_key)
+        # Do not evict a locked entry; a small temporary overflow is safer than
+        # allowing a second decision for the same turn.
+        for key, candidate in list(_POLICY_QUERY_LOCKS.items()):
+            if len(_POLICY_QUERY_LOCKS) <= POLICY_CACHE_LIMIT:
+                break
+            if key != identity.turn_key and not candidate.locked():
+                _POLICY_QUERY_LOCKS.pop(key, None)
+        return lock
+
+
+def _policy_async_query_lock(identity: _PolicyIdentity) -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    key = (loop_key, *identity.turn_key)
+    with _POLICY_LOCK:
+        lock = _POLICY_ASYNC_QUERY_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _POLICY_ASYNC_QUERY_LOCKS[key] = lock
+        _POLICY_ASYNC_QUERY_LOCKS.move_to_end(key)
+        for candidate_key, candidate in list(_POLICY_ASYNC_QUERY_LOCKS.items()):
+            if len(_POLICY_ASYNC_QUERY_LOCKS) <= POLICY_CACHE_LIMIT:
+                break
+            if candidate_key != key and _async_policy_lock_is_idle(candidate):
+                _POLICY_ASYNC_QUERY_LOCKS.pop(candidate_key, None)
+        return lock
+
+
+def _policy_async_event_lock(identity: _PolicyIdentity) -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    key = (loop_key, *identity.scope_key)
+    with _POLICY_LOCK:
+        lock = _POLICY_ASYNC_EVENT_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _POLICY_ASYNC_EVENT_LOCKS[key] = lock
+        _POLICY_ASYNC_EVENT_LOCKS.move_to_end(key)
+        for candidate_key, candidate in list(_POLICY_ASYNC_EVENT_LOCKS.items()):
+            if len(_POLICY_ASYNC_EVENT_LOCKS) <= POLICY_CACHE_LIMIT:
+                break
+            if candidate_key != key and _async_policy_lock_is_idle(candidate):
+                _POLICY_ASYNC_EVENT_LOCKS.pop(candidate_key, None)
+        return lock
+
+
+def _async_policy_lock_is_idle(lock: asyncio.Lock) -> bool:
+    # release() wakes a waiter before that task resumes and marks the lock as
+    # acquired. During that gap locked() is False, but replacing the lock would
+    # split one scope into two concurrent critical sections. Keep it while the
+    # private waiter deque is non-empty; this is conservative for cancellation.
+    return not lock.locked() and not bool(getattr(lock, "_waiters", None))
+
+
+def _normalize_policy_response(result: Any) -> tuple[str, float]:
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return "native", 0.2
+    disposition = result.get("disposition")
+    if disposition not in {"card", "native"}:
+        return "native", 0.2
+    ttl_ms = result.get("ttl_ms")
+    if isinstance(ttl_ms, bool) or not isinstance(ttl_ms, (int, float)):
+        return "native", 0.2
+    if not math.isfinite(float(ttl_ms)) or ttl_ms < 0 or ttl_ms > 1000:
+        return "native", 0.2
+    return disposition, ttl_ms / 1000.0
+
+
+def _fetch_delivery_policy_sync(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> Any:
+    return _post_json_sync_response(url, payload, timeout)
+
+
+def _cleanup_native_policy_state(local_vars: dict[str, Any]) -> None:
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+    _discard_pending_deltas_for_local_vars(local_vars)
+
+
+def _policy_event_locals(
+    local_vars: dict[str, Any],
+    gate: _PolicyGateResult,
+) -> dict[str, Any]:
+    identity = gate.identity
+    if identity is None:
+        return local_vars
+    updates: dict[str, Any] = {}
+    if identity.turn_id:
+        updates["turn_id"] = identity.turn_id
+    if identity.is_new_turn:
+        updates["_hfc_policy_new_turn"] = True
+    return {**local_vars, **updates} if updates else local_vars
+
+
+def _discard_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> None:
+    canonical_id = _canonical_id_from_local_vars(local_vars)
+    if not canonical_id:
+        return
+    with _PENDING_DELTAS_LOCK:
+        for key, pending in list(_PENDING_DELTAS.items()):
+            if _pending_message_id(key, pending) == canonical_id:
+                _PENDING_DELTAS.pop(key, None)
+
+
+def _queue_coalesced_delta(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> bool:
+    if event_name not in {"thinking.delta", "answer.delta"}:
+        return False
+    if config.delta_coalesce_ms <= 0:
+        return False
+    identity = _delta_coalesce_identity(config, local_vars, event_name)
+    if identity is None:
+        return False
+    key, loop, base_locals, text = identity
+    should_flush_now = False
+    should_schedule = False
+    with _PENDING_DELTAS_LOCK:
+        pending = _PENDING_DELTAS.get(key)
+        if pending is None:
+            if len(_PENDING_DELTAS) >= config.delta_coalesce_max_pending:
+                _PENDING_DELTAS.pop(next(iter(_PENDING_DELTAS)), None)
+            pending = _PendingDelta(
+                event_name=event_name,
+                event_url=config.event_url,
+                timeout_seconds=_timeout_for_event(config, event_name),
+                loop=loop,
+                base_locals=base_locals,
+                text_parts=[],
+            )
+            _PENDING_DELTAS[key] = pending
+        pending.text_parts.append(text)
+        pending.char_count += len(text)
+        if pending.char_count >= config.delta_coalesce_chars:
+            should_flush_now = True
+        elif not pending.scheduled:
+            pending.scheduled = True
+            should_schedule = True
+    if should_flush_now:
+        _schedule_delta_flush(loop, key, 0.0)
+    elif should_schedule:
+        _schedule_delta_flush(loop, key, config.delta_coalesce_ms / 1000.0)
+    return True
+
+
+def _delta_coalesce_identity(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> tuple[tuple[int, str, str, str, str], Any, dict[str, Any], str] | None:
+    source_obj = local_vars.get("source")
+    if _platform_name(local_vars, source_obj) != "feishu":
+        return None
+    message_obj = local_vars.get("message")
+    gateway_event_obj = local_vars.get("event")
+    message_id = _first_string(
+        local_vars, ("message_id", "msg_id", "event_message_id")
+    ) or _first_attr_string(
+        message_obj, ("message_id", "msg_id")
+    ) or _first_attr_string(
+        gateway_event_obj, ("message_id", "msg_id")
+    )
+    if not message_id:
+        return None
+    turn_id = _turn_id_for_runtime_event(event_name, local_vars) or ""
+    canonical_id = turn_id or message_id
+    text = _first_raw_string(local_vars, ("text", "delta", "delta_text", "content"))
+    if text is None:
+        text = _first_attr_raw_string(message_obj, ("text", "content"))
+    if not text:
+        return None
+    loop = local_vars.get("_hfc_loop")
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+    profile_id, _profile_source = _profile_identity(local_vars, source_obj, message_obj)
+    key = (id(loop), config.event_url, canonical_id, event_name, profile_id)
+    base_locals = _delta_base_locals(
+        {**local_vars, **({"turn_id": turn_id} if turn_id else {})}
+    )
+    return key, loop, base_locals, str(text)
+
+
+def _delta_base_locals(local_vars: dict[str, Any]) -> dict[str, Any]:
+    keep_keys = {
+        "source",
+        "event",
+        "message",
+        "chat_id",
+        "open_chat_id",
+        "receive_id",
+        "conversation_id",
+        "thread_id",
+        "session_id",
+        "message_id",
+        "msg_id",
+        "event_message_id",
+        "turn_id",
+        "created_at",
+        "profile_id",
+        "hermes_profile",
+        "profile",
+        "mode",
+        "_hfc_text_mode",
+    }
+    return {key: value for key, value in local_vars.items() if key in keep_keys}
+
+
+def _schedule_delta_flush(loop: Any, key: tuple[int, str, str, str, str], delay: float) -> None:
+    async def flush_later() -> None:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await _flush_pending_delta_key(key)
+
+    def create_task() -> None:
+        asyncio.create_task(flush_later())
+
+    try:
+        if loop.is_running():
+            loop.call_soon_threadsafe(create_task)
+    except Exception:
+        return
+
+
+async def flush_pending_deltas_for_message(message_id: str) -> None:
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        return
+    with _PENDING_DELTAS_LOCK:
+        keys = [
+            key
+            for key, pending in _PENDING_DELTAS.items()
+            if _pending_message_id(key, pending) == message_id
+        ]
+    for key in keys:
+        await _flush_pending_delta_key(key)
+
+
+async def _flush_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> None:
+    canonical_id = _canonical_id_from_local_vars(local_vars)
+    if canonical_id:
+        await flush_pending_deltas_for_message(canonical_id)
+
+
+def _has_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> bool:
+    canonical_id = _canonical_id_from_local_vars(local_vars)
+    if not canonical_id:
+        return False
+    with _PENDING_DELTAS_LOCK:
+        return any(
+            _pending_message_id(key, pending) == canonical_id
+            for key, pending in _PENDING_DELTAS.items()
+        )
+
+
+def _message_id_from_local_vars(local_vars: dict[str, Any]) -> str | None:
+    message_obj = local_vars.get("message")
+    gateway_event_obj = local_vars.get("event")
+    message_id = _first_string(
+        local_vars, ("message_id", "msg_id", "event_message_id")
+    ) or _first_attr_string(
+        message_obj, ("message_id", "msg_id")
+    ) or _first_attr_string(
+        gateway_event_obj, ("message_id", "msg_id")
+    )
+    return message_id
+
+
+def _canonical_id_from_local_vars(local_vars: dict[str, Any]) -> Optional[str]:
+    return (
+        _turn_id_for_runtime_event("", local_vars)
+        or _message_id_from_local_vars(local_vars)
+    )
+
+
+def _pending_message_id(
+    key: tuple[int, str, str, str, str], pending: _PendingDelta
+) -> str:
+    return key[2]
+
+
+async def _flush_pending_delta_key(key: tuple[int, str, str, str, str]) -> None:
+    with _PENDING_DELTAS_LOCK:
+        pending = _PENDING_DELTAS.pop(key, None)
+    if pending is None or not pending.text_parts:
+        return
+    payload = build_event(
+        pending.event_name,
+        {**pending.base_locals, "text": "".join(pending.text_parts)},
+    )
+    if payload is None:
+        return
+    await _send_fail_open_ordered(
+        pending.event_url,
+        payload,
+        pending.timeout_seconds,
+    )
+
+
+async def _flush_build_send_ordered(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> None:
+    await _flush_pending_deltas_for_local_vars(local_vars)
+    payload = build_event(event_name, local_vars)
+    if payload is None:
+        return
+    await _send_fail_open_ordered(
+        config.event_url,
+        payload,
+        _timeout_for_event(config, event_name),
+    )
+
+
+def emit_from_hermes_locals(
+    local_vars: dict[str, Any],
+    event_name: str = "message.started",
+) -> bool:
+    try:
+        config = _config_for_terminal(load_runtime_config(), local_vars, event_name)
+        if not config.enabled:
+            return False
+        _ensure_runtime_control_started(config)
+        _hfc_eager_ensure_command_card_hooks(local_vars)
+        gate = _policy_gate_sync(config, local_vars, event_name)
+        if not gate.card:
+            return False
+        event_locals = _policy_event_locals(local_vars, gate)
+        payload = build_event(event_name, event_locals)
+        if payload is None:
+            return False
+        asyncio.get_running_loop()
+        asyncio.create_task(
+            _send_fail_open_ordered(
+                config.event_url,
+                payload,
+                _timeout_for_event(config, event_name),
+            )
+        )
+        return True
+    except Exception:
+        return False
+
+
+def emit_from_hermes_locals_threadsafe(
+    local_vars: dict[str, Any],
+    event_name: str = "message.started",
+) -> bool:
+    try:
+        config = _config_for_terminal(load_runtime_config(), local_vars, event_name)
+        if not config.enabled:
+            return False
+        _ensure_runtime_control_started(config)
+        _hfc_eager_ensure_command_card_hooks(local_vars)
+        gate = _policy_gate_sync(config, local_vars, event_name)
+        if not gate.card:
+            return False
+        event_locals = _policy_event_locals(local_vars, gate)
+        if _queue_coalesced_delta(config, event_locals, event_name):
+            return True
+        if _has_pending_deltas_for_local_vars(event_locals):
+            if "_hfc_loop" in event_locals:
+                coroutine = _flush_build_send_ordered(config, event_locals, event_name)
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        coroutine,
+                        event_locals["_hfc_loop"],
+                    )
+                except Exception:
+                    coroutine.close()
+                    raise
+            else:
+                asyncio.get_running_loop()
+                asyncio.create_task(
+                    _flush_build_send_ordered(config, event_locals, event_name)
+                )
+            return True
+        payload = build_event(event_name, event_locals)
+        if payload is None:
+            return False
+        if "_hfc_loop" in event_locals:
+            coroutine = _send_fail_open_ordered(
+                config.event_url,
+                payload,
+                _timeout_for_event(config, event_name),
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    coroutine,
+                    event_locals["_hfc_loop"],
+                )
+            except Exception:
+                coroutine.close()
+                raise
+        else:
+            asyncio.get_running_loop()
+            asyncio.create_task(
+                _send_fail_open_ordered(
+                    config.event_url,
+                    payload,
+                    _timeout_for_event(config, event_name),
+                )
+            )
+        return True
+    except Exception:
+        return False
+
+
+def handle_status_from_hermes_locals(
+    local_vars: dict[str, Any],
+    *,
+    event_type: str,
+    message: str,
+) -> bool:
+    try:
+        source = local_vars.get("source")
+        if _platform_name(local_vars, source) != "feishu":
+            return False
+        provider_failure = bool(
+            event_type == "lifecycle" and isinstance(message, str) and len(message) <= 1000
+            and re.fullmatch(r"❌ (?:API failed|Rate limited) after [1-9][0-9]{0,2} retries — [^\r\n]+", message)
+        )
+        if not provider_failure and not _CONTEXT_COMPACTION_STATUS_RE.search(str(message or "")):
+            return False
+        run_guard = local_vars.get("_run_still_current")
+        if callable(run_guard) and not run_guard():
+            return False
+        event_locals = {
+            **local_vars,
+            "_hfc_notice_title": "正在压缩上下文",
+            "_hfc_notice_level": "info",
+            "_hfc_notice_kind": "context-compaction",
+            "_hfc_notice_id": "context-compaction:active",
+            "_hfc_notice_scope": "session",
+            "_hfc_notice_phase": "started",
+            "_hfc_notice_create_session": True,
+            "display_status": "in_progress",
+            "content": "正在总结较早的对话，完成后会继续当前任务。",
+        }
+        if provider_failure:
+            event_locals.update({
+                "_hfc_notice_title": "模型服务异常",
+                "_hfc_notice_level": "warning",
+                "_hfc_notice_kind": "provider-failure",
+                "_hfc_notice_id": "provider-failure:terminal",
+                "content": "模型服务请求失败，本轮正在结束。错误说明会保留在结果卡中。",
+            })
+            return _emit_status_notice_confirmed(event_locals)
+        return emit_from_hermes_locals_threadsafe(
+            event_locals,
+            event_name="system.notice",
+        )
+    except Exception:
+        return False
+
+
+def _emit_status_notice_confirmed(local_vars: dict[str, Any]) -> bool:
+    """Suppress native failure text only after a bounded sidecar acknowledgement."""
+    loop = local_vars.get("_hfc_loop")
+    future = None
+    try:
+        if loop is None or not loop.is_running():
+            return False
+        try:
+            if asyncio.get_running_loop() is loop:
+                return False  # Never block the loop needed to deliver this event.
+        except RuntimeError:
+            pass
+        timeout = min(10.0, max(1.0, load_runtime_config().timeout_seconds + 1.0))
+        coroutine = emit_from_hermes_locals_async(local_vars, "system.notice", require_ack=True)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception:
+            coroutine.close()
+            raise
+        return future.result(timeout=timeout) is True
+    except Exception:
+        if future is not None:
+            future.cancel()
+        return False
+
+
+async def emit_from_hermes_locals_async(
+    local_vars: dict[str, Any],
+    event_name: str = "message.started",
+    *, require_ack: bool = False,
+) -> bool:
+    try:
+        config = _config_for_terminal(load_runtime_config(), local_vars, event_name)
+        if not config.enabled:
+            return False
+        _ensure_runtime_control_started(config)
+        order_identity = _policy_identity(config, local_vars, event_name)
+        if order_identity is None:
+            _cleanup_native_policy_state(local_vars)
+            return False
+        event_lock = _policy_async_event_lock(order_identity)
+        async with event_lock:
+            gate = await _policy_gate_async(config, local_vars, event_name)
+            if not gate.card:
+                return False
+            event_locals = _policy_event_locals(local_vars, gate)
+            if event_name not in {"thinking.delta", "answer.delta"}:
+                await _flush_pending_deltas_for_local_vars(event_locals)
+            payload = build_event(event_name, event_locals)
+            if payload is None:
+                return False
+            if event_name in {"message.completed", "message.failed"}:
+                # Terminal events get a bounded retry: losing one strands the card.
+                result = await _post_terminal_with_retry(config, payload, event_name)
+            else:
+                result = await _post_json_ordered_response(
+                    config.event_url,
+                    payload,
+                    _timeout_for_event(config, event_name),
+                )
+            if event_name == "message.completed":
+                _register_native_handoff_descriptor(payload, result)
+            applied = _event_was_applied(
+                result,
+                strict=require_ack or event_name in {"message.completed", "message.failed"},
+            )
+            if event_name == "message.completed":
+                _register_native_media_text_suppression(payload, applied=applied)
+            return applied
+    except Exception:
+        return False
+
+
+def can_stage_exact_base_completion(local_vars: dict[str, Any]) -> bool:
+    """Return whether Base will still own one exact final-text decision."""
+    try:
+        source = local_vars.get("source")
+        if _platform_name(local_vars, source) != "feishu":
+            return False
+        response = _completion_answer(local_vars)
+        if not response:
+            _warn_stage_diagnostic("empty-answer")
+            return False
+        agent_result = local_vars.get("agent_result")
+        already_sent = bool(
+            local_vars.get("_already_sent")
+            or (
+                isinstance(agent_result, dict)
+                and agent_result.get("already_sent")
+            )
+        )
+        failed = bool(
+            isinstance(agent_result, dict) and agent_result.get("failed")
+        )
+        if already_sent and not failed:
+            _warn_stage_diagnostic("already-delivered")
+            return False
+        return _exact_base_delivery_hook_available()
+    except Exception:
+        _warn_stage_diagnostic("exception")
+        return False
+
+
+def _exact_base_delivery_hook_available() -> bool:
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        method = getattr(BasePlatformAdapter, "_process_message_background", None)
+        code = getattr(method, "__code__", None)
+        names = set(getattr(code, "co_names", ()) or ())
+        if {"prepare_exact_base_final_delivery", "finalize_exact_base_no_text"}.issubset(names):
+            return True
+        send = getattr(BasePlatformAdapter, "_send_final_text", None)
+        send_names = set(getattr(getattr(send, "__code__", None), "co_names", ()))
+        decomposed = {"capture_decomposed_base_context", "finalize_exact_base_no_text", "_send_final_text"}.issubset(names)
+        if decomposed and {
+            "prepare_decomposed_base_final_delivery", "_record_delivery_obligation",
+            "_send_with_retry", "_finalize_delivery_obligation",
+        }.issubset(send_names):
+            return True
+        ledger = getattr(BasePlatformAdapter, "send_final_ledgered", None)
+        ledger_names = set(getattr(getattr(ledger, "__code__", None), "co_names", ()))
+        ledger_contract = {"_record_delivery_obligation", "_send_with_retry", "_finalize_delivery_obligation"}
+        if not ledger_contract.issubset(ledger_names):
+            _warn_stage_diagnostic("base-hook-unavailable")
+            return False
+        if decomposed:
+            available = (
+                "send_final_ledgered" in send_names
+                and "prepare_decomposed_base_final_delivery" in ledger_names
+            )
+        else:
+            available = (
+                {"finalize_exact_base_no_text", "send_final_ledgered"}.issubset(names)
+                and "prepare_exact_base_final_delivery" in ledger_names
+            )
+        if not available:
+            _warn_stage_diagnostic("base-hook-unavailable")
+        return available
+    except Exception:
+        _warn_stage_diagnostic("exception")
+        return False
+
+
+async def stage_message_completed_from_hermes_locals_async(
+    local_vars: dict[str, Any],
+) -> bool:
+    """Freeze one terminal payload until Base exposes exact delivery values.
+
+    No sidecar request or obligation inference happens here. The staged value
+    is task-local and is consumed only by the owned Base hooks after Hermes has
+    finished its native media/file extraction pipeline.
+    """
+    _HFC_EXACT_COMPLETION_STAGE.set(None)
+    try:
+        config = _config_for_terminal(load_runtime_config(), local_vars, "message.completed")
+        if not config.enabled:
+            _warn_stage_diagnostic("config-disabled")
+            return False
+        _ensure_runtime_control_started(config)
+        order_identity = _policy_identity(config, local_vars, "message.completed")
+        if order_identity is None:
+            _warn_stage_diagnostic("policy-identity-unavailable")
+            _cleanup_native_policy_state(local_vars)
+            return False
+        event_lock = _policy_async_event_lock(order_identity)
+        async with event_lock:
+            gate = await _policy_gate_async(
+                config,
+                local_vars,
+                "message.completed",
+            )
+            if not gate.card:
+                _warn_stage_diagnostic("policy-native")
+                return False
+            event_locals = _policy_event_locals(local_vars, gate)
+            await _flush_pending_deltas_for_local_vars(event_locals)
+            payload = build_event("message.completed", event_locals)
+            if payload is None:
+                _warn_stage_diagnostic("payload-unavailable")
+                return False
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        stage = {
+            "payload": payload,
+            "event_url": config.event_url,
+            "timeout_seconds": _timeout_for_event(config, "message.completed"),
+            "task_id": id(task) if task is not None else None,
+        }
+        admission_mode = admission_completion_mode(local_vars)
+        if admission_mode == "native":
+            return False
+        if admission_mode == "handoff":
+            from .admission_completion import prepare
+            offer = prepare(local_vars, stage, _finish_admission_delivery)
+            if offer is None:
+                return False
+            stage["_admission_offer"] = offer
+        _HFC_EXACT_COMPLETION_STAGE.set(stage)
+        return True
+    except Exception:
+        _warn_stage_diagnostic("exception")
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return False
+
+
+def _exact_completion_stage_for_current_task() -> dict[str, Any] | None:
+    stage = _HFC_EXACT_COMPLETION_STAGE.get()
+    if not isinstance(stage, dict):
+        return None
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    owner = stage.get("task_id")
+    if owner is not None and (task is None or id(task) != owner):
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return None
+    offer = stage.get("_admission_offer")
+    if offer is not None and not (offer.state == "prepared" and offer.fresh()):
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return None
+    if "_admission_claim" in stage:
+        from .admission_completion import valid_consumed
+        if not valid_consumed(stage):
+            _HFC_EXACT_COMPLETION_STAGE.set(None)
+            return None
+    if not isinstance(stage.get("payload"), dict):
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return None
+    return stage
+
+
+class _ExactCardDeliveryAdapterProxy:
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+        self.name = str(getattr(delegate, "name", "feishu") or "feishu")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def _send_with_retry(self, *_args: Any, **_kwargs: Any) -> Any:
+        return _send_result(True)
+
+
+def _exact_base_attachments(local_vars: dict[str, Any]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    attachments: list[dict[str, str]] = []
+    for field in ("images", "local_files", "media_files"):
+        values = local_vars.get(field)
+        if values is None:
+            continue
+        candidates = values if isinstance(values, (list, tuple, set)) else [values]
+        for candidate in candidates:
+            attachment = _coerce_attachment(candidate)
+            if attachment is None or attachment["name"] in seen:
+                continue
+            seen.add(attachment["name"])
+            attachments.append(attachment)
+    return attachments
+
+
+def _exact_base_has_attachments(local_vars: dict[str, Any]) -> bool:
+    """Treat any Base attachment local as outside the exact text contract."""
+    for field in ("images", "local_files", "media_files"):
+        try:
+            if bool(local_vars.get(field)):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _exact_stage_allows_ack(stage: dict[str, Any]) -> bool:
+    payload = stage.get("payload")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if (
+        not isinstance(data, dict)
+        or payload.get("event") != "message.completed"
+        or ("delivery_kind" in data and data["delivery_kind"] != "")
+    ):
+        return False
+    profile_id = str(data.get("profile_id") or "")
+    profile_source = str(data.get("profile_source") or "")
+    return profile_id == "default" and not profile_source.startswith("sanitized_")
+
+
+def _native_handoff_content_hash(content: Any) -> str:
+    return derive_native_handoff_content_hash(content)
+
+
+def _semantic_code_value(value: Any) -> Any:
+    """Return location-independent Python code semantics for hashing."""
+    if isinstance(value, CodeType):
+        return {
+            "argcount": value.co_argcount,
+            "posonlyargcount": value.co_posonlyargcount,
+            "kwonlyargcount": value.co_kwonlyargcount,
+            "nlocals": value.co_nlocals,
+            "flags": value.co_flags,
+            "code": value.co_code.hex(),
+            "consts": [_semantic_code_value(item) for item in value.co_consts],
+            "names": list(value.co_names),
+            "varnames": list(value.co_varnames),
+            "freevars": list(value.co_freevars),
+            "cellvars": list(value.co_cellvars),
+        }
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite code constant")
+        return {"float": repr(value)}
+    if isinstance(value, bytes):
+        return {"bytes": value.hex()}
+    if isinstance(value, slice):
+        # Python 3.14 stores literal slices in co_consts.
+        return {
+            "slice": [
+                _semantic_code_value(item)
+                for item in (value.start, value.stop, value.step)
+            ]
+        }
+    if isinstance(value, tuple):
+        return {"tuple": [_semantic_code_value(item) for item in value]}
+    if isinstance(value, list):
+        return {"list": [_semantic_code_value(item) for item in value]}
+    if isinstance(value, (set, frozenset)):
+        values = [_semantic_code_value(item) for item in value]
+        return {
+            "set": sorted(
+                values,
+                key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+            )
+        }
+    if isinstance(value, dict):
+        items = [
+            (_semantic_code_value(key), _semantic_code_value(item))
+            for key, item in value.items()
+        ]
+        return {
+            "dict": sorted(
+                items,
+                key=lambda pair: json.dumps(
+                    pair[0], sort_keys=True, separators=(",", ":")
+                ),
+            )
+        }
+    raise ValueError("unsupported code constant")
+
+
+def _callable_delivery_semantics(value: Any) -> Any | None:
+    """Return loaded callable bytecode semantics, never source-file text."""
+    if isinstance(value, (staticmethod, classmethod)):
+        value = value.__func__
+    if not callable(value):
+        return None
+    try:
+        code = getattr(value, "__code__")
+        if not isinstance(code, CodeType):
+            return None
+        return _semantic_code_value(code)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _module_delivery_semantics(module: Any) -> dict[str, Any] | None:
+    """Hash the already-loaded adapter module's functions and plan constants."""
+    module_name = str(getattr(module, "__name__", "") or "")
+    if not module_name:
+        return None
+    functions: dict[str, Any] = {}
+    patterns: dict[str, Any] = {}
+    constants: dict[str, Any] = {}
+    for name, value in sorted(vars(module).items()):
+        if inspect.isfunction(value) and value.__module__ == module_name:
+            semantics = _callable_delivery_semantics(value)
+            if semantics is None:
+                return None
+            functions[name] = semantics
+            continue
+        if isinstance(value, re.Pattern):
+            patterns[name] = {
+                "pattern": _semantic_code_value(value.pattern),
+                "flags": value.flags,
+            }
+            continue
+        if not name.lstrip("_").isupper():
+            continue
+        try:
+            constants[name] = _semantic_code_value(value)
+        except ValueError:
+            # Classes, modules, fixtures, and other runtime objects are not
+            # delivery-plan constants and must not make the digest unstable.
+            continue
+    if not functions:
+        return None
+    return {
+        "module": module_name,
+        "functions": functions,
+        "patterns": patterns,
+        "constants": constants,
+    }
+
+
+def _native_handoff_runtime_wrappers_ready(adapter: Any) -> bool:
+    """Require the complete stable-UUID and ledger ACK wrapper chain."""
+    adapter_type = type(adapter)
+    required_methods = (
+        ("send", _hfc_send_with_native_command_result_card, "_hfc_original_send"),
+        (
+            "_feishu_send_with_retry",
+            _hfc_feishu_send_with_native_handoff_tracking,
+            "_hfc_original_feishu_send_with_retry",
+        ),
+        (
+            "_send_raw_message",
+            _hfc_send_raw_message_with_native_handoff_route,
+            "_hfc_original_send_raw_message",
+        ),
+        (
+            "_build_reply_message_body",
+            _hfc_build_reply_message_body_with_native_uuid,
+            "_hfc_original_build_reply_message_body",
+        ),
+        (
+            "_build_create_message_body",
+            _hfc_build_create_message_body_with_native_uuid,
+            "_hfc_original_build_create_message_body",
+        ),
+    )
+    for method_name, wrapper, original_name in required_methods:
+        if getattr(adapter_type, method_name, None) is not wrapper:
+            return False
+        if not callable(getattr(adapter_type, original_name, None)):
+            return False
+    ledger = sys.modules.get("gateway.delivery_ledger")
+    return bool(
+        ledger is not None
+        and getattr(ledger, "mark_delivered", None)
+        is _hfc_mark_delivery_ledger_delivered_then_ack
+        and getattr(ledger, "mark_failed", None)
+        is _hfc_mark_delivery_ledger_failed_then_clear
+        and callable(getattr(ledger, "_hfc_original_mark_delivered", None))
+        and callable(getattr(ledger, "_hfc_original_mark_failed", None))
+    )
+
+
+def _native_handoff_plan_fingerprint(adapter: Any) -> str:
+    """Fingerprint the exact Feishu chunk, route, and UUID delivery contract.
+
+    A missing source component disables ACK-capable handoff. This deliberately
+    favors Hermes' ordinary fail-open delivery over reusing a descriptor across
+    an adapter upgrade whose chunking or endpoint plan cannot be proven equal.
+    """
+    adapter_type = type(adapter)
+    try:
+        max_length = int(getattr(adapter, "MAX_MESSAGE_LENGTH"))
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if max_length <= 0:
+        return ""
+    adapter_module = sys.modules.get(adapter_type.__module__)
+    helpers_module = sys.modules.get("gateway.platforms.helpers")
+    if helpers_module is None:
+        try:
+            helpers_module = importlib.import_module("gateway.platforms.helpers")
+        except Exception:
+            helpers_module = None
+    if adapter_module is None or helpers_module is None:
+        return ""
+    adapter_semantics = _module_delivery_semantics(adapter_module)
+    strip_markdown_semantics = _callable_delivery_semantics(
+        getattr(helpers_module, "strip_markdown", None)
+    )
+    if adapter_semantics is None or strip_markdown_semantics is None:
+        return ""
+    callables = (
+        getattr(adapter_type, "_hfc_original_send", None),
+        getattr(adapter_type, "format_message", None),
+        getattr(adapter_type, "truncate_message", None),
+        getattr(adapter_type, "_build_outbound_payload", None),
+        getattr(adapter_type, "_hfc_original_feishu_send_with_retry", None),
+        getattr(adapter_type, "_hfc_original_send_raw_message", None),
+        getattr(adapter_type, "_hfc_original_build_reply_message_body", None),
+        getattr(adapter_type, "_hfc_original_build_create_message_body", None),
+        _hfc_send_with_native_command_result_card,
+        _hfc_feishu_send_with_native_handoff_tracking,
+        _hfc_send_raw_message_with_native_handoff_route,
+        _hfc_build_reply_message_body_with_native_uuid,
+        _hfc_build_create_message_body_with_native_uuid,
+        _native_handoff_uuid,
+    )
+    callable_semantics = [_callable_delivery_semantics(value) for value in callables]
+    if any(value is None for value in callable_semantics):
+        return ""
+    semantic_material = json.dumps(
+        {
+            "adapter": adapter_semantics,
+            "strip_markdown": strip_markdown_semantics,
+            "critical_callables": callable_semantics,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    semantic_digest = sha256(semantic_material).hexdigest()
+    cache_key = (adapter_type, max_length, __version__, semantic_digest)
+    cached = _NATIVE_HANDOFF_PLAN_FINGERPRINTS.get(cache_key)
+    if cached:
+        return cached
+    material = json.dumps(
+        {
+            "protocol": NATIVE_HANDOFF_PLAN_PROTOCOL,
+            "package_version": __version__,
+            "adapter_module": adapter_type.__module__,
+            "adapter_qualname": adapter_type.__qualname__,
+            "max_message_length": max_length,
+            "semantic_digest": semantic_digest,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    fingerprint = sha256(material).hexdigest()
+    if len(_NATIVE_HANDOFF_PLAN_FINGERPRINTS) >= 128:
+        _NATIVE_HANDOFF_PLAN_FINGERPRINTS.pop(
+            next(iter(_NATIVE_HANDOFF_PLAN_FINGERPRINTS)),
+            None,
+        )
+    _NATIVE_HANDOFF_PLAN_FINGERPRINTS[cache_key] = fingerprint
+    return fingerprint
+
+
+def _exact_native_route(metadata: Any) -> str:
+    thread_id = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    return "thread-create" if thread_id else "create"
+
+
+def _exact_terminal_payload(
+    stage: dict[str, Any],
+    local_vars: dict[str, Any],
+    *,
+    ack_capable: bool,
+) -> dict[str, Any]:
+    payload = copy.deepcopy(stage["payload"])
+    data = payload.setdefault("data", {})
+    content = str(
+        local_vars.get("content", local_vars.get("text_content", "")) or ""
+    )
+    exact_thread_id = _metadata_thread_id(
+        local_vars.get("metadata") if isinstance(local_vars.get("metadata"), dict) else None
+    )
+    if exact_thread_id:
+        payload["thread_id"] = exact_thread_id
+    else:
+        payload.pop("thread_id", None)
+    attachments = _exact_base_attachments(local_vars)
+    has_base_attachments = _exact_base_has_attachments(local_vars)
+    data["answer"] = content
+    data["attachments"] = attachments
+    data["native_delivery"] = "required" if has_base_attachments else "allowed"
+    prior_handoff = data.get("native_handoff")
+    generation = (
+        str(prior_handoff.get("generation") or "")
+        if isinstance(prior_handoff, dict)
+        else ""
+    )
+    handoff: dict[str, Any] = {"generation": generation}
+    if ack_capable:
+        obligation_id = str(local_vars.get("obligation_id") or "").strip()
+        plan_fingerprint = str(local_vars.get("plan_fingerprint") or "")
+        obligation_key = _native_handoff_obligation_key(obligation_id)
+        content_hash = _native_handoff_content_hash(content)
+        route = _exact_native_route(local_vars.get("metadata"))
+        target_hash = derive_native_handoff_target_hash(
+            profile_id=str(data.get("profile_id") or ""),
+            chat_id=str(payload.get("chat_id") or ""),
+            thread_id=exact_thread_id,
+            route=route,
+        )
+        handoff.update(
+            {
+                "capabilities": [
+                    "native-ack-v2",
+                    "stable-feishu-uuid-v2",
+                    "exact-base-delivery-v1",
+                ],
+                "obligation_key": obligation_key,
+                "content_hash": content_hash,
+                "plan_fingerprint": plan_fingerprint,
+                "route": route,
+                "target_hash": target_hash,
+                "provisional_uuid_seed": derive_native_handoff_uuid_seed(
+                    obligation_key=obligation_key,
+                    content_hash=content_hash,
+                    plan_fingerprint=plan_fingerprint,
+                    route=route,
+                    target_hash=target_hash,
+                ),
+            }
+        )
+    data["native_handoff"] = handoff
+    return payload
+
+
+async def _recover_exact_terminal_native_handoff(
+    payload: dict[str, Any],
+    *,
+    event_url: str,
+    timeout: float,
+) -> bool:
+    binding = _native_handoff_binding_from_payload(payload)
+    if binding is None:
+        return False
+    recovery_payload = _native_handoff_recovery_payload(binding)
+    recovery_url = _summary_base_url(event_url) + "/native-handoff/recover"
+    status, descriptor = await _lookup_native_handoff_descriptor(
+        recovery_url,
+        recovery_payload,
+        timeout,
+    )
+    if status == "found" and descriptor is not None:
+        _install_native_handoff_context(binding, descriptor)
+        return True
+    if status == "unknown":
+        _install_provisional_native_handoff(
+            binding,
+            recovery_url=recovery_url,
+            recovery_timeout=timeout,
+            recovery_payload=recovery_payload,
+            recovery=False,
+        )
+        return True
+    return False
+
+
+def admission_completion_mode(local_vars: dict[str, Any]) -> str:
+    from .admission_completion import (
+        _prepare_failed,
+        admission_identity_ready,
+        admission_readiness_reason,
+        extractor_available,
+        mode,
+        unsupported_reason,
+    )
+    value = mode(local_vars)
+    if value == "native":
+        _hfc_warn("admission completion retains native: " + unsupported_reason())
+    if value == "handoff":
+        if not admission_identity_ready(local_vars):
+            _prepare_failed(admission_readiness_reason(local_vars))
+            return "native"
+        if _admission_default_profile_unverified(local_vars):
+            _prepare_failed("profile-default-unverified")
+            return "native"
+        runner = local_vars.get("self")
+        try:
+            adapter = runner._adapter_for_source(local_vars.get("source"))
+            available = extractor_available(adapter)
+        except Exception:
+            available = False
+        if not available:
+            _hfc_warn("admission completion retains native: missing-or-unverified-extraction-seam")
+            return "native"
+    return value
+
+
+def _admission_default_profile_unverified(local_vars: dict[str, Any]) -> bool:
+    """Do not guess that an arbitrary multiplex HOME is the default bot."""
+    runner = local_vars.get("self") or local_vars.get("runner")
+    registered = _GATEWAY_RUNNER_REF() if _GATEWAY_RUNNER_REF is not None else None
+    multiplex = any(
+        getattr(getattr(item, "config", None), "multiplex_profiles", False) is True
+        for item in (runner, registered)
+    )
+    if not multiplex:
+        return False
+    _profile, source = _profile_identity(
+        local_vars, local_vars.get("source"), local_vars.get("message")
+    )
+    if source != "fallback_default":
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+        selected = Path(get_hermes_home()).expanduser().resolve()
+        standard_default = (Path.home() / ".hermes").resolve()
+        return selected != standard_default
+    except Exception:
+        return True
+
+
+def capture_admission_base_extraction(local_vars: dict[str, Any]) -> None:
+    from .admission_completion import consume_extracted
+    event = local_vars.get("event")
+    profile, _ = _profile_identity({}, getattr(event, "source", None), None)
+    stage = consume_extracted(local_vars, profile)
+    if stage is not None:
+        _HFC_EXACT_COMPLETION_STAGE.set(stage)
+
+
+async def _finish_admission_delivery(event: Any, succeeded: bool) -> None:
+    stage = _exact_completion_stage_for_current_task()
+    if stage is None or stage.get("_admission_event") is not event:
+        return
+    try:
+        if succeeded:
+            # The original no-waiter function has finished attachments.
+            # A missing standalone send carries no native-text ACK.
+            await finalize_exact_base_no_text({
+                **stage.get("base_context", {}), "event": event,
+                "content": stage.get("_admission_text") or "",
+                "metadata": {"thread_id": stage.get("payload", {}).get("thread_id", "")},
+            })
+    finally:
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+
+
+def capture_decomposed_base_context(local_vars: dict[str, Any]) -> None:
+    """Carry extracted attachments across Base's helper call in this exact turn."""
+    stage = _exact_completion_stage_for_current_task()
+    if stage is not None:
+        stage["base_context"] = {
+            key: local_vars[key] for key in ("images", "local_files", "media_files")
+        }
+
+
+async def prepare_decomposed_base_final_delivery(
+    local_vars: dict[str, Any],
+) -> tuple[Any, str, Any, Any]:
+    stage = _exact_completion_stage_for_current_task()
+    if stage is not None:
+        context = stage.pop("base_context", None)
+        if not isinstance(context, dict):
+            # Missing extraction evidence must never grant a text-only ACK.
+            _HFC_EXACT_COMPLETION_STAGE.set(None)
+            _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+            return (local_vars.get("delivery_adapter"), str(local_vars.get("content") or ""),
+                    local_vars.get("reply_to"), local_vars.get("metadata"))
+        local_vars = {**local_vars, **context}
+    return await prepare_exact_base_final_delivery(local_vars)
+
+
+async def prepare_exact_base_final_delivery(
+    local_vars: dict[str, Any],
+) -> tuple[Any, str, Any, Any]:
+    """Commit exact Base terminal state after Hermes ledger is attempting."""
+    from .admission_completion import diagnose_attempt
+
+    adapter = local_vars.get("delivery_adapter")
+    content = str(local_vars.get("content") or "")
+    reply_to = local_vars.get("reply_to")
+    metadata = local_vars.get("metadata")
+    fallback = (adapter, content, reply_to, metadata)
+    stage = _exact_completion_stage_for_current_task()
+    if stage is None or adapter is None or not content:
+        return fallback
+    attempt = None
+    try:
+        obligation_id = str(local_vars.get("obligation_id") or "").strip()
+        plan_fingerprint = _native_handoff_plan_fingerprint(adapter)
+        ack_capable = bool(
+            obligation_id
+            and _is_lower_hex(plan_fingerprint, 64)
+            and _native_handoff_runtime_wrappers_ready(adapter)
+            and not _exact_base_has_attachments(local_vars)
+            and _exact_stage_allows_ack(stage)
+        )
+        normal_reason = "ack-not-capable" if not ack_capable else ""
+        payload = _exact_terminal_payload(
+            stage,
+            {
+                **local_vars,
+                "plan_fingerprint": plan_fingerprint,
+            },
+            ack_capable=ack_capable,
+        )
+        if ack_capable and not is_exact_native_text_scope(payload.get("data")):
+            ack_capable = False
+            normal_reason = "ack-not-exact-scope"
+            payload = _exact_terminal_payload(
+                stage,
+                {
+                    **local_vars,
+                    "plan_fingerprint": plan_fingerprint,
+                },
+                ack_capable=False,
+            )
+        event_url = str(stage["event_url"])
+        timeout = float(stage["timeout_seconds"])
+        try:
+            if "_admission_claim" in stage:
+                result, attempt = await _post_admission_terminal(
+                    stage, payload, local_vars, adapter, event_url, timeout
+                )
+                if attempt is None:
+                    diagnose_attempt(stage, "ack-stage-invalidated")
+                    return fallback
+            else:
+                result = await _post_json_ordered_response(event_url, payload, timeout)
+        except Exception:
+            diagnose_attempt(stage, "ack-transport-error")
+            if ack_capable:
+                await _recover_exact_terminal_native_handoff(
+                    payload,
+                    event_url=event_url,
+                    timeout=timeout,
+                )
+            return fallback
+        applied = _event_was_applied(result, strict=True)
+        if attempt is not None and applied:
+            # The sidecar has accepted this exact terminal. Do not reinterpret
+            # the old send as a new owner's claim after this await; consume only
+            # the frozen, single-use acknowledgement of the submitted request.
+            if _HFC_EXACT_COMPLETION_STAGE.get() is not stage or not attempt.consume(result):
+                attempt.revoke()
+                diagnose_attempt(stage, "ack-stage-invalidated")
+                return fallback
+        elif "_admission_claim" in stage:
+            from .admission_completion import valid_consumed
+            if not valid_consumed(stage):
+                diagnose_attempt(stage, "ack-stage-invalidated")
+                return fallback
+        if not applied:
+            if attempt is not None:
+                attempt.revoke()
+            diagnose_attempt(stage, "ack-not-applied")
+        if ack_capable and not applied:
+            registered = _register_native_handoff_descriptor(payload, result)
+            if not registered:
+                await _recover_exact_terminal_native_handoff(
+                    payload,
+                    event_url=event_url,
+                    timeout=timeout,
+                )
+        if applied:
+            if normal_reason:
+                diagnose_attempt(stage, normal_reason, consume=False)
+            return (
+                _ExactCardDeliveryAdapterProxy(adapter),
+                content,
+                reply_to,
+                metadata,
+            )
+        return fallback
+    except Exception:
+        diagnose_attempt(stage, "ack-stage-invalidated")
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return fallback
+    finally:
+        if attempt is not None:
+            try:
+                attempt.revoke()
+            except BaseException:
+                pass
+        if _HFC_EXACT_COMPLETION_STAGE.get() is stage:
+            _HFC_EXACT_COMPLETION_STAGE.set(None)
+
+
+async def _post_admission_terminal(
+    stage: dict[str, Any], payload: dict[str, Any], values: dict[str, Any],
+    adapter: Any, url: str, timeout: float,
+) -> tuple[Any, Any]:
+    """Bound the queue and send; freeze the live claim only after the lock."""
+    from .admission_completion import begin_applied_attempt
+
+    deadline = time.monotonic() + timeout
+    lock = _send_lock(url, payload)
+    acquired = False
+    attempt = None
+    try:
+        if lock is not None:
+            await asyncio.wait_for(lock.acquire(), timeout=max(0.0, deadline - time.monotonic()))
+            acquired = True
+        if _HFC_EXACT_COMPLETION_STAGE.get() is not stage:
+            return None, None
+        attempt = begin_applied_attempt(stage, payload, values, adapter)
+        if attempt is None:
+            return None, None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        result = await asyncio.wait_for(
+            _post_json_response(url, payload, remaining), timeout=remaining
+        )
+        return result, attempt
+    except BaseException:
+        if attempt is not None:
+            try:
+                attempt.revoke()
+            except BaseException:
+                pass
+        raise
+    finally:
+        if acquired:
+            lock.release()
+
+
+async def finalize_exact_base_no_text(local_vars: dict[str, Any]) -> None:
+    """Finalize a staged terminal whose Base path has no standalone text."""
+    stage = _exact_completion_stage_for_current_task()
+    if stage is None:
+        return
+    try:
+        from .admission_completion import diagnose_attempt
+
+        payload = _exact_terminal_payload(stage, local_vars, ack_capable=False)
+        await _post_json_ordered_response(
+            str(stage["event_url"]),
+            payload,
+            float(stage["timeout_seconds"]),
+        )
+    except Exception:
+        try:
+            diagnose_attempt(stage, "ack-transport-error")
+        except Exception:
+            pass
+    finally:
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+
+
+def _event_was_applied(result: Any, *, strict: bool = True) -> bool:
+    # Only an explicit sidecar commit may suppress Hermes' native delivery.
+    # Empty/legacy/malformed 2xx responses stay fail-open.
+    if strict:
+        return (
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and result.get("applied") is True
+        )
+    if not isinstance(result, dict):
+        return True
+    return result.get("ok") is not False and result.get("applied") is not False
+
+
+def _register_native_media_text_suppression(
+    payload: dict[str, Any], *, applied: bool
+) -> None:
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+    if not applied:
+        return
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return
+    if str(data.get("native_delivery") or "").strip().lower() != "required":
+        return
+    chat_id = str(payload.get("chat_id") or "").strip()
+    content = str(data.get("answer") or "").strip()
+    if not chat_id or not content:
+        return
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(
+        _NativeMediaTextSuppression(chat_id=chat_id, content=content)
+    )
+
+
+def _should_suppress_matching_native_media_text(chat_id: Any, content: Any) -> bool:
+    pending = _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.get()
+    if pending is None:
+        return False
+    if str(chat_id or "").strip() != pending.chat_id:
+        return False
+    visible_content = _card_visible_answer(str(content or ""))
+    if visible_content != pending.content:
+        return False
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+    return True
+
+
+def _cron_policy_local_vars(local_vars: dict[str, Any]) -> dict[str, Any] | None:
+    job = local_vars.get("job")
+    if not isinstance(job, dict):
+        return None
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        origin = {}
+    resolved_targets = _resolved_cron_targets(local_vars, job)
+    platform = str(
+        _extract_real_platform(job.get("deliver"))
+        or _first_target_platform(resolved_targets)
+        or origin.get("platform")
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_PLATFORM")
+        or "feishu"
+    ).strip().lower()
+    origin_chat_id = (
+        origin.get("chat_id")
+        if str(origin.get("platform") or "").strip().lower() == "feishu"
+        else ""
+    )
+    chat_id = str(
+        _resolved_target_chat_id(resolved_targets, "feishu")
+        or _deliver_chat_id(job.get("deliver"))
+        or origin_chat_id
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+        or ""
+    ).strip()
+    if platform != "feishu" or not chat_id:
+        return None
+    return {
+        **local_vars,
+        "platform": "feishu",
+        "chat_id": chat_id,
+        "conversation_id": str(job.get("id") or chat_id),
+    }
+
+
+def emit_cron_delivery(local_vars: dict[str, Any]) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        _ensure_runtime_control_started(config)
+        policy_locals = _cron_policy_local_vars(local_vars)
+        if policy_locals is None:
+            return False
+        if not _policy_gate_sync(
+            config,
+            policy_locals,
+            "message.completed",
+        ).card:
+            return False
+        payload = build_cron_event(local_vars)
+        if payload is None:
+            return False
+        result = _post_json_sync_response(
+            config.event_url,
+            payload,
+            TERMINAL_TIMEOUT_SECONDS,
+        )
+        _register_native_handoff_descriptor(payload, result)
+        return _event_was_applied(result, strict=True)
+    except Exception:
+        return False
+
+
+def handle_hfc_command_from_hermes_locals(local_vars: dict[str, Any]) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        source_obj = local_vars.get("source")
+        if _platform_name(local_vars, source_obj) != "feishu":
+            return False
+        command = _parse_hfc_command(_command_text(local_vars))
+        if command is None:
+            return False
+        message_obj = local_vars.get("message")
+        gateway_event_obj = local_vars.get("event")
+        chat_id = _first_string(local_vars, ("chat_id", "open_chat_id", "receive_id"))
+        if chat_id is None:
+            chat_id = _first_attr_string(
+                message_obj, ("chat_id", "open_chat_id", "receive_id")
+            )
+        if chat_id is None:
+            chat_id = _first_attr_string(
+                source_obj, ("chat_id", "open_chat_id", "receive_id")
+            )
+        if chat_id is None:
+            return False
+        message_id = _first_string(
+            local_vars, ("message_id", "msg_id", "event_message_id")
+        ) or _first_attr_string(
+            message_obj, ("message_id", "msg_id")
+        ) or _first_attr_string(
+            gateway_event_obj, ("message_id", "msg_id")
+        )
+        if not message_id:
+            return False
+        profile_id, profile_source = _profile_identity(local_vars, source_obj, message_obj)
+        payload = {
+            "command": command,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "thread_id": _thread_id_for_runtime_event(local_vars, message_obj, source_obj),
+            "reply_to_message_id": _reply_to_message_id_from_runtime(
+                local_vars,
+                message_obj,
+                gateway_event_obj,
+            ),
+            "profile_id": profile_id,
+            "profile_source": profile_source,
+            "chat_type": _command_chat_type(
+                local_vars, source_obj, gateway_event_obj
+            ),
+            "operator": _command_operator(
+                local_vars, source_obj, gateway_event_obj
+            ),
+            "created_at": _created_at(local_vars.get("created_at")),
+            "platform": "feishu",
+        }
+        if command == "doctor":
+            root_secret = read_transport_root_secret()
+            if root_secret is None:
+                return False
+            payload["adapter_command_proof"] = sign_command_transport_proof(
+                root_secret,
+                payload,
+                timestamp=int(time.time()),
+                nonce=secrets.token_urlsafe(18),
+            )
+        url = f"{_summary_base_url(config.event_url)}/commands"
+        if command != "doctor":
+            return _post_json_sync(url, payload, config.timeout_seconds)
+        result = _post_json_sync_response(url, payload, config.timeout_seconds)
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return False
+        operation_id = str(result.get("operation_id") or "").strip()
+        if not operation_id:
+            return False
+        _remember_operation_transport(
+            operation_id,
+            derive_operation_transport_secret(root_secret, operation_id),
+            profile_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _remember_operation_transport(
+    operation_id: str,
+    secret: str | bytes,
+    profile_id: str | None = None,
+    transport_lineage_id: str = "",
+) -> None:
+    operation_id = str(operation_id or "").strip()
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
+    if not operation_id or not isinstance(secret_bytes, bytes) or len(secret_bytes) < 16:
+        return
+    now = time.time()
+    with _OPERATION_TRANSPORT_SECRETS_LOCK:
+        _prune_operation_transport_secrets_locked(now)
+        existing = _OPERATION_TRANSPORT_SECRETS.get(operation_id)
+        trusted_profile_id = (
+            str(profile_id).strip()
+            if isinstance(profile_id, str) and profile_id.strip()
+            else existing[1] if existing is not None else "default"
+        )
+        context = (
+            secret_bytes,
+            trusted_profile_id,
+            now + _OPERATION_TRANSPORT_SECRET_TTL_SECONDS,
+        )
+        _OPERATION_TRANSPORT_SECRETS[operation_id] = context
+        lineage_id = str(transport_lineage_id or "").strip()
+        if lineage_id:
+            _OPERATION_TRANSPORT_SECRETS[lineage_id] = context
+        while len(_OPERATION_TRANSPORT_SECRETS) > _OPERATION_TRANSPORT_SECRET_LIMIT:
+            _OPERATION_TRANSPORT_SECRETS.pop(
+                next(iter(_OPERATION_TRANSPORT_SECRETS))
+            )
+
+
+def _operation_transport_context(operation_id: str) -> tuple[bytes, str] | None:
+    now = time.time()
+    with _OPERATION_TRANSPORT_SECRETS_LOCK:
+        _prune_operation_transport_secrets_locked(now)
+        item = _OPERATION_TRANSPORT_SECRETS.get(operation_id)
+        return (item[0], item[1]) if item is not None else None
+
+
+def _transport_secret_for_token(token: str) -> bytes | None:
+    operation_id = _operation_id_from_token(token)
+    context = _operation_transport_context(operation_id) if operation_id else None
+    return context[0] if context is not None else None
+
+
+def _operation_id_from_token(token: str) -> str:
+    try:
+        if not isinstance(token, str) or not token or len(token) > 2048:
+            return ""
+        encoded, _signature = token.rsplit(".", 1)
+        padding = "=" * (-len(encoded) % 4)
+        decoded = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        if len(decoded) > 1024:
+            return ""
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return ""
+        operation_id = payload.get("operation_id")
+        return str(operation_id).strip() if isinstance(operation_id, str) else ""
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+
+def _prune_operation_transport_secrets_locked(now: float) -> None:
+    for operation_id, (_secret, _profile_id, expires_at) in list(
+        _OPERATION_TRANSPORT_SECRETS.items()
+    ):
+        if expires_at <= now:
+            _OPERATION_TRANSPORT_SECRETS.pop(operation_id, None)
+
+
+def _command_text(local_vars: dict[str, Any]) -> str:
+    text = _first_raw_string(local_vars, ("text", "content", "message_text", "query"))
+    if text is not None:
+        return text
+    message_obj = local_vars.get("message")
+    text = _first_attr_raw_string(message_obj, ("text", "content"))
+    if text is not None:
+        return text
+    gateway_event_obj = local_vars.get("event")
+    text = _first_attr_raw_string(gateway_event_obj, ("text", "content"))
+    return text or ""
+
+
+def _command_chat_type(
+    local_vars: dict[str, Any], source_obj: Any, gateway_event_obj: Any
+) -> str:
+    message_obj = local_vars.get("message")
+    return (
+        _first_string(local_vars, ("chat_type",))
+        or _first_attr_string(message_obj, ("chat_type",))
+        or _first_attr_string(source_obj, ("chat_type",))
+        or _first_attr_string(gateway_event_obj, ("chat_type",))
+        or ""
+    )
+
+
+def _command_operator(
+    local_vars: dict[str, Any], source_obj: Any, gateway_event_obj: Any
+) -> str:
+    aliases = ("operator_open_id", "sender_open_id", "open_id")
+    direct = _first_string(local_vars, aliases)
+    if direct:
+        return direct
+    message_obj = local_vars.get("message")
+    for candidate in (
+        local_vars.get("operator"),
+        local_vars.get("sender_id"),
+        getattr(message_obj, "operator", None),
+        getattr(message_obj, "sender_id", None),
+        getattr(source_obj, "operator", None),
+        getattr(source_obj, "sender_id", None),
+        getattr(gateway_event_obj, "operator", None),
+        getattr(gateway_event_obj, "sender_id", None),
+    ):
+        value = _first_attr_string(candidate, ("open_id",))
+        if value:
+            return value
+    return ""
+
+
+def _message_sender_open_id(
+    local_vars: dict[str, Any], source_obj: Any, gateway_event_obj: Any
+) -> str:
+    candidate = _command_operator(local_vars, source_obj, gateway_event_obj)
+    if not candidate:
+        candidate = _hfc_resume_operator_open_id(gateway_event_obj)
+    return (
+        candidate
+        if type(candidate) is str and _FEISHU_OPEN_ID_RE.fullmatch(candidate)
+        else ""
+    )
+
+
+def _message_admission_user_id(source_obj: Any) -> str:
+    """Keep the native admission identity separate from a Feishu mention open_id."""
+    candidate = getattr(source_obj, "user_id", None)
+    if (
+        type(candidate) is str
+        and candidate.strip()
+        and len(candidate) <= 256
+    ):
+        return candidate
+    return ""
+
+
+def _parse_hfc_command(text: str) -> str | None:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return None
+    match = re.match(r"^/hfc(?:\s+([A-Za-z0-9_-]+))?\s*$", stripped, re.IGNORECASE)
+    if not match:
+        return None
+    command = (match.group(1) or "help").lower()
+    if command not in {"help", "status", "doctor", "monitor"}:
+        return "help"
+    return command
+
+
+def _reply_to_message_id_from_runtime(
+    local_vars: dict[str, Any],
+    message_obj: Any,
+    gateway_event_obj: Any,
+) -> str:
+    aliases = ("reply_to_message_id", "quote_message_id", "parent_message_id")
+    source_obj = local_vars.get("source")
+    value = (
+        _first_string(local_vars, aliases)
+        or _first_attr_string(message_obj, aliases)
+        or _first_attr_string(gateway_event_obj, aliases)
+        or _first_attr_string(source_obj, aliases)
+    )
+    if not value:
+        source_message_id = _first_attr_string(
+            source_obj, ("message_id", "msg_id", "event_message_id")
+        )
+        event_message_id = _message_id_from_local_vars(local_vars)
+        if (
+            source_message_id
+            and source_message_id != event_message_id
+            and _thread_id_for_runtime_event(local_vars, message_obj, source_obj)
+        ):
+            value = source_message_id
+    return value or ""
+
+
+def build_interaction_event(
+    local_vars: dict[str, Any],
+    *,
+    kind: str,
+    interaction_id: str,
+    prompt: str,
+    options: list[dict[str, Any]] | None = None,
+    description: str = "",
+    timeout_seconds: float | None = None,
+    fallback_policy: str = "",
+    multi_select: bool = False,
+    allow_custom_input: bool | None = None,
+) -> dict[str, Any] | None:
+    if allow_custom_input is None:
+        allow_custom_input = kind == "clarify"
+    event_locals = {
+        **local_vars,
+        "_hfc_interaction_id": interaction_id,
+        "_hfc_interaction_kind": kind,
+        "_hfc_interaction_prompt": prompt,
+        "_hfc_interaction_description": description,
+        "_hfc_interaction_options": options or [],
+        "_hfc_interaction_timeout_seconds": timeout_seconds,
+        "_hfc_interaction_fallback_policy": fallback_policy,
+        "_hfc_interaction_multi_select": bool(multi_select),
+        "_hfc_interaction_allow_custom_input": bool(allow_custom_input),
+    }
+    payload = build_event("interaction.requested", event_locals)
+    if payload is not None and kind == "approval" and local_vars.get("_hfc_pause_approval") is True:
+        payload["data"]["pause_on_timeout"] = True
+    return payload
+
+
+def request_interaction_from_hermes_locals(
+    local_vars: dict[str, Any],
+    *,
+    kind: str,
+    interaction_id: str,
+    prompt: str,
+    options: list[dict[str, Any]] | None = None,
+    description: str = "",
+    timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
+    multi_select: bool = False,
+    allow_custom_input: bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            _hfc_warn(
+                "interaction request skipped: config disabled "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return None
+        _hfc_eager_ensure_command_card_hooks(local_vars)
+        gate = _policy_gate_sync(config, local_vars, "interaction.requested")
+        if not gate.card:
+            _hfc_warn(
+                "interaction request denied by policy gate "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return None
+        payload = build_interaction_event(
+            local_vars,
+            kind=kind,
+            interaction_id=interaction_id,
+            prompt=prompt,
+            options=options or [],
+            description=description,
+            # The card window is deliberately shorter than the wait below for approvals: an
+            # approval that expires while the waiter is still here can be re-armed from its card,
+            # whereas one that outlives the waiter leaves a button nothing can answer.
+            timeout_seconds=(
+                _approval_card_window(timeout_seconds) if kind == "approval" else timeout_seconds
+            ),
+            multi_select=multi_select,
+            allow_custom_input=allow_custom_input,
+        )
+        if payload is None:
+            _hfc_warn(
+                "interaction request skipped: build_event returned None "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return None
+        post_result = _post_interaction_event(
+            local_vars,
+            config.event_url,
+            payload,
+            _timeout_for_event(config, payload["event"]),
+        )
+        if post_result is _POST_FAILED:
+            _hfc_warn(
+                "interaction request failed: POST to sidecar failed "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
+            )
+            # The event may still have been delivered even though the response
+            # was lost (connection dropped mid-flight). Falling straight back to
+            # native text then produces a duplicate: the card was already sent
+            # AND a numbered-list text appears. Ask the sidecar before giving up.
+            if _wait_for_interaction_card_confirmation(config, interaction_id):
+                _hfc_warn(
+                    "interaction card confirmed present after POST failure: "
+                    f"{_hfc_log_reference('interaction', interaction_id)}"
+                )
+                post_result = {"ok": True, "applied": True}
+            else:
+                return None
+        if isinstance(post_result, dict) and post_result.get("ok") is False:
+            _hfc_warn(
+                "interaction request failed: sidecar rejected (kind="
+                + str(kind)
+                + ") "
+                + _hfc_log_reference("interaction", interaction_id)
+                + " post_result="
+                + _hfc_summarize_post_result(post_result)
+            )
+            return None
+        if _uses_text_interaction_fallback(post_result):
+            _hfc_warn(
+                "interaction request text-mode fallback (kind="
+                + str(kind)
+                + ") "
+                + _hfc_log_reference("interaction", interaction_id)
+                + " post_result="
+                + _hfc_summarize_post_result(post_result)
+            )
+            return None
+        if isinstance(post_result, dict) and post_result.get("applied") is False:
+            _hfc_warn(
+                "interaction not applied "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return None
+        base_url = _summary_base_url(config.event_url)
+        url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
+        timeout = _interaction_timeout(timeout_seconds)
+        poll_interval = _interaction_poll_interval(poll_interval_seconds)
+        deadline = time.monotonic() + timeout
+        pause_waiting = False
+        # This wait blocks the agent's execution thread. The gateway kills a run that reports no
+        # activity, which would strand the very card the user is about to click; heartbeat the way
+        # the core's own approval wait does.
+        try:
+            from tools.environments.base import touch_activity_if_due as _touch_activity
+        except Exception:
+            _touch_activity = None
+        _activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+        while True:
+            try:
+                result = _get_json_sync(url, config.timeout_seconds)
+            except Exception:
+                result = None
+            if _touch_activity is not None:
+                _touch_activity(_activity_state, "waiting for user approval")
+            if isinstance(result, dict) and result.get("status") in {"completed", "failed"}:
+                return result
+            if (kind == "approval" and local_vars.get("_hfc_pause_approval") is True
+                    and isinstance(result, dict) and result.get("pause_on_timeout") is True
+                    and result.get("status") in {"pending", "paused"}):
+                # The live approval callback keeps the tool blocked. Expiry only
+                # withdraws the old consent token; it does not resolve a denial.
+                pause_waiting = True
+                deadline = time.monotonic() + timeout
+            current = local_vars.get("_hfc_wait_current")
+            try:
+                still_current = not callable(current) or bool(current())
+            except Exception:
+                still_current = False
+            if not still_current:
+                _post_interaction_timeout_sync(local_vars, config.event_url, payload, config.timeout_seconds)
+                return {"ok": False, "status": "failed", "interaction_id": interaction_id}
+            if time.monotonic() >= deadline:
+                if pause_waiting:
+                    # A temporary sidecar outage is not a user denial either.
+                    # Keep the live callback blocked until consent or cancellation.
+                    deadline = time.monotonic() + timeout
+                    time.sleep(poll_interval)
+                    continue
+                _hfc_warn(
+                    "interaction poll timeout: "
+                    f"{_hfc_log_reference('interaction', interaction_id)}"
+                )
+                _post_interaction_timeout_sync(
+                    local_vars,
+                    config.event_url,
+                    payload,
+                    config.timeout_seconds,
+                )
+                return {
+                    "ok": False,
+                    "status": "timeout",
+                    "interaction_id": interaction_id,
+                }
+            time.sleep(poll_interval)
+    except Exception as exc:
+        _hfc_warn(
+            "interaction request exception: "
+            f"kind={kind} {_hfc_log_reference('interaction', interaction_id)} "
+            f"error={exc.__class__.__name__}"
+        )
+        return None
+
+
+async def request_slash_confirm_from_hermes_locals_async(
+    local_vars: dict[str, Any],
+    *,
+    command: str,
+    title: str,
+    message: str,
+    interaction_id: str,
+    timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
+) -> str | None:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return None
+        if not (
+            await _policy_gate_async(
+                config,
+                local_vars,
+                "interaction.requested",
+            )
+        ).card:
+            return None
+        if _hfc_native_feishu_command_cards_available(local_vars):
+            return None
+        command_text = str(command or "").strip().lstrip("/")
+        prompt = str(title or "").strip() or f"Confirm /{command_text or 'command'}"
+        payload = build_interaction_event(
+            local_vars,
+            kind="slash_confirm",
+            interaction_id=interaction_id,
+            prompt=prompt,
+            description=str(message or "").strip(),
+            options=[
+                {"label": "允许一次", "value": "once", "style": "primary"},
+                {"label": "始终允许", "value": "always"},
+                {"label": "取消", "value": "cancel", "style": "danger"},
+            ],
+            timeout_seconds=timeout_seconds,
+            fallback_policy="native_text",
+        )
+        if payload is None:
+            return None
+        try:
+            post_result = await _post_json_ordered_response(
+                config.event_url,
+                payload,
+                _timeout_for_event(config, payload["event"]),
+            )
+        except Exception:
+            return None
+        if isinstance(post_result, dict) and post_result.get("ok") is False:
+            return None
+        if _uses_text_interaction_fallback(post_result):
+            return None
+        if isinstance(post_result, dict) and post_result.get("applied") is False:
+            for _ in range(2):
+                await asyncio.sleep(0.05)
+                payload = build_interaction_event(
+                    local_vars,
+                    kind="slash_confirm",
+                    interaction_id=interaction_id,
+                    prompt=prompt,
+                    description=str(message or "").strip(),
+                    options=[
+                        {"label": "允许一次", "value": "once", "style": "primary"},
+                        {"label": "始终允许", "value": "always"},
+                        {"label": "取消", "value": "cancel", "style": "danger"},
+                    ],
+                    timeout_seconds=timeout_seconds,
+                    fallback_policy="native_text",
+                )
+                if payload is None:
+                    return None
+                try:
+                    post_result = await _post_json_ordered_response(
+                        config.event_url,
+                        payload,
+                        _timeout_for_event(config, payload["event"]),
+                    )
+                except Exception:
+                    return None
+                if isinstance(post_result, dict) and post_result.get("ok") is False:
+                    return None
+                if _uses_text_interaction_fallback(post_result):
+                    return None
+                if not (
+                    isinstance(post_result, dict)
+                    and post_result.get("applied") is False
+                ):
+                    break
+            else:
+                return None
+        base_url = _summary_base_url(config.event_url)
+        url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
+        timeout = _interaction_timeout(timeout_seconds)
+        poll_interval = _interaction_poll_interval(poll_interval_seconds)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                result = await _get_json(url, config.timeout_seconds)
+            except Exception:
+                result = None
+            if isinstance(result, dict) and result.get("status") == "completed":
+                choice = str(result.get("choice") or "").strip()
+                if choice in {"once", "always", "cancel"}:
+                    return choice
+                return None
+            if isinstance(result, dict) and result.get("status") == "failed":
+                return None
+            if time.monotonic() >= deadline:
+                await _post_interaction_timeout_async(
+                    config.event_url,
+                    payload,
+                    config.timeout_seconds,
+                )
+                return None
+            await asyncio.sleep(poll_interval)
+    except Exception:
+        return None
+
+
+def _uses_text_interaction_fallback(result: Any) -> bool:
+    return (
+        isinstance(result, dict)
+        and str(result.get("interaction_mode") or "").strip().lower()
+        in {"text", "markdown", "reply"}
+    )
+
+
+def _hfc_eager_runner_from_turn_context(local_vars: dict[str, Any], source: Any) -> Any:
+    """Recover closure ownership only through the exact live turn/adapter route."""
+    ctx = local_vars.get("_hfc_turn_ctx") or local_vars.get("ctx")
+    if ctx is None or getattr(ctx, "source", None) is not source:
+        return None
+    expected_adapter = getattr(ctx, "_status_adapter", None)
+    if expected_adapter is None or getattr(expected_adapter, "_client", None) is None:
+        return None
+    candidates = []
+    # Nested callbacks capture ctx, but Python does not include run_sync's self
+    # in their locals. Hermes wires these bound methods before creating them.
+    for name in ("progress_callback", "_status_callback_sync"):
+        callback_owner = getattr(getattr(ctx, name, None), "__self__", None)
+        if callback_owner is not None and getattr(callback_owner, "_ctx", None) is ctx:
+            candidate = getattr(callback_owner, "_runner", None)
+            if candidate is not None:
+                candidates.append(candidate)
+    # Older contexts may not retain bound methods. Use the remembered Gateway
+    # only when its profile-aware resolver returns the very same live adapter.
+    with _GATEWAY_RUNNER_LOCK:
+        reference = _GATEWAY_RUNNER_REF
+    if reference is not None:
+        remembered = reference()
+        if remembered is not None:
+            candidates.append(remembered)
+    for candidate in candidates:
+        if _hfc_feishu_adapter_from_runner(candidate, source) is expected_adapter:
+            return candidate
+    return None
+
+
+def _hfc_eager_ensure_command_card_hooks(local_vars: dict[str, Any]) -> bool:
+    """Wire the first interaction even when optional startup hooks were unavailable.
+
+    Resolve through the actual turn's runner/profile contract. A connected SDK
+    dispatcher is refreshed in place by the installer; no connect wrapper or
+    transport reconstruction is needed. New transports bind the patched method.
+    """
+    try:
+        owner = local_vars.get("self")
+        source = local_vars.get("source") or getattr(local_vars.get("event"), "source", None)
+        if source is None or _platform_name(local_vars, source) != "feishu":
+            return False
+        # Current Hermes moves callbacks into TurnRunner; legacy hooks still
+        # receive GatewayRunner as self. Never guess another profile's adapter.
+        runner = local_vars.get("runner") or getattr(owner, "_runner", None) or owner
+        if runner is None:
+            runner = _hfc_eager_runner_from_turn_context(local_vars, source)
+        adapter = _hfc_feishu_adapter_from_runner(runner, source)
+        if adapter is None:
+            return False
+        adapter_type = type(adapter)
+        if (getattr(adapter_type, "_hfc_command_card_methods_installed", False)
+                and getattr(adapter_type, "_on_card_action_trigger", None)
+                is _hfc_on_feishu_card_action_trigger
+                and getattr(adapter_type, "_handle_card_action_event", None)
+                is _hfc_handle_feishu_card_action_event):
+            _hfc_refresh_feishu_event_handler(adapter)
+            return True
+        return install_feishu_command_card_adapter_methods(runner)
+    except Exception:
+        return False
+
+
+def _hfc_native_feishu_command_cards_available(local_vars: dict[str, Any]) -> bool:
+    try:
+        source_obj = local_vars.get("source")
+        if _platform_name(local_vars, source_obj) != "feishu":
+            return False
+        runner = local_vars.get("self") or local_vars.get("runner")
+        adapter = _hfc_feishu_adapter_from_runner(runner, source_obj)
+        if adapter is None or not getattr(adapter, "_client", None):
+            return False
+        if not hasattr(adapter, "_feishu_send_with_retry"):
+            return False
+        install_feishu_command_card_adapter_methods(runner)
+        return callable(getattr(adapter, "send_slash_confirm", None))
+    except Exception:
+        return False
+
+
+def _is_feishu_adapter_key(key: Any, adapter: Any) -> bool:
+    key_text = str(getattr(key, "value", key) or "").strip().lower()
+    if key_text == "feishu":
+        return True
+    name = str(getattr(adapter, "name", "") or "").strip().lower()
+    if name == "feishu":
+        return True
+    platform = getattr(adapter, "platform", None)
+    return str(getattr(platform, "value", platform) or "").strip().lower() == "feishu"
+
+
+async def _hfc_send_model_picker(
+    self,
+    chat_id: str,
+    providers: Any,
+    current_model: str = "",
+    current_provider: str = "",
+    session_key: str = "",
+    on_model_selected: Any = None,
+    metadata: dict[str, Any] | None = None,
+):
+    try:
+        options = _model_picker_options(providers, current_model=current_model)
+        if not options:
+            return _send_result(False, error="no model options")
+        reply_to = _metadata_reply_to(metadata)
+        message_id = reply_to or "model_" + sha256(
+            f"{chat_id}:{session_key}:{time.time()}".encode("utf-8")
+        ).hexdigest()[:16]
+        interaction_id = "model_" + sha256(
+            f"{chat_id}:{session_key}:{message_id}".encode("utf-8")
+        ).hexdigest()[:16]
+        prompt = "选择模型"
+        description_parts = []
+        if current_model:
+            description_parts.append(f"当前模型：`{current_model}`")
+        if current_provider:
+            description_parts.append(f"当前 provider：`{current_provider}`")
+        choice = await _request_command_card_choice_async(
+            {
+                "chat_id": chat_id,
+                "conversation_id": session_key or chat_id,
+                "message_id": message_id,
+                "reply_to_message_id": reply_to,
+            },
+            kind="model_picker",
+            interaction_id=interaction_id,
+            prompt=prompt,
+            description="\n".join(description_parts),
+            options=options,
+        )
+        if choice is None:
+            return _send_result(False, error="model picker card unavailable")
+        selected = _parse_model_picker_choice(choice)
+        if selected is None:
+            await complete_command_card_from_hermes_locals_async(
+                {
+                    "chat_id": chat_id,
+                    "conversation_id": session_key or chat_id,
+                    "message_id": message_id,
+                },
+                answer="模型选择无效，请重新发送 `/model`。",
+            )
+            return _send_result(True, message_id=message_id)
+        provider_slug, model_id = selected
+        if on_model_selected is None:
+            result_text = f"已选择 {provider_slug}/{model_id}"
+        else:
+            result_text = await on_model_selected(chat_id, model_id, provider_slug)
+        await complete_command_card_from_hermes_locals_async(
+            {
+                "chat_id": chat_id,
+                "conversation_id": session_key or chat_id,
+                "message_id": message_id,
+            },
+            answer=result_text,
+        )
+        return _send_result(True, message_id=message_id)
+    except Exception as exc:
+        return _send_result(False, error=str(exc))
+
+
+async def _request_command_card_choice_async(
+    local_vars: dict[str, Any],
+    *,
+    kind: str,
+    interaction_id: str,
+    prompt: str,
+    options: list[dict[str, Any]],
+    description: str = "",
+    timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
+) -> str | None:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return None
+        if not (
+            await _policy_gate_async(
+                config,
+                local_vars,
+                "interaction.requested",
+            )
+        ).card:
+            return None
+        payload = build_interaction_event(
+            local_vars,
+            kind=kind,
+            interaction_id=interaction_id,
+            prompt=prompt,
+            options=options,
+            description=description,
+            timeout_seconds=timeout_seconds,
+            fallback_policy="native_text",
+        )
+        if payload is None:
+            return None
+        try:
+            post_result = await _post_json_ordered_response(
+                config.event_url,
+                payload,
+                _timeout_for_event(config, payload["event"]),
+            )
+        except Exception:
+            return None
+        if isinstance(post_result, dict) and post_result.get("ok") is False:
+            return None
+        if _uses_text_interaction_fallback(post_result):
+            return None
+        base_url = _summary_base_url(config.event_url)
+        url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
+        timeout = _interaction_timeout(timeout_seconds)
+        poll_interval = _interaction_poll_interval(poll_interval_seconds)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                result = await _get_json(url, config.timeout_seconds)
+            except Exception:
+                result = None
+            if isinstance(result, dict) and result.get("status") == "completed":
+                choice = str(result.get("choice") or "").strip()
+                return choice or None
+            if isinstance(result, dict) and result.get("status") == "failed":
+                return None
+            if time.monotonic() >= deadline:
+                await _post_interaction_timeout_async(
+                    config.event_url,
+                    payload,
+                    config.timeout_seconds,
+                )
+                return None
+            await asyncio.sleep(poll_interval)
+    except Exception:
+        return None
+
+
+def _hfc_resume_source_name(source: Any) -> str | None:
+    platform = getattr(source, "platform", None)
+    value = str(getattr(platform, "value", platform) or "").strip().lower()
+    return value or None
+
+
+def _hfc_resume_row_matches_session_key(runner: Any, source: Any, row: dict[str, Any]) -> bool:
+    """Accept Hermes rows that prove the exact current routing scope."""
+    row_key = str(row.get("session_key") or "").strip()
+    get_key = getattr(runner, "_session_key_for_source", None)
+    if not row_key or not callable(get_key):
+        return False
+    try:
+        source_key = str(get_key(source) or "").strip()
+    except Exception:
+        return False
+    return bool(source_key) and row_key == source_key
+
+
+def _hfc_resume_metadata(runner: Any, event: Any, source: Any) -> dict[str, Any]:
+    reply_anchor = _hfc_command_event_message_id(event)
+    get_reply_anchor = getattr(runner, "_reply_anchor_for_event", None)
+    if callable(get_reply_anchor):
+        try:
+            reply_anchor = str(get_reply_anchor(event) or reply_anchor).strip()
+        except Exception:
+            pass
+    get_metadata = getattr(runner, "_thread_metadata_for_source", None)
+    if callable(get_metadata):
+        try:
+            metadata = get_metadata(source, reply_anchor)
+            if isinstance(metadata, dict):
+                metadata = dict(metadata)
+                if reply_anchor:
+                    metadata.setdefault("reply_to_message_id", reply_anchor)
+                return metadata
+        except Exception:
+            pass
+    metadata: dict[str, Any] = {}
+    if reply_anchor:
+        metadata["reply_to_message_id"] = reply_anchor
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    if thread_id:
+        metadata["thread_id"] = thread_id
+    return metadata
+
+
+def _hfc_resume_operator_open_id(event: Any) -> str:
+    source = getattr(event, "source", None)
+    raw = getattr(event, "raw_message", None)
+    raw_event = getattr(raw, "event", None)
+    candidates = [
+        getattr(event, "sender_id", None),
+        getattr(source, "sender_id", None),
+        getattr(raw, "sender_id", None),
+        getattr(getattr(raw, "sender", None), "sender_id", None),
+        getattr(getattr(raw_event, "sender", None), "sender_id", None),
+    ]
+    for candidate in candidates:
+        open_id = str(getattr(candidate, "open_id", "") or "").strip()
+        if open_id:
+            return open_id
+    source_user_id = str(getattr(source, "user_id", "") or "").strip()
+    return source_user_id if source_user_id.startswith("ou_") else ""
+
+
+async def _hfc_try_resume_picker(
+    runner: Any,
+    event: Any,
+    original_handler: Any,
+) -> bool:
+    try:
+        source = getattr(event, "source", None)
+        if source is None or _platform_name({}, source) != "feishu":
+            return False
+        chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+        if chat_type not in {"", "dm", "p2p", "private"}:
+            if not _hfc_resume_operator_open_id(event):
+                return False
+        session_db = getattr(runner, "_session_db", None)
+        list_sessions = getattr(session_db, "list_sessions_rich", None)
+        if not callable(list_sessions):
+            return False
+        rows = await list_sessions(source=_hfc_resume_source_name(source), limit=10)
+        if not isinstance(rows, list):
+            return False
+        visible: list[dict[str, Any]] = []
+        row_visible = getattr(runner, "_resume_row_visible", None)
+        if not callable(row_visible):
+            return False
+        for row in rows:
+            if not isinstance(row, dict) or not str(row.get("title") or "").strip():
+                continue
+            if await row_visible(source, row, False) or _hfc_resume_row_matches_session_key(
+                runner, source, row
+            ):
+                visible.append(row)
+            if len(visible) >= 10:
+                break
+        if not visible:
+            return False
+
+        adapter = _hfc_feishu_adapter_from_runner(runner, source)
+        if adapter is None or not getattr(adapter, "_client", None):
+            return False
+        send_picker = getattr(adapter, "send_resume_picker", None)
+        if not callable(send_picker):
+            return False
+
+        current_session_id = ""
+        session_store = getattr(runner, "session_store", None)
+        get_current = getattr(session_store, "get_or_create_session", None)
+        if callable(get_current):
+            try:
+                current = get_current(source)
+                current_session_id = str(getattr(current, "session_id", "") or "")
+            except Exception:
+                pass
+        result = await send_picker(
+            chat_id=str(getattr(source, "chat_id", "") or ""),
+            sessions=visible,
+            current_session_id=current_session_id,
+            runner=runner,
+            event=event,
+            original_handler=original_handler,
+            metadata=_hfc_resume_metadata(runner, event, source),
+        )
+        return bool(getattr(result, "success", False))
+    except Exception as exc:
+        _hfc_warn(f"resume picker failed open: {_hfc_exception_summary(exc)}")
+        return False
+
+
+async def _hfc_handle_resume_command_with_picker(runner: Any, event: Any) -> Any:
+    original = getattr(type(runner), "_hfc_original_handle_resume_command", None)
+    if not callable(original):
+        return None
+    try:
+        get_args = getattr(event, "get_command_args", None)
+        raw_args = str(get_args() or "").strip() if callable(get_args) else ""
+    except Exception:
+        raw_args = ""
+    if raw_args:
+        return await original(runner, event)
+    if await _hfc_try_resume_picker(runner, event, original):
+        return None
+    return await original(runner, event)
+
+
+def _hfc_install_resume_picker_handler(runner_type: type[Any]) -> bool:
+    current = runner_type.__dict__.get("_handle_resume_command")
+    if current is _hfc_handle_resume_command_with_picker:
+        setattr(runner_type, "_hfc_resume_picker_wrapped", True)
+        return True
+    if getattr(runner_type, "_hfc_resume_picker_wrapped", False):
+        return callable(getattr(runner_type, "_handle_resume_command", None))
+    original = current or getattr(runner_type, "_handle_resume_command", None)
+    if not callable(original):
+        return False
+    setattr(runner_type, "_hfc_original_handle_resume_command", original)
+    setattr(runner_type, "_handle_resume_command", _hfc_handle_resume_command_with_picker)
+    setattr(runner_type, "_hfc_resume_picker_wrapped", True)
+    return True
+
+
+async def _hfc_handle_compress_command_with_card(runner: Any, event: Any) -> Any:
+    original = getattr(type(runner), "_hfc_original_handle_compress_command", None)
+    if not callable(original):
+        return None
+    source = getattr(event, "source", None)
+    if source is None or _platform_name({}, source) != "feishu":
+        return await original(runner, event)
+
+    context = _HFC_FEISHU_COMMAND_RESULT_CONTEXT.get()
+    if not isinstance(context, dict):
+        context = _hfc_command_result_context_from_event(event)
+        if context is not None:
+            _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(context)
+    if not isinstance(context, dict):
+        return await original(runner, event)
+    command = str(context.get("command") or "").strip().lower()
+    raw_command = str(context.get("raw_command") or "").strip().lower()
+    if command not in {"compress", "compact"} and raw_command not in {
+        "compress",
+        "compact",
+    }:
+        return await original(runner, event)
+    context["command"] = "compress"
+
+    adapter = _hfc_feishu_adapter_from_runner(runner, source)
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if adapter is None or not chat_id:
+        return await original(runner, event)
+
+    started = await _hfc_send_native_command_result_card(
+        adapter,
+        chat_id=chat_id,
+        content="⏳ 正在压缩上下文…",
+        reply_to=str(context.get("reply_to_message_id") or "").strip() or None,
+        metadata=None,
+        context=context,
+    )
+    result = await original(runner, event)
+    if not getattr(started, "success", False):
+        return result
+
+    terminal_content = str(result or "").strip() or "上下文压缩已完成。"
+    completed = await _hfc_send_native_command_result_card(
+        adapter,
+        chat_id=chat_id,
+        content=terminal_content,
+        reply_to=str(context.get("reply_to_message_id") or "").strip() or None,
+        metadata=None,
+        context=context,
+    )
+    if getattr(completed, "success", False):
+        return None
+    return result
+
+
+def _hfc_install_compress_command_handler(runner_type: type[Any]) -> bool:
+    current = runner_type.__dict__.get("_handle_compress_command")
+    if current is _hfc_handle_compress_command_with_card:
+        setattr(runner_type, "_hfc_compress_command_wrapped", True)
+        return True
+    if getattr(runner_type, "_hfc_compress_command_wrapped", False):
+        return callable(getattr(runner_type, "_handle_compress_command", None))
+    original = current or getattr(runner_type, "_handle_compress_command", None)
+    if not callable(original):
+        return False
+    setattr(runner_type, "_hfc_original_handle_compress_command", original)
+    setattr(
+        runner_type,
+        "_handle_compress_command",
+        _hfc_handle_compress_command_with_card,
+    )
+    setattr(runner_type, "_hfc_compress_command_wrapped", True)
+    return True
+
+
+async def _hfc_request_update_command(runner: Any, event: Any) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        message_id = _hfc_command_event_message_id(event)
+        operator_open_id = _hfc_resume_operator_open_id(event)
+        if not chat_id or not message_id or not operator_open_id:
+            return False
+        local_vars = {
+            "source": source,
+            "event": event,
+            "message": event,
+            "runner": runner,
+        }
+        profile_id, profile_source = _profile_identity(local_vars, source, event)
+        payload = {
+            "command": "update",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "thread_id": str(getattr(source, "thread_id", "") or "").strip(),
+            "reply_to_message_id": message_id,
+            "profile_id": profile_id,
+            "profile_source": profile_source,
+            "chat_type": str(getattr(source, "chat_type", "") or "").strip().lower(),
+            "operator": {"open_id": operator_open_id},
+            "created_at": _created_at(getattr(event, "created_at", None)),
+            "platform": "feishu",
+        }
+        root_secret = read_transport_root_secret()
+        if root_secret is None:
+            return False
+        payload["adapter_command_proof"] = sign_command_transport_proof(
+            root_secret,
+            payload,
+            timestamp=int(time.time()),
+            nonce=secrets.token_urlsafe(18),
+        )
+        result = await _post_json_response(
+            f"{_summary_base_url(config.event_url)}/commands",
+            payload,
+            config.timeout_seconds,
+        )
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return False
+        operation_id = str(result.get("operation_id") or "").strip()
+        if not operation_id:
+            return False
+        _remember_operation_transport(
+            operation_id,
+            derive_operation_transport_secret(root_secret, operation_id),
+            profile_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _hfc_handle_update_command_with_card(runner: Any, event: Any) -> Any:
+    original = getattr(type(runner), "_hfc_original_handle_update_command", None)
+    if not callable(original):
+        return None
+    source = getattr(event, "source", None)
+    if source is None or _platform_name({}, source) != "feishu":
+        return await original(runner, event)
+    if _hfc_command_from_event(event) != "update":
+        return await original(runner, event)
+    try:
+        get_args = getattr(event, "get_command_args", None)
+        raw_args = str(get_args() or "").strip() if callable(get_args) else ""
+    except Exception:
+        raw_args = ""
+    chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+    if raw_args or chat_type not in {"dm", "p2p", "private"}:
+        return await original(runner, event)
+    if not _hfc_resume_operator_open_id(event):
+        return "自动更新暂不可用：无法确认操作者身份，未执行 Hermes 更新。"
+    if await _hfc_request_update_command(runner, event):
+        return None
+    return "自动更新暂不可用，请稍后重试；未执行 Hermes 更新。"
+
+
+def _hfc_install_update_command_handler(runner_type: type[Any]) -> bool:
+    current = runner_type.__dict__.get("_handle_update_command")
+    if current is _hfc_handle_update_command_with_card:
+        setattr(runner_type, "_hfc_update_command_wrapped", True)
+        return True
+    if getattr(runner_type, "_hfc_update_command_wrapped", False):
+        return callable(getattr(runner_type, "_handle_update_command", None))
+    original = current or getattr(runner_type, "_handle_update_command", None)
+    if not callable(original):
+        return False
+    setattr(runner_type, "_hfc_original_handle_update_command", original)
+    setattr(runner_type, "_handle_update_command", _hfc_handle_update_command_with_card)
+    setattr(runner_type, "_hfc_update_command_wrapped", True)
+    return True
+
+
+def _metadata_reply_to(metadata: dict[str, Any] | None) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    return str(
+        metadata.get("reply_to_message_id")
+        or metadata.get("message_id")
+        or metadata.get("reply_to")
+        or ""
+    ).strip()
+
+
+def _metadata_thread_id(metadata: dict[str, Any] | None) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("thread_id") or "").strip()
+
+
+def _send_result(success: bool, message_id: str | None = None, error: str | None = None):
+    return SimpleNamespace(success=success, message_id=message_id, error=error)
+
+
+def _hfc_feishu_response_types(adapter: Any) -> tuple[Any, Any]:
+    module = sys.modules.get(type(adapter).__module__)
+    if module is None:
+        return None, None
+    return (
+        getattr(module, "P2CardActionTriggerResponse", None),
+        getattr(module, "CallBackCard", None),
+    )
+
+
+def _hfc_empty_feishu_callback_response(adapter: Any) -> Any:
+    response_type, _ = _hfc_feishu_response_types(adapter)
+    return response_type() if response_type is not None else None
+
+
+def _hfc_toast_feishu_callback_response(
+    adapter: Any, content: str, *, toast_type: str = "warning"
+) -> Any:
+    response_type, _ = _hfc_feishu_response_types(adapter)
+    if response_type is None:
+        return None
+    response = response_type()
+    module = sys.modules.get(type(adapter).__module__)
+    callback_toast_type = getattr(module, "CallBackToast", None) if module else None
+    if callback_toast_type is None:
+        response_types = getattr(response_type, "_types", {})
+        if isinstance(response_types, dict):
+            callback_toast_type = response_types.get("toast")
+    if callback_toast_type is None:
+        return response
+    toast = callback_toast_type()
+    toast.type = toast_type
+    toast.content = content
+    response.toast = toast
+    return response
+
+
+def _hfc_raw_feishu_callback_response(adapter: Any, card_data: dict[str, Any]) -> Any:
+    response_type, card_type = _hfc_feishu_response_types(adapter)
+    if response_type is None:
+        return None
+    response = response_type()
+    if card_type is not None:
+        card = card_type()
+        card.type = "raw"
+        card.data = card_data
+        response.card = card
+    return response
+
+
+def _hfc_interaction_success_response(
+    adapter: Any,
+    card_data: dict[str, Any],
+    toast_content: str,
+) -> Any:
+    if card_data.get("schema") == "2.0" or "body" in card_data:
+        _hfc_warn("interaction callback card suppressed: schema 2.0")
+        return _hfc_toast_feishu_callback_response(
+            adapter,
+            toast_content,
+            toast_type="success",
+        )
+    return _hfc_raw_feishu_callback_response(adapter, card_data)
+
+
+def _hfc_response_success(response: Any) -> bool:
+    success_value = getattr(response, "success", None)
+    if callable(success_value):
+        try:
+            return bool(success_value())
+        except Exception:
+            return False
+    if success_value is not None:
+        return bool(success_value)
+    return False
+
+
+def _hfc_response_message_id(response: Any) -> str:
+    direct = str(getattr(response, "message_id", "") or "")
+    if direct:
+        return direct
+    data = getattr(response, "data", None)
+    data_message_id = str(getattr(data, "message_id", "") or "")
+    if data_message_id:
+        return data_message_id
+    raw_response = getattr(response, "raw_response", None)
+    if raw_response is not None and raw_response is not response:
+        return _hfc_response_message_id(raw_response)
+    return ""
+
+
+def _hfc_feishu_send_success(response: Any) -> tuple[bool, str]:
+    return _hfc_response_success(response), _hfc_response_message_id(response)
+
+
+def _hfc_update_response_success(response: Any) -> bool:
+    return _hfc_response_success(response)
+
+
+def _hfc_update_response_error(response: Any) -> str:
+    return _hfc_response_summary(response)
+
+
+def _hfc_log_reference(kind: str, value: Any) -> str:
+    normalized_kind = re.sub(r"[^a-z0-9_-]", "", str(kind or "id").lower()) or "id"
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        return f"{normalized_kind}#missing"
+    digest = sha256(
+        f"hfc-log:{normalized_kind}:{normalized_value}".encode("utf-8")
+    ).hexdigest()[:10]
+    return f"{normalized_kind}#{digest}"
+
+
+def _hfc_exception_summary(exc: BaseException) -> str:
+    details: list[str] = []
+    for name in ("status_code", "api_code", "code", "outcome", "retryable"):
+        try:
+            value = getattr(exc, name, None)
+        except Exception:
+            value = None
+        if value is not None and isinstance(value, (str, int, float, bool)):
+            details.append(f"{name}={value!r}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"{exc.__class__.__name__}{suffix}"
+
+
+def _hfc_is_transient_sidecar_error(exc: BaseException) -> bool:
+    if isinstance(exc, urlerror.HTTPError):
+        return False
+    if isinstance(exc, (ConnectionError, BrokenPipeError, TimeoutError)):
+        return True
+    if isinstance(exc, urlerror.URLError):
+        return isinstance(
+            getattr(exc, "reason", None),
+            (ConnectionError, BrokenPipeError, TimeoutError),
+        )
+    return False
+
+
+def _hfc_response_summary(response: Any) -> str:
+    try:
+        code = getattr(response, "code", None)
+        status_code = getattr(response, "status_code", None)
+        parts = []
+        if code is not None:
+            parts.append(f"code={code!r}")
+        if status_code is not None:
+            parts.append(f"status_code={status_code!r}")
+        if parts:
+            return " ".join(parts)
+    except Exception:
+        pass
+    raw_response = getattr(response, "raw_response", None)
+    if raw_response is not None and raw_response is not response:
+        return _hfc_response_summary(raw_response)
+    return f"type={response.__class__.__name__}"
+
+
+def _hfc_warn(message: str) -> None:
+    try:
+        logger.warning("[hermes-feishu-card] %s", message)
+        return
+    except BaseException:
+        pass
+    try:
+        print(f"[hermes-feishu-card] {message}", file=sys.stderr)
+    except BaseException:
+        pass
+
+
+def _warn_stage_diagnostic(reason: str) -> None:
+    try:
+        _completion_diagnostics.stage_skipped(reason)
+    except BaseException:
+        pass
+
+
+def _hfc_summarize_post_result(result: Any) -> str:
+    try:
+        if not isinstance(result, dict):
+            return f"type={result.__class__.__name__}"
+        safe = {
+            key: result.get(key)
+            for key in (
+                "ok",
+                "applied",
+                "interaction_mode",
+                "status",
+                "disposition",
+            )
+            if key in result
+        }
+        delivery = result.get("delivery")
+        if isinstance(delivery, dict):
+            outcome = str(delivery.get("outcome") or "").strip()
+            allowed_outcomes = {
+                "accepted",
+                "delivered",
+                "not_sent",
+                "unknown",
+                "native",
+                "card",
+            }
+            safe["delivery"] = {
+                "outcome": outcome if outcome in allowed_outcomes else "other"
+            }
+        return json.dumps(safe, ensure_ascii=False)
+    except Exception:
+        return f"type={result.__class__.__name__}"
+
+
+def _hfc_info(message: str) -> None:
+    try:
+        logger.info("[hermes-feishu-card] %s", message)
+    except Exception:
+        pass
+
+
+def _hfc_build_native_command_feedback_card(
+    command: str,
+    content: str,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if command == "commands":
+        catalog = context.get("command_catalog")
+        if not isinstance(catalog, list):
+            catalog = collect_hermes_command_catalog()
+            context["command_catalog"] = catalog
+        if catalog:
+            center_id = str(context.get("command_center_id") or "").strip()
+            if not center_id:
+                seed = ":".join(
+                    [
+                        str(context.get("chat_id") or ""),
+                        str(context.get("reply_to_message_id") or ""),
+                        str(context.get("created_at") or time.monotonic()),
+                    ]
+                )
+                center_id = "commands_" + sha256(seed.encode("utf-8")).hexdigest()[:16]
+                context["command_center_id"] = center_id
+            return build_command_center_card(catalog, center_id=center_id)
+    if command in NATIVE_RESULT_COMMANDS:
+        return build_native_result_card(command, content)
+    return _hfc_command_result_card(
+        title=_hfc_command_result_title(command),
+        content=content,
+        template=_hfc_command_result_template(content),
+    )
+
+
+def _hfc_remember_command_center_state(
+    adapter: Any,
+    context: dict[str, Any],
+    message_id: str,
+) -> None:
+    center_id = str(context.get("command_center_id") or "").strip()
+    catalog = context.get("command_catalog")
+    if not center_id or not message_id or not isinstance(catalog, list):
+        return
+    state = getattr(adapter, "_hfc_command_center_state", None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(adapter, "_hfc_command_center_state", state)
+    now = time.time()
+    for key, item in list(state.items()):
+        if not isinstance(item, dict) or _hfc_command_center_state_expired(item, now):
+            state.pop(key, None)
+    while len(state) >= 64:
+        state.pop(next(iter(state)), None)
+    state[center_id] = {
+        "catalog": catalog,
+        "chat_id": str(context.get("chat_id") or ""),
+        "chat_type": str(context.get("chat_type") or "").lower(),
+        "operator_open_id": str(context.get("operator_open_id") or ""),
+        "message_id": message_id,
+        "runner": context.get("runner"),
+        "event": context.get("event"),
+        "selected_category": "",
+        "expires_at": now + 600.0,
+    }
+
+
+def _hfc_command_center_state_expired(
+    item: dict[str, Any],
+    now: float | None = None,
+) -> bool:
+    try:
+        expires_at = float(item.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(expires_at):
+        return True
+    return expires_at <= (time.time() if now is None else now)
+
+
+def _hfc_command_from_event(event: Any) -> str:
+    command = ""
+    getter = getattr(event, "get_command", None)
+    if callable(getter):
+        try:
+            command = str(getter() or "")
+        except Exception:
+            command = ""
+    if not command:
+        text = str(getattr(event, "text", "") or "").strip()
+        if text.startswith("/"):
+            command = text
+    command = command.strip()
+    if command.startswith("/"):
+        command = command[1:]
+    if not command:
+        return ""
+    return command.split(None, 1)[0].strip().lower()
+
+
+def _hfc_canonical_command(command: str) -> str:
+    raw = str(command or "").strip().lstrip("/")
+    if not raw:
+        return ""
+    raw = raw.split(None, 1)[0].lower()
+    try:
+        from hermes_cli.commands import resolve_command
+
+        resolved = resolve_command(raw)
+        name = str(getattr(resolved, "name", "") or "").strip().lower()
+        if name:
+            return name
+    except Exception:
+        pass
+    return raw.replace("_", "-")
+
+
+def _hfc_command_event_message_id(event: Any) -> str:
+    for obj in (event, getattr(event, "source", None)):
+        if obj is None:
+            continue
+        for name in ("message_id", "id", "event_message_id"):
+            try:
+                value = str(getattr(obj, name, "") or "").strip()
+            except Exception:
+                value = ""
+            if value:
+                return value
+    return ""
+
+
+def _hfc_command_result_context_from_event(event: Any) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    source = getattr(event, "source", None)
+    if _platform_name({}, source) != "feishu":
+        return None
+    raw_command = _hfc_command_from_event(event)
+    command = _hfc_canonical_command(raw_command)
+    if not command:
+        return None
+    get_args = getattr(event, "get_command_args", None)
+    try:
+        raw_args = str(get_args() or "").strip() if callable(get_args) else ""
+    except Exception:
+        raw_args = ""
+    now = time.monotonic()
+    return {
+        "command": command,
+        "raw_command": raw_command,
+        "raw_args": raw_args,
+        "chat_id": str(getattr(source, "chat_id", "") or "").strip(),
+        "chat_type": str(getattr(source, "chat_type", "") or "").strip().lower(),
+        "operator_open_id": _hfc_resume_operator_open_id(event),
+        "reply_to_message_id": _hfc_command_event_message_id(event),
+        "thread_id": str(getattr(source, "thread_id", "") or "").strip(),
+        "card_message_id": "",
+        "created_at": now,
+        "expires_at": now + COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS,
+    }
+
+
+def _hfc_delivery_context_from_event(event: Any) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    source = getattr(event, "source", None)
+    if _platform_name({}, source) != "feishu":
+        return None
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not chat_id:
+        return None
+    local_vars = {"source": source, "event": event}
+    profile_id, profile_source = _profile_identity(local_vars, source, None)
+    message_id = _hfc_command_event_message_id(event)
+    thread_id = str(
+        getattr(source, "thread_id", "")
+        or getattr(event, "thread_id", "")
+        or ""
+    ).strip()
+    return {
+        "chat_id": chat_id,
+        "profile_id": profile_id,
+        "profile_invalid": profile_source.startswith("sanitized_"),
+        "message_id": message_id,
+        "conversation_id": thread_id or chat_id,
+        "thread_id": thread_id,
+    }
+
+
+def _hfc_direct_policy_locals(chat_id: Any) -> dict[str, Any]:
+    normalized_chat_id = str(chat_id or "").strip()
+    context = _HFC_FEISHU_DELIVERY_CONTEXT.get()
+    if not isinstance(context, dict):
+        context = {}
+    return {
+        "platform": "feishu",
+        "chat_id": normalized_chat_id,
+        "profile_id": str(context.get("profile_id") or "").strip(),
+        "_hfc_profile_invalid": context.get("profile_invalid") is True,
+        "message_id": str(context.get("message_id") or "").strip(),
+        "conversation_id": str(
+            context.get("conversation_id") or normalized_chat_id
+        ).strip(),
+    }
+
+
+def _hfc_direct_card_allowed_sync(
+    chat_id: Any,
+    *,
+    event_name: str = "system.notice",
+) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        return _policy_gate_sync(
+            config,
+            _hfc_direct_policy_locals(chat_id),
+            event_name,
+        ).card
+    except Exception:
+        return False
+
+
+async def _hfc_direct_card_allowed_async(
+    chat_id: Any,
+    *,
+    event_name: str = "system.notice",
+) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        return (
+            await _policy_gate_async(
+                config,
+                _hfc_direct_policy_locals(chat_id),
+                event_name,
+            )
+        ).card
+    except Exception:
+        return False
+
+
+def _hfc_take_feishu_command_result_context(
+    *,
+    chat_id: str,
+    content: Any,
+) -> dict[str, Any] | None:
+    context = _HFC_FEISHU_COMMAND_RESULT_CONTEXT.get()
+    if not isinstance(context, dict):
+        return None
+    command = str(context.get("command") or "").strip().lower()
+    if not command:
+        _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
+        return None
+    if not str(content or "").strip():
+        return None
+    try:
+        expires_at = float(context.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if expires_at <= time.monotonic():
+        _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
+        return None
+    expected_chat_id = str(context.get("chat_id") or "").strip()
+    actual_chat_id = str(chat_id or "").strip()
+    if expected_chat_id and actual_chat_id and expected_chat_id != actual_chat_id:
+        _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
+        return None
+    return context
+
+
+def _hfc_notice_context_from_event(event: Any) -> dict[str, str] | None:
+    if event is None:
+        return None
+    source = getattr(event, "source", None)
+    if _platform_name({}, source) != "feishu":
+        return None
+    return _hfc_notice_context_from_source(source, event=event)
+
+
+def _hfc_notice_context_from_source(
+    source: Any,
+    *,
+    event: Any = None,
+) -> dict[str, str] | None:
+    if _platform_name({}, source) != "feishu":
+        return None
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not chat_id:
+        return None
+    # The inbound event owns the current anchor; source.message_id can still
+    # refer to a previous turn. Operational notices often receive only source.
+    bound_turn = getattr(source, _CANONICAL_TURN_ATTR, "")
+    bound_anchor = (
+        bound_turn if isinstance(bound_turn, str) and bound_turn.startswith("om_") else ""
+    )
+    message_id = str(
+        getattr(event, "message_id", "")
+        or bound_anchor
+        or getattr(source, "message_id", "")
+        or ""
+    ).strip()
+    thread_id = str(
+        getattr(source, "thread_id", "")
+        or (getattr(event, "thread_id", "") if event is not None else "")
+        or ""
+    ).strip()
+    profile_id, _profile_source = _profile_identity(
+        {"source": source, "event": event},
+        source,
+        None,
+    )
+    return {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "conversation_id": thread_id or chat_id,
+        "thread_id": thread_id,
+        "profile_id": profile_id,
+    }
+
+
+def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
+    raw_text = str(content or "")
+    if not raw_text.strip():
+        return None
+    background_notice = _hfc_classify_background_notice(raw_text)
+    if background_notice is not None:
+        return background_notice
+    text = raw_text.strip()
+    lowered = text.lower()
+    if text == "⏳ Gateway is restarting and is not accepting new work right now.":
+        return {
+            "title": "Gateway 正在重启", "level": "warning",
+            "notice_kind": "gateway-restart", "notice_id": "gateway-restart-wait",
+            "notice_terminal": True,
+            "content": "Gateway 正在重启，暂不接受新任务。当前这条请求尚未开始执行。\n\n"
+                       "重启耗时取决于正在收尾的任务和启动过程；收到重启完成通知后，请重新发送请求。",
+        }
+    if text in {"♻ Gateway restarted successfully. Your session continues.",
+                "♻️ Gateway restarted successfully. Your session continues."}:
+        # Maintainer note (contract change): this notice is delivered as PLAIN TEXT, not a card.
+        #
+        # It used to render as a card titled "Gateway 重启完成" — a duplicate of the home-channel
+        # line in different words, arriving with a status pill and a metrics row it never had
+        # ("已完成 · 0s · Unknown · ↑0 · ↓0 · ctx 0/0 0%"). The user asked for the two surfaces to
+        # read the same and for the card to go: "可以改成不发卡片。发♻️ Gateway online — Hermes is
+        # back and ready." `_hfc_send_system_notice_card` honours `plain_text` by sending exactly
+        # this line through the adapter's own text send; `title`/`level`/`content` stay for the
+        # classification contract and any caller that still renders one.
+        return {
+            "title": "Gateway 重启完成", "level": "success",
+            "notice_kind": "gateway-restart", "notice_id": "gateway-restart-ready",
+            "notice_terminal": True,
+            "content": "Gateway 已重启完成，会话已保留。现在可以发送新任务。",
+            "plain_text": _HFC_GATEWAY_ONLINE_TEXT,
+        }
+    if text.startswith("📬 No home channel is set for Feishu."):
+        return {
+            "title": "默认投递位置未设置", "level": "info",
+            "notice_kind": "home-channel", "notice_id": "home-channel",
+        }
+    if text.startswith("ℹ️ 上下文压缩已推迟"):
+        return {
+            "title": "上下文压缩提示", "level": "info",
+            "notice_kind": "compression",
+            "notice_id": _hfc_content_notice_id("compression", text),
+        }
+    if text.startswith("⏳") or lowered.startswith("working ") or "working —" in lowered:
+        # Maintainer note (contract change): the ⏳ status line is NEVER a card.
+        #
+        # These lines used to become notice cards titled「运行中」. They are transient process state
+        # ("compressing", "waiting for approval", "loading the model", the long-running heartbeat,
+        # "tool timed out, retrying", …): the turn's OWN card already carries the live progress, so
+        # the extra card restated it and then appeared/vanished every ~180s. The user asked for the
+        # whole class to be plain text (「⏳ Working — … 之类的，我觉得不应该发卡片」/「都改为纯文本。
+        # 体验效果感觉会好一点」).
+        #
+        # Returning None preserves the adapter's plain-text path. The egress helper
+        # recalls only known transient templates, never arbitrary hourglass text.
+        # Queue/error acknowledgements and answer content remain visible. The edit
+        # path also still works: `_hfc_edit_message_with_system_notice_card` falls back to the
+        # original edit once classification returns None, so a refreshing status updates ONE line.
+        return None
+    if "caps context" in lowered and "auto-compaction" in lowered:
+        return {
+            "title": "上下文窗口提示",
+            "level": "info",
+            "notice_kind": "context-cap",
+            "notice_id": "context-cap",
+        }
+    if "session automatically reset" in lowered:
+        return {
+            "title": "会话已自动重置",
+            "level": "success",
+            "notice_kind": "session-reset",
+            "notice_id": "session-reset",
+        }
+    if "reading skill" in lowered:
+        return {
+            "title": "技能加载",
+            "level": "info",
+            "notice_kind": "skill-loading",
+            "notice_id": _hfc_content_notice_id("skill-loading", text),
+        }
+    if "self-improvement review" in lowered:
+        return {
+            "title": "自我改进",
+            "level": "info",
+            "notice_kind": "self-improvement",
+            "notice_id": _hfc_content_notice_id("self-improvement", text),
+        }
+    if "context compression" in lowered or "compression model" in lowered:
+        return {
+            "title": "上下文压缩提示",
+            "level": "info",
+            "notice_kind": "compression",
+            "notice_id": _hfc_content_notice_id("compression", text),
+        }
+    return None
+
+
+def _hfc_classify_background_notice(text: str) -> dict[str, Any] | None:
+    process_finished = BACKGROUND_PROCESS_FINISHED_RE.fullmatch(text)
+    if process_finished is not None:
+        process_id = process_finished.group("process_id")
+        exit_code_text = process_finished.group("exit_code")
+        if exit_code_text == "0":
+            title = "后台进程已完成"
+            level = "success"
+        elif exit_code_text == "None":
+            title = "后台进程已结束"
+            level = "warning"
+        else:
+            title = "后台进程失败"
+            level = "error"
+        return {
+            "title": title,
+            "level": level,
+            "notice_kind": "background-process",
+            "notice_id": f"background-process:{process_id}",
+            "notice_terminal": True,
+        }
+
+    process_running = BACKGROUND_PROCESS_RUNNING_RE.fullmatch(text)
+    if process_running is not None:
+        process_id = process_running.group("process_id")
+        return {
+            "title": "后台进程运行中",
+            "level": "info",
+            "notice_kind": "background-process",
+            "notice_id": f"background-process:{process_id}",
+            "notice_terminal": False,
+        }
+
+    task_started = BACKGROUND_TASK_STARTED_RE.fullmatch(text)
+    if task_started is not None:
+        task_id = task_started.group("task_id")
+        return {
+            "title": "后台任务已启动",
+            "level": "info",
+            "notice_kind": "background-task",
+            "notice_id": f"background-task:{task_id}",
+            "notice_terminal": False,
+        }
+
+    if BACKGROUND_TASK_COMPLETED_RE.fullmatch(text) is not None:
+        return {
+            "title": "后台任务已完成",
+            "level": "success",
+            "notice_kind": "background-task",
+            "notice_id": _hfc_content_notice_id("background-task-completed", text),
+            "notice_terminal": True,
+        }
+
+    task_failed = BACKGROUND_TASK_FAILED_RE.fullmatch(text)
+    if task_failed is not None:
+        task_id = task_failed.group("task_id")
+        return {
+            "title": "后台任务失败",
+            "level": "error",
+            "notice_kind": "background-task",
+            "notice_id": f"background-task:{task_id}",
+            "notice_terminal": True,
+        }
+    return None
+
+
+def _hfc_content_notice_id(kind: str, content: str) -> str:
+    digest = sha256(f"{kind}:{content}".encode("utf-8")).hexdigest()[:10]
+    return f"{kind}:{digest}"
+
+
+_HFC_GATEWAY_ONLINE_TEXT = "♻️ Gateway online — Hermes is back and ready."
+
+
+def _hfc_notice_plain_text(notice: Any) -> str | None:
+    """Wording for a notice the gateway should deliver as PLAIN TEXT instead of a card.
+
+    Only the restart-completion notice declares this (see `_hfc_classify_system_notice`): its card
+    duplicated the home-channel line in different words and carried a metrics row it never had. A
+    notice without the key keeps the card path, which is every other notice.
+    """
+    if not isinstance(notice, dict):
+        return None
+    value = notice.get("plain_text")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+async def _hfc_send_plain_notice(
+    adapter: Any,
+    *,
+    chat_id: str,
+    text: str,
+    reply_to: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    """Send a notice as an ordinary text message — no card, no render, no card bookkeeping.
+
+    Goes through the adapter's pre-hook ``send`` (``_hfc_original_send``), so this is the same
+    plain Feishu text path the core itself uses. Reporting success back to the caller is what stops
+    the core from ALSO sending its own copy of the notice.
+    """
+    original = getattr(type(adapter), "_hfc_original_send", None)
+    if not callable(original):
+        return _send_result(False, error="delivery_disposition=native")
+    try:
+        result = await original(adapter, chat_id, text, reply_to=reply_to, metadata=metadata)
+        if getattr(result, "success", False):
+            await _hfc_recall_plain_text_status_notice(
+                chat_id, text, metadata, result, reply_to=reply_to,
+                generated_restart_notice=(text == _HFC_GATEWAY_ONLINE_TEXT),
+            )
+            return result
+        return _send_result(False, error="delivery_disposition=native")
+    except Exception as exc:
+        # `delivery_disposition=native` is the callers' signal to fall back to the core's own text
+        # send, so a failed plain send degrades to the original wording rather than a lost notice.
+        _hfc_warn(f"plain notice send failed: {_hfc_exception_summary(exc)}")
+        return _send_result(False, error="delivery_disposition=native")
+
+
+async def _hfc_send_system_notice_card(
+    adapter: Any,
+    *,
+    chat_id: str,
+    content: Any,
+    reply_to: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    existing_message_id: str | None = None,
+) -> Any:
+    notice = _hfc_classify_system_notice(content)
+    if notice is None:
+        return _send_result(False, error="not a system notice")
+    plain_text = _hfc_notice_plain_text(notice)
+    if plain_text is not None:
+        # Deliberately BEFORE the card policy gate: the delivery format of this notice is its own
+        # contract, not a per-chat card/native decision — `bindings.native_chats` is chat-scoped and
+        # would strip the streaming cards from the chat as well.
+        return await _hfc_send_plain_notice(
+            adapter,
+            chat_id=chat_id,
+            text=plain_text,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+    if not await _hfc_direct_card_allowed_async(chat_id):
+        return _send_result(False, error="delivery_disposition=native")
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return _send_result(False, error="delivery_outcome=not_sent")
+        context = _HFC_FEISHU_NOTICE_CONTEXT.get()
+        if not isinstance(context, dict):
+            context = {}
+        message_id = str(existing_message_id or context.get("message_id") or "").strip()
+        if message_id and not message_id.startswith("notice_"):
+            notice_kind = str(notice.get("notice_kind") or "")
+            # Maintainer note (contract change): a HEARTBEAT now takes the independent scope too.
+            #
+            # It used to be anchored to the turn (scope="session"), which folded the ⏳ Working line
+            # into the turn's own card — and from there NOTHING could ever withdraw it. Both recall
+            # paths are closed to a session-scoped notice: the card path requires
+            # delivery_kind=="notice" (a session notice is "chat"), and /recall/schedule refuses an
+            # owned session card outright (409) because deleting it would delete the answer, not the
+            # ping. So every finished turn kept its last ⏳ Working line for good.
+            #
+            # The user asked for the behaviour the plain-text heartbeat used to have ("文案之前发出去
+            # 15 秒会撤回"); the independent notice is the surface that can honor it, and it is the one
+            # this codebase already prepared for a heartbeat: _hfc_independent_notice_message_id has a
+            # heartbeat branch keyed on (chat_id, anchor), and the sidecar has a heartbeat recall path
+            # keyed on delivery_kind=="notice". background-task keeps the scope it always had.
+            if notice_kind == "heartbeat":
+                anchored_scope = "independent"
+                # The event must NOT carry the anchor as its own id. The sidecar's session key IS the
+                # event's message id (server._session_key), so an anchor id would key this heartbeat
+                # onto the TURN's session — the very card this change is separating from. The
+                # independent id is stable per anchor, which is what lets a later heartbeat update its
+                # own notice instead of stacking a new one every tick.
+                message_id = _hfc_independent_notice_message_id(
+                    chat_id, str(content or ""), notice, anchor=message_id
+                )
+            elif notice_kind == "background-task":
+                anchored_scope = "independent"
+            else:
+                anchored_scope = "session"
+            payload = _hfc_build_system_notice_payload(
+                chat_id=chat_id,
+                content=str(content or ""),
+                reply_to=reply_to,
+                metadata=metadata,
+                context=context,
+                notice=notice,
+                notice_scope=anchored_scope,
+                message_id=message_id,
+            )
+            post_result = await _post_json_ordered_response(
+                config.event_url,
+                payload,
+                max(_timeout_for_event(config, payload["event"]), TERMINAL_TIMEOUT_SECONDS),
+            )
+            if _hfc_notice_post_applied(post_result):
+                return _send_result(True, message_id=payload["message_id"])
+            if not (
+                isinstance(post_result, dict)
+                and post_result.get("ok") is not False
+                and post_result.get("applied") is False
+            ):
+                return _send_result(
+                    False,
+                    error=(
+                        "delivery_outcome="
+                        + _hfc_notice_delivery_outcome(post_result)
+                    ),
+                )
+
+        independent_message_id = (
+            message_id
+            if message_id.startswith("notice_")
+            else _hfc_independent_notice_message_id(
+                chat_id,
+                str(content or ""),
+                notice,
+                anchor=str(context.get("message_id") or "").strip(),
+            )
+        )
+        payload = _hfc_build_system_notice_payload(
+            chat_id=chat_id,
+            content=str(content or ""),
+            reply_to=reply_to,
+            metadata=metadata,
+            context=context,
+            notice=notice,
+            notice_scope="independent",
+            message_id=independent_message_id,
+        )
+        post_result = await _post_json_ordered_response(
+            config.event_url,
+            payload,
+            max(_timeout_for_event(config, payload["event"]), TERMINAL_TIMEOUT_SECONDS),
+        )
+        if _hfc_notice_post_applied(post_result):
+            return _send_result(True, message_id=payload["message_id"])
+    except Exception as exc:
+        _hfc_warn(f"send system notice card failed: {exc.__class__.__name__}")
+        return _send_result(False, error="delivery_outcome=unknown")
+    return _send_result(
+        False,
+        error="delivery_outcome=" + _hfc_notice_delivery_outcome(post_result),
+    )
+
+
+def _hfc_notice_post_applied(result: Any) -> bool:
+    if not isinstance(result, dict) or result.get("ok") is False:
+        return False
+    outcome = _hfc_notice_delivery_outcome(result)
+    if outcome == "accepted":
+        return result.get("applied") is True
+    return outcome == "delivered" and result.get("applied") is not False
+
+
+def _hfc_notice_delivery_outcome(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "unknown"
+    delivery = result.get("delivery")
+    if not isinstance(delivery, dict):
+        return "unknown"
+    outcome = delivery.get("outcome")
+    if outcome in {"accepted", "delivered", "not_sent", "unknown"}:
+        return outcome
+    return "unknown"
+
+
+def _hfc_send_result_delivery_outcome(result: Any) -> str:
+    error = getattr(result, "error", None)
+    if error == "delivery_outcome=not_sent":
+        return "not_sent"
+    if error == "delivery_outcome=unknown":
+        return "unknown"
+    return "unknown"
+
+
+def _hfc_independent_notice_message_id(
+    chat_id: str,
+    content: str,
+    notice: dict[str, Any],
+    *,
+    anchor: str = "",
+) -> str:
+    notice_id = str(notice.get("notice_id") or "").strip()
+    if notice.get("notice_kind") == "background-process" and notice_id:
+        raw = f"{chat_id}:{notice_id}".encode("utf-8")
+        return "notice_" + sha256(raw).hexdigest()[:16]
+    if notice.get("notice_kind") == "heartbeat" and notice_id:
+        raw = f"{chat_id}:{anchor}:{notice_id}".encode("utf-8")
+        return "notice_" + sha256(raw).hexdigest()[:16]
+    if notice_id.startswith("background-task-completed:"):
+        return "notice_" + secrets.token_hex(8)
+    bucket = int(time.time() // 300)
+    raw = (
+        f"{chat_id}:"
+        f"{notice_id}:"
+        f"{content}:"
+        f"{bucket}"
+    ).encode("utf-8")
+    return "notice_" + sha256(raw).hexdigest()[:16]
+
+
+def _hfc_build_system_notice_payload(
+    *,
+    chat_id: str,
+    content: str,
+    reply_to: str | None,
+    metadata: dict[str, Any] | None,
+    context: dict[str, str],
+    notice: dict[str, Any],
+    notice_scope: str,
+    message_id: str,
+) -> dict[str, Any]:
+    reply_id = str(reply_to or "").strip() or _metadata_reply_to(metadata)
+    thread_id = str(
+        context.get("thread_id") or _metadata_thread_id(metadata) or ""
+    ).strip()
+    conversation_id = str(
+        context.get("conversation_id") or thread_id or chat_id
+    ).strip() or chat_id
+    source = SimpleNamespace(platform="feishu", chat_id=chat_id, thread_id=thread_id)
+    local_vars: dict[str, Any] = {
+        "source": source,
+        "chat_id": chat_id,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "content": notice.get("content", content),
+        "_hfc_notice_title": notice.get("title") or "运行提示",
+        "_hfc_notice_level": notice.get("level") or "info",
+        "_hfc_notice_kind": notice.get("notice_kind") or "system",
+        "_hfc_notice_id": notice.get("notice_id") or "",
+        "_hfc_notice_scope": notice_scope,
+        "delivery_kind": "notice" if notice_scope == "independent" else "chat",
+    }
+    profile_id = str(context.get("profile_id") or "").strip()
+    if profile_id:
+        local_vars["profile_id"] = profile_id
+    if "notice_terminal" in notice:
+        local_vars["_hfc_notice_terminal"] = bool(notice["notice_terminal"])
+    if reply_id:
+        local_vars["reply_to_message_id"] = reply_id
+    payload = build_event("system.notice", local_vars)
+    if payload is None:
+        raise RuntimeError("failed to build system.notice payload")
+    return payload
+
+
+async def _hfc_send_native_command_result_card(
+    adapter: Any,
+    *,
+    chat_id: str,
+    content: str,
+    reply_to: str | None,
+    metadata: dict[str, Any] | None,
+    context: dict[str, Any],
+) -> Any:
+    if not await _hfc_direct_card_allowed_async(chat_id):
+        return _send_result(False, error="delivery_disposition=native")
+    if not getattr(adapter, "_client", None):
+        return _send_result(False, error="not connected")
+    if not hasattr(adapter, "_feishu_send_with_retry"):
+        return _send_result(False, error="feishu send unavailable")
+
+    lock = context.get("_lock")
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        context["_lock"] = lock
+
+    async with lock:
+        command = str(context.get("command") or "").strip().lower()
+        card = _hfc_build_native_command_feedback_card(command, content, context)
+        card_message_id = str(context.get("card_message_id") or "").strip()
+        if card_message_id:
+            updated = await _hfc_update_native_command_card(
+                adapter,
+                card_message_id,
+                card,
+            )
+            if updated:
+                if command == "commands":
+                    _hfc_remember_command_center_state(
+                        adapter,
+                        context,
+                        card_message_id,
+                    )
+                return _send_result(True, message_id=card_message_id)
+            return _send_result(False, error="update command result card failed")
+
+        effective_reply_to = (
+            str(reply_to or "").strip()
+            or _metadata_reply_to(metadata)
+            or str(context.get("reply_to_message_id") or "").strip()
+            or None
+        )
+        effective_metadata = dict(metadata or {})
+        thread_id = str(context.get("thread_id") or "").strip()
+        if thread_id and not effective_metadata.get("thread_id"):
+            effective_metadata["thread_id"] = thread_id
+        try:
+            response = await adapter._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=serialize_card_for_delivery(card),
+                reply_to=effective_reply_to,
+                metadata=effective_metadata or None,
+            )
+        except Exception as exc:
+            _hfc_warn(
+                "send command result card failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
+            return _send_result(False, error=str(exc))
+
+        finalizer = getattr(adapter, "_finalize_send_result", None)
+        if callable(finalizer):
+            try:
+                result = finalizer(response, "send command result card failed")
+                if getattr(result, "success", False):
+                    message_id = str(getattr(result, "message_id", "") or "").strip()
+                    if message_id:
+                        context["card_message_id"] = message_id
+                        if command == "commands":
+                            _hfc_remember_command_center_state(
+                                adapter,
+                                context,
+                                message_id,
+                            )
+                    return result
+                return result
+            except Exception:
+                pass
+        success, message_id = _hfc_feishu_send_success(response)
+        if not success:
+            _hfc_warn(
+                "send command result card failed: "
+                f"response={_hfc_response_summary(response)}"
+            )
+            return _send_result(False, error="send command result card failed")
+        context["card_message_id"] = message_id
+        if command == "commands":
+            _hfc_remember_command_center_state(adapter, context, message_id)
+        return _send_result(True, message_id=message_id)
+
+
+def _validated_native_handoff_descriptor(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "protocol",
+        "id",
+        "uuid_seed",
+        "expires_at",
+    }:
+        return None
+    if value.get("protocol") != NATIVE_HANDOFF_PROTOCOL:
+        return None
+    handoff_id = str(value.get("id") or "")
+    uuid_seed = str(value.get("uuid_seed") or "")
+    if not _is_lower_hex(handoff_id, 64) or not _is_lower_hex(uuid_seed, 32):
+        return None
+    expires_at = _finite_float(value.get("expires_at"))
+    now = time.time()
+    if (
+        expires_at is None
+        or expires_at <= now
+        or expires_at > now + NATIVE_HANDOFF_MAX_LIFETIME_SECONDS + 30.0
+    ):
+        return None
+    return {
+        "protocol": NATIVE_HANDOFF_PROTOCOL,
+        "id": handoff_id,
+        "uuid_seed": uuid_seed,
+        "expires_at": expires_at,
+    }
+
+
+def _native_handoff_binding_from_payload(payload: Any) -> dict[str, str] | None:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("event") != "message.completed"
+    ):
+        return None
+    data = payload.get("data")
+    if not is_exact_native_text_scope(data):
+        return None
+    chat_id = str(payload.get("chat_id") or "").strip()
+    answer = str(data.get("answer") or "")
+    if not chat_id or not answer:
+        return None
+    profile_id = str(data.get("profile_id") or "")
+    profile_source = str(data.get("profile_source") or "")
+    if profile_id != "default" or profile_source.startswith("sanitized_"):
+        return None
+    metadata = data.get("native_handoff")
+    if not isinstance(metadata, dict):
+        return None
+    capabilities = set(metadata.get("capabilities") or ())
+    if not {
+        "native-ack-v2",
+        "stable-feishu-uuid-v2",
+        "exact-base-delivery-v1",
+    }.issubset(capabilities):
+        return None
+    obligation_key = str(metadata.get("obligation_key") or "")
+    content_hash = str(metadata.get("content_hash") or "")
+    plan_fingerprint = str(metadata.get("plan_fingerprint") or "")
+    route = str(metadata.get("route") or "")
+    target_hash = str(metadata.get("target_hash") or "")
+    provisional_uuid_seed = str(metadata.get("provisional_uuid_seed") or "")
+    expected_route = "thread-create" if str(payload.get("thread_id") or "").strip() else "create"
+    try:
+        expected_target_hash = derive_native_handoff_target_hash(
+            profile_id=profile_id,
+            chat_id=chat_id,
+            thread_id=str(payload.get("thread_id") or "").strip(),
+            route=route,
+        )
+        expected_uuid_seed = derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        )
+    except ValueError:
+        return None
+    if (
+        not _is_lower_hex(obligation_key, 64)
+        or not _is_lower_hex(content_hash, 64)
+        or not _is_lower_hex(plan_fingerprint, 64)
+        or not _is_lower_hex(target_hash, 64)
+        or content_hash != _native_handoff_content_hash(answer)
+        or route != expected_route
+        or target_hash != expected_target_hash
+        or provisional_uuid_seed != expected_uuid_seed
+    ):
+        return None
+    return {
+        "chat_id": chat_id,
+        "thread_id": str(payload.get("thread_id") or "").strip(),
+        "content_hash": content_hash,
+        "match_content_hash": content_hash,
+        "obligation_key": obligation_key,
+        "plan_fingerprint": plan_fingerprint,
+        "route": route,
+        "target_hash": target_hash,
+        "uuid_seed": expected_uuid_seed,
+    }
+
+
+def _install_native_handoff_context(
+    binding: dict[str, str],
+    descriptor: dict[str, Any],
+    *,
+    recovery: bool = False,
+    send_content: str | None = None,
+    provisional: bool = False,
+    recovery_url: str = "",
+    recovery_timeout: float = 0.0,
+    recovery_payload: dict[str, Any] | None = None,
+) -> Any:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    context: dict[str, Any] = {
+        "descriptor": descriptor,
+        **binding,
+        "task_id": id(task) if task is not None else None,
+    }
+    if recovery:
+        context["recovery"] = True
+    if send_content is not None:
+        context["send_content"] = send_content
+    if provisional:
+        context["provisional"] = True
+        context["provisional_expires_at"] = (
+            time.time() + NATIVE_HANDOFF_MAX_LIFETIME_SECONDS
+        )
+        context["recovery_url"] = recovery_url
+        context["recovery_timeout"] = recovery_timeout
+        context["recovery_payload"] = copy.deepcopy(recovery_payload)
+    return _HFC_NATIVE_HANDOFF_CONTEXT.set(context)
+
+
+def _register_native_handoff_descriptor(payload: Any, result: Any) -> bool:
+    """Register a server-issued handoff only in the current task context."""
+    _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is not True or result.get("applied") is not False:
+        return False
+    if str(result.get("disposition") or "") != "native":
+        return False
+    descriptor = _validated_native_handoff_descriptor(result.get("native_handoff"))
+    binding = _native_handoff_binding_from_payload(payload)
+    if (
+        descriptor is None
+        or binding is None
+        or descriptor.get("uuid_seed") != binding.get("uuid_seed")
+    ):
+        return False
+    _install_native_handoff_context(binding, descriptor)
+    return True
+
+
+def _native_handoff_for_send(
+    adapter: Any,
+    chat_id: Any,
+    content: Any,
+    metadata: Any,
+) -> dict[str, Any] | None:
+    context = _HFC_NATIVE_HANDOFF_CONTEXT.get()
+    if not isinstance(context, dict):
+        return None
+    descriptor = context.get("descriptor")
+    provisional = context.get("provisional") is True
+    provisional_seed = (
+        str(descriptor.get("uuid_seed") or "")
+        if isinstance(descriptor, dict)
+        else ""
+    )
+    provisional_expires_at = _finite_float(context.get("provisional_expires_at"))
+    descriptor_valid = _validated_native_handoff_descriptor(descriptor) is not None
+    provisional_valid = bool(
+        provisional
+        and _is_lower_hex(provisional_seed, 32)
+        and provisional_expires_at is not None
+        and provisional_expires_at > time.time()
+    )
+    if not descriptor_valid and not provisional_valid:
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return None
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    owner = context.get("task_id")
+    if owner is not None and (task is None or id(task) != owner):
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return None
+    expected_thread = str(context.get("thread_id") or "")
+    actual_thread = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    expected_route = str(context.get("route") or "")
+    actual_route = "thread-create" if actual_thread else "create"
+    try:
+        actual_target_hash = derive_native_handoff_target_hash(
+            profile_id="default",
+            chat_id=str(chat_id or "").strip(),
+            thread_id=actual_thread,
+            route=actual_route,
+        )
+    except ValueError:
+        actual_target_hash = ""
+    matches = (
+        str(chat_id or "").strip() == context.get("chat_id")
+        and _native_handoff_content_hash(content)
+        == context.get("match_content_hash")
+        and _native_handoff_plan_fingerprint(adapter)
+        == context.get("plan_fingerprint")
+        and expected_route == actual_route
+        and actual_thread == expected_thread
+        and actual_target_hash == context.get("target_hash")
+    )
+    if not matches:
+        # A different send in the same task is a lifecycle fence: an old
+        # descriptor must never attach itself to an unrelated later turn.
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return None
+    return context
+
+
+async def _ack_native_handoff(descriptor: dict[str, Any]) -> bool:
+    validated = _validated_native_handoff_descriptor(descriptor)
+    if validated is None:
+        return False
+    try:
+        config = load_runtime_config()
+        url = _summary_base_url(config.event_url) + "/native-handoff/ack"
+        result = await _post_json_response(url, validated, config.timeout_seconds)
+    except Exception:
+        return False
+    return isinstance(result, dict) and result.get("ok") is True
+
+
+def _native_handoff_obligation_key(obligation_id: Any) -> str:
+    value = str(obligation_id or "").strip()
+    if not value or len(value) > 512 or any(ord(character) < 32 for character in value):
+        return ""
+    return sha256(
+        b"hfc-native-obligation-v1\0" + value.encode("utf-8")
+    ).hexdigest()
+
+
+def _native_handoff_recovery_payload(
+    binding: dict[str, str],
+) -> dict[str, str]:
+    return {
+        "protocol": "hfc-native-handoff-recovery-v2",
+        "obligation_key": binding["obligation_key"],
+        "content_hash": binding["content_hash"],
+        "plan_fingerprint": binding["plan_fingerprint"],
+        "route": binding["route"],
+        "target_hash": binding["target_hash"],
+    }
+
+
+async def _lookup_native_handoff_descriptor(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> tuple[str, dict[str, Any] | None]:
+    """Return found, absent, or unknown without mistaking transport loss."""
+    try:
+        result = await _post_json_response(url, payload, timeout)
+    except Exception:
+        return "unknown", None
+    if not isinstance(result, dict):
+        return "unknown", None
+    if result.get("ok") is not True:
+        return "absent", None
+    if result.get("found") is False:
+        return "absent", None
+    if result.get("found") is not True:
+        return "unknown", None
+    descriptor = _validated_native_handoff_descriptor(result.get("native_handoff"))
+    try:
+        expected_seed = derive_native_handoff_uuid_seed(
+            obligation_key=str(payload.get("obligation_key") or ""),
+            content_hash=str(payload.get("content_hash") or ""),
+            plan_fingerprint=str(payload.get("plan_fingerprint") or ""),
+            route=str(payload.get("route") or ""),
+            target_hash=str(payload.get("target_hash") or ""),
+        )
+    except ValueError:
+        return "unknown", None
+    if descriptor is None or descriptor.get("uuid_seed") != expected_seed:
+        return "unknown", None
+    return "found", descriptor
+
+
+def _install_provisional_native_handoff(
+    binding: dict[str, str],
+    *,
+    recovery_url: str,
+    recovery_timeout: float,
+    recovery_payload: dict[str, Any],
+    recovery: bool,
+    match_content: str | None = None,
+) -> Any:
+    provisional_binding = dict(binding)
+    if match_content is not None:
+        provisional_binding["match_content_hash"] = _native_handoff_content_hash(
+            match_content
+        )
+    return _install_native_handoff_context(
+        provisional_binding,
+        {"uuid_seed": binding["uuid_seed"]},
+        recovery=recovery,
+        provisional=True,
+        recovery_url=recovery_url,
+        recovery_timeout=recovery_timeout,
+        recovery_payload=recovery_payload,
+    )
+
+
+def _ledger_obligation_inside_provisional_window(obligation_id: str) -> bool:
+    ledger = sys.modules.get("gateway.delivery_ledger")
+    debug_rows = getattr(ledger, "debug_rows", None) if ledger else None
+    if not callable(debug_rows):
+        return False
+    try:
+        decoded = json.loads(debug_rows(limit=500))
+    except Exception:
+        return False
+    if not isinstance(decoded, list):
+        return False
+    matches = [
+        row
+        for row in decoded
+        if isinstance(row, dict) and row.get("id") == obligation_id
+    ]
+    if len(matches) != 1:
+        return False
+    created_at = _finite_float(matches[0].get("created_at"))
+    if created_at is None:
+        return False
+    age = time.time() - created_at
+    return 0.0 <= age <= NATIVE_HANDOFF_MAX_LIFETIME_SECONDS
+
+
+async def _recover_and_ack_provisional_native_handoff(
+    context: dict[str, Any],
+) -> bool:
+    url = str(context.get("recovery_url") or "")
+    timeout = _finite_float(context.get("recovery_timeout"))
+    payload = context.get("recovery_payload")
+    if not url or timeout is None or timeout <= 0 or not isinstance(payload, dict):
+        return False
+    status, descriptor = await _lookup_native_handoff_descriptor(
+        url,
+        payload,
+        timeout,
+    )
+    if status != "found" or descriptor is None:
+        return False
+    return await _ack_native_handoff(descriptor)
+
+
+def _schedule_provisional_native_handoff_recovery(context: dict[str, Any]) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_recover_and_ack_provisional_native_handoff(dict(context)))
+    _NATIVE_HANDOFF_ACK_TASKS.add(task)
+    task.add_done_callback(_NATIVE_HANDOFF_ACK_TASKS.discard)
+
+
+def _schedule_native_handoff_ack(descriptor: dict[str, Any]) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_ack_native_handoff(descriptor))
+    _NATIVE_HANDOFF_ACK_TASKS.add(task)
+    task.add_done_callback(_NATIVE_HANDOFF_ACK_TASKS.discard)
+
+
+def _hfc_mark_delivery_ledger_delivered_then_ack(
+    obligation_id: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    module = sys.modules.get("gateway.delivery_ledger")
+    original = getattr(module, "_hfc_original_mark_delivered", None) if module else None
+    if not callable(original):
+        raise RuntimeError("original delivery ledger mark_delivered unavailable")
+    # Crash-order invariant: the durable Hermes ledger transition happens
+    # first. If this raises, sidecar ACK is forbidden.
+    result = original(obligation_id, *args, **kwargs)
+    context = _HFC_NATIVE_HANDOFF_CONTEXT.get()
+    if not isinstance(context, dict):
+        return result
+    expected_key = str(context.get("obligation_key") or "")
+    if not expected_key or _native_handoff_obligation_key(obligation_id) != expected_key:
+        return result
+    descriptor = _validated_native_handoff_descriptor(context.get("descriptor"))
+    if descriptor is None:
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        if context.get("provisional") is True:
+            _schedule_provisional_native_handoff_recovery(context)
+        return result
+    # Clear before spawning the ACK task so no later same-task send can reuse
+    # the descriptor after the ledger has become authoritative.
+    _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    _schedule_native_handoff_ack(descriptor)
+    return result
+
+
+def _hfc_mark_delivery_ledger_failed_then_clear(
+    obligation_id: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    module = sys.modules.get("gateway.delivery_ledger")
+    original = getattr(module, "_hfc_original_mark_failed", None) if module else None
+    if not callable(original):
+        raise RuntimeError("original delivery ledger mark_failed unavailable")
+    try:
+        return original(obligation_id, *args, **kwargs)
+    finally:
+        context = _HFC_NATIVE_HANDOFF_CONTEXT.get()
+        if isinstance(context, dict):
+            expected_key = str(context.get("obligation_key") or "")
+            if (
+                expected_key
+                and _native_handoff_obligation_key(obligation_id) == expected_key
+            ):
+                # A failed row is terminal for this in-process attempt. The
+                # descriptor remains durable in sidecar for a later ledger retry,
+                # but must not leak to another send in the current task.
+                _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+
+
+def _install_delivery_ledger_mark_delivered_wrapper() -> bool:
+    try:
+        import gateway.delivery_ledger as ledger
+    except Exception:
+        return False
+    delivered = getattr(ledger, "mark_delivered", None)
+    failed = getattr(ledger, "mark_failed", None)
+    delivered_ready = delivered is _hfc_mark_delivery_ledger_delivered_then_ack
+    failed_ready = failed is _hfc_mark_delivery_ledger_failed_then_clear
+    if not delivered_ready:
+        if not callable(delivered):
+            return False
+        setattr(ledger, "_hfc_original_mark_delivered", delivered)
+        setattr(
+            ledger,
+            "mark_delivered",
+            _hfc_mark_delivery_ledger_delivered_then_ack,
+        )
+        delivered_ready = True
+    if not failed_ready:
+        if not callable(failed):
+            return False
+        setattr(ledger, "_hfc_original_mark_failed", failed)
+        setattr(ledger, "mark_failed", _hfc_mark_delivery_ledger_failed_then_clear)
+        failed_ready = True
+    return delivered_ready and failed_ready
+
+
+async def prepare_native_handoff_recovery(
+    *,
+    adapter: Any,
+    obligation_id: Any,
+    chat_id: Any,
+    content: Any,
+    thread_id: Any = "",
+    original_content: Any = None,
+) -> Any:
+    """Re-establish one task-scoped handoff for a ledger redelivery.
+
+    Only the one-way obligation digest crosses the sidecar boundary. Raw
+    delivery content and routing identifiers remain inside Hermes memory.
+    """
+    _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    raw_obligation_id = str(obligation_id or "").strip()
+    bounded_chat_id = str(chat_id or "").strip()
+    bounded_content = str(content or "")
+    bounded_thread_id = str(thread_id or "").strip()
+    exact_original_content = (
+        original_content
+        if isinstance(original_content, str) and original_content
+        else None
+    )
+    plan_fingerprint = _native_handoff_plan_fingerprint(adapter)
+    route = "thread-create" if bounded_thread_id else "create"
+    if (
+        not raw_obligation_id
+        or len(raw_obligation_id) > 512
+        or not bounded_chat_id
+        or len(bounded_chat_id) > 512
+        or not bounded_content
+        or exact_original_content is None
+        or not _is_lower_hex(plan_fingerprint, 64)
+        or not _native_handoff_runtime_wrappers_ready(adapter)
+        or any(ord(character) < 32 for character in raw_obligation_id)
+    ):
+        return None
+    try:
+        obligation_key = _native_handoff_obligation_key(raw_obligation_id)
+        target_hash = derive_native_handoff_target_hash(
+            profile_id="default",
+            chat_id=bounded_chat_id,
+            thread_id=bounded_thread_id,
+            route=route,
+        )
+        content_hash = _native_handoff_content_hash(exact_original_content)
+        uuid_seed = derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        )
+        binding = {
+            "chat_id": bounded_chat_id,
+            "thread_id": bounded_thread_id,
+            "content_hash": content_hash,
+            "match_content_hash": _native_handoff_content_hash(bounded_content),
+            "obligation_key": obligation_key,
+            "plan_fingerprint": plan_fingerprint,
+            "route": route,
+            "target_hash": target_hash,
+            "uuid_seed": uuid_seed,
+        }
+        request_payload = _native_handoff_recovery_payload(binding)
+        config = load_runtime_config()
+        recovery_url = _summary_base_url(config.event_url) + "/native-handoff/recover"
+        status, descriptor = await _lookup_native_handoff_descriptor(
+            recovery_url,
+            request_payload,
+            config.timeout_seconds,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if status == "found" and descriptor is not None:
+        # A confirmed descriptor refers to the exact original ledger row, so
+        # chunk boundaries and UUID ordinals may safely omit RECOVERED_MARKER.
+        return _install_native_handoff_context(
+            binding,
+            descriptor,
+            recovery=True,
+            send_content=exact_original_content,
+        )
+    if status == "unknown" and _ledger_obligation_inside_provisional_window(
+        raw_obligation_id
+    ):
+        # Transport ambiguity inside Hermes' one-hour ledger window may use
+        # the deterministic seed, but it keeps the visible marker until a
+        # full sidecar descriptor is independently recovered.
+        return _install_provisional_native_handoff(
+            binding,
+            recovery_url=recovery_url,
+            recovery_timeout=config.timeout_seconds,
+            recovery_payload=request_payload,
+            recovery=True,
+            match_content=bounded_content,
+        )
+    return None
+
+
+def finish_native_handoff_recovery(scope: Any) -> None:
+    if scope is None:
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return
+    try:
+        _HFC_NATIVE_HANDOFF_CONTEXT.reset(scope)
+    except Exception:
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+
+
+def _native_handoff_response_succeeded(adapter: Any, response: Any) -> bool:
+    checker = getattr(adapter, "_response_succeeded", None)
+    if callable(checker):
+        try:
+            return bool(checker(response))
+        except Exception:
+            return False
+    return bool(response and getattr(response, "success", lambda: False)())
+
+
+def _native_handoff_post_requires_text_fallback(adapter: Any, value: Any) -> bool:
+    text = str(getattr(value, "msg", "") or value or "")
+    module = sys.modules.get(type(adapter).__module__)
+    pattern = getattr(module, "_POST_CONTENT_INVALID_RE", None) if module else None
+    try:
+        if pattern is not None and pattern.search(text):
+            return True
+    except Exception:
+        pass
+    lowered = text.lower()
+    return "post" in lowered and ("invalid" in lowered or "format" in lowered)
+
+
+async def _hfc_feishu_send_with_native_handoff_tracking(
+    self: Any,
+    *,
+    chat_id: str,
+    msg_type: str,
+    payload: str,
+    reply_to: str | None,
+    metadata: dict[str, Any] | None,
+) -> Any:
+    original = getattr(type(self), "_hfc_original_feishu_send_with_retry", None)
+    if not callable(original):
+        raise RuntimeError("original Feishu retry helper unavailable")
+    tracker = _HFC_NATIVE_HANDOFF_SEND_TRACKER.get()
+    if not isinstance(tracker, dict):
+        return await original(
+            self,
+            chat_id=chat_id,
+            msg_type=msg_type,
+            payload=payload,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+    fallback_ordinal = tracker.get("fallback_ordinal")
+    if msg_type == "text" and isinstance(fallback_ordinal, int):
+        ordinal = fallback_ordinal
+        tracker["fallback_ordinal"] = None
+    else:
+        ordinal = int(tracker.get("next_ordinal", 0))
+        tracker["next_ordinal"] = ordinal + 1
+    required = tracker.setdefault("required", {})
+    required.setdefault(ordinal, False)
+    token = _HFC_NATIVE_HANDOFF_CHUNK.set(
+        {"ordinal": ordinal, "format": str(msg_type or "text")}
+    )
+    try:
+        response = await original(
+            self,
+            chat_id=chat_id,
+            msg_type=msg_type,
+            payload=payload,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        succeeded = _native_handoff_response_succeeded(self, response)
+        required[ordinal] = succeeded
+        failures = tracker.setdefault("failures", {})
+        if succeeded:
+            failures.pop(ordinal, None)
+        else:
+            failures[ordinal] = response
+        if (
+            msg_type == "post"
+            and not succeeded
+            and _native_handoff_post_requires_text_fallback(self, response)
+        ):
+            tracker["fallback_ordinal"] = ordinal
+        return response
+    except Exception as exc:
+        required[ordinal] = False
+        tracker.setdefault("failures", {})[ordinal] = exc
+        if msg_type == "post" and _native_handoff_post_requires_text_fallback(self, exc):
+            tracker["fallback_ordinal"] = ordinal
+        raise
+    finally:
+        _HFC_NATIVE_HANDOFF_CHUNK.reset(token)
+
+
+async def _hfc_topic_anchor_for_send(
+    self: Any, thread_id: str, metadata: dict[str, Any] | None
+) -> str:
+    """Resolve a message id INSIDE ``thread_id`` so an unanchored topic send can reply into it.
+
+    ``metadata["reply_to_message_id"]`` is preferred (no extra API call); otherwise the newest
+    message in the topic is fetched. Any failure returns ``""`` so the caller keeps its previous
+    routing — never let an anchor lookup break a delivery.
+    """
+    candidate = _metadata_reply_to(metadata)
+    if candidate.startswith("om_"):
+        return candidate
+    fetch = getattr(self, "_fetch_last_message_in_thread", None)
+    if not callable(fetch):
+        return ""
+    try:
+        anchor = await fetch(thread_id)
+    except Exception as exc:
+        logger.warning(
+            "[hermes-feishu-card] topic anchor lookup failed: thread_hash=%s error_kind=%s",
+            sha256(thread_id.encode()).hexdigest()[:12], type(exc).__name__
+        )
+        return ""
+    anchor = str(anchor or "").strip()
+    if not anchor:
+        logger.warning(
+            "[hermes-feishu-card] no anchor inside topic thread_hash=%s; falling back to an unanchored send, "
+            "which becomes a NEW topic in a topic group",
+            sha256(thread_id.encode()).hexdigest()[:12],
+        )
+    return anchor
+
+
+async def _hfc_send_raw_message_with_native_handoff_route(self: Any, **kwargs: Any) -> Any:
+    original = getattr(type(self), "_hfc_original_send_raw_message", None)
+    if not callable(original):
+        raise RuntimeError("original Feishu raw send unavailable")
+    metadata = kwargs.get("metadata")
+    thread_id = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    reply_to = str(kwargs.get("reply_to") or "").strip()
+    if not reply_to and thread_id:
+        metadata_reply_to = _metadata_reply_to(
+            metadata if isinstance(metadata, dict) else None
+        )
+        if metadata_reply_to.startswith("om_"):
+            kwargs = dict(kwargs)
+            kwargs["reply_to"] = metadata_reply_to
+            reply_to = metadata_reply_to
+    send_kwargs = kwargs
+    if thread_id and not reply_to:
+        # A topic send with no reply anchor cannot be addressed by Feishu: ``thread_id`` is not a
+        # supported receive_id for message.create, so an unanchored create silently becomes a NEW
+        # topic in a topic group. Media sends (image/file/voice/video) and the approval/update-prompt
+        # cards arrive with ``metadata["thread_id"]`` only — resolve an anchor INSIDE the topic and
+        # reply to it, instead of dropping the topic binding and posting to the parent chat.
+        anchor = await _hfc_topic_anchor_for_send(
+            self, thread_id, metadata if isinstance(metadata, dict) else None
+        )
+        send_kwargs = dict(kwargs)
+        if anchor:
+            send_kwargs["reply_to"] = anchor
+            reply_to = anchor
+        else:
+            # No anchor reachable: preserve the logical topic binding for native-handoff
+            # identity/UUID derivation, while the unanchored create falls back to the parent chat.
+            send_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            send_metadata.pop("thread_id", None)
+            send_kwargs["metadata"] = send_metadata
+    if _HFC_NATIVE_HANDOFF_SEND_TRACKER.get() is None:
+        return await original(self, **send_kwargs)
+    if thread_id:
+        route = "thread-reply" if reply_to else "thread-create"
+    else:
+        route = "reply" if reply_to else "create"
+    token = _HFC_NATIVE_HANDOFF_ROUTE.set(route)
+    try:
+        return await original(self, **send_kwargs)
+    finally:
+        _HFC_NATIVE_HANDOFF_ROUTE.reset(token)
+
+
+def _native_handoff_uuid(uuid_seed: str, ordinal: int, route: str, msg_type: str) -> str:
+    digest = sha256(
+        (
+            "hfc-feishu-uuid-v1\0"
+            + uuid_seed
+            + "\0"
+            + str(ordinal)
+            + "\0"
+            + route
+            + "\0"
+            + msg_type
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:]}"
+
+
+def _hfc_build_reply_message_body_with_native_uuid(
+    self: Any,
+    *,
+    content: str,
+    msg_type: str,
+    reply_in_thread: bool,
+    uuid_value: str,
+) -> Any:
+    original = getattr(type(self), "_hfc_original_build_reply_message_body", None)
+    chunk = _HFC_NATIVE_HANDOFF_CHUNK.get()
+    tracker = _HFC_NATIVE_HANDOFF_SEND_TRACKER.get()
+    if callable(original) and isinstance(chunk, dict) and isinstance(tracker, dict):
+        descriptor = tracker.get("descriptor") or {}
+        uuid_value = _native_handoff_uuid(
+            str(descriptor.get("uuid_seed") or ""),
+            int(chunk.get("ordinal", 0)),
+            _HFC_NATIVE_HANDOFF_ROUTE.get()
+            or ("thread-reply" if reply_in_thread else "reply"),
+            str(chunk.get("format") or msg_type or "text"),
+        )
+    if not callable(original):
+        raise RuntimeError("original Feishu reply body builder unavailable")
+    return original(
+        content=content,
+        msg_type=msg_type,
+        reply_in_thread=reply_in_thread,
+        uuid_value=uuid_value,
+    )
+
+
+def _hfc_build_create_message_body_with_native_uuid(
+    self: Any,
+    *,
+    receive_id: str,
+    msg_type: str,
+    content: str,
+    uuid_value: str,
+) -> Any:
+    original = getattr(type(self), "_hfc_original_build_create_message_body", None)
+    chunk = _HFC_NATIVE_HANDOFF_CHUNK.get()
+    tracker = _HFC_NATIVE_HANDOFF_SEND_TRACKER.get()
+    if callable(original) and isinstance(chunk, dict) and isinstance(tracker, dict):
+        descriptor = tracker.get("descriptor") or {}
+        uuid_value = _native_handoff_uuid(
+            str(descriptor.get("uuid_seed") or ""),
+            int(chunk.get("ordinal", 0)),
+            _HFC_NATIVE_HANDOFF_ROUTE.get() or "create",
+            str(chunk.get("format") or msg_type or "text"),
+        )
+    if not callable(original):
+        raise RuntimeError("original Feishu create body builder unavailable")
+    return original(
+        receive_id=receive_id,
+        msg_type=msg_type,
+        content=content,
+        uuid_value=uuid_value,
+    )
+
+
+def _native_handoff_aggregate_failure(
+    adapter: Any,
+    result: Any,
+    tracker: dict[str, Any],
+) -> Any:
+    failures = tracker.get("failures")
+    if isinstance(failures, dict) and failures:
+        first_failure = failures[min(failures)]
+        if not isinstance(first_failure, BaseException):
+            finalizer = getattr(adapter, "_finalize_send_result", None)
+            if callable(finalizer):
+                try:
+                    failed_result = finalizer(
+                        first_failure,
+                        "native handoff chunk delivery incomplete",
+                    )
+                    if not getattr(failed_result, "success", False):
+                        return failed_result
+                except Exception:
+                    pass
+    try:
+        result.success = False
+        result.error = "native handoff chunk delivery incomplete"
+        return result
+    except Exception:
+        return SimpleNamespace(
+            success=False,
+            message_id=None,
+            error="native handoff chunk delivery incomplete",
+            retryable=False,
+            retry_after=None,
+        )
+
+
+async def _hfc_send_with_native_command_result_card(
+    self: Any,
+    chat_id: str,
+    content: str,
+    reply_to: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    original = getattr(type(self), "_hfc_original_send", None)
+    from .notice_producers import notice_for_send
+    try:
+        notice = notice_for_send(self, chat_id, content, metadata)
+    except Exception:
+        notice = None
+    if notice is not None and callable(original):
+        result = await original(self, chat_id, notice['content'], reply_to=reply_to, metadata=metadata)
+        if getattr(result, "success", False) is True:
+            await schedule_message_recall_async(
+                str(getattr(result, "message_id", "") or ""),
+                route=notice['route'], notice_family=notice['family'],
+            )
+        return result
+    handoff_context = _native_handoff_for_send(self, chat_id, content, metadata)
+    if handoff_context is not None and callable(original):
+        descriptor = handoff_context["descriptor"]
+        delivery_content = content
+        if handoff_context.get("recovery") is True:
+            exact_original_content = handoff_context.get("send_content")
+            if isinstance(exact_original_content, str) and exact_original_content:
+                delivery_content = exact_original_content
+        tracker = {
+            "descriptor": descriptor,
+            "next_ordinal": 0,
+            "fallback_ordinal": None,
+            "required": {},
+            "failures": {},
+        }
+        effective_metadata = dict(metadata or {})
+        for reply_key in ("reply_to_message_id", "message_id", "reply_to"):
+            effective_metadata.pop(reply_key, None)
+        expected_thread = str(handoff_context.get("thread_id") or "")
+        if expected_thread:
+            effective_metadata["thread_id"] = expected_thread
+        else:
+            effective_metadata.pop("thread_id", None)
+        token = _HFC_NATIVE_HANDOFF_SEND_TRACKER.set(tracker)
+        try:
+            result = await original(
+                self,
+                chat_id,
+                delivery_content,
+                reply_to=None,
+                metadata=effective_metadata or None,
+            )
+        except Exception:
+            # An exception escapes the adapter's normal SendResult contract;
+            # do not let its descriptor leak to a later task-local send.
+            _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+            raise
+        finally:
+            _HFC_NATIVE_HANDOFF_SEND_TRACKER.reset(token)
+        required = tracker.get("required") or {}
+        fully_delivered = (
+            bool(getattr(result, "success", False))
+            and bool(required)
+            and all(value is True for value in required.values())
+        )
+        if not fully_delivered:
+            if handoff_context.get("recovery") is True:
+                _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+            return _native_handoff_aggregate_failure(self, result, tracker)
+        obligation_key = str(handoff_context.get("obligation_key") or "")
+        if obligation_key:
+            # Hermes' delivery ledger owns the crash-safe ACK order. Its
+            # mark_delivered wrapper will ACK only after the durable ledger
+            # transition succeeds.
+            return result
+        acknowledged = await _ack_native_handoff(descriptor)
+        if acknowledged or handoff_context.get("recovery") is True:
+            _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return result
+    if not await _hfc_direct_card_allowed_async(chat_id):
+        _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+        if callable(original):
+            return await original(
+                self,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return _send_result(False, error="original Feishu send unavailable")
+    if _should_suppress_matching_native_media_text(chat_id, content):
+        return _send_result(True, message_id="media_text_suppressed")
+    context = _hfc_take_feishu_command_result_context(chat_id=chat_id, content=content)
+    if context is not None:
+        result = await _hfc_send_native_command_result_card(
+            self,
+            chat_id=chat_id,
+            content=str(content or ""),
+            reply_to=reply_to,
+            metadata=metadata,
+            context=context,
+        )
+        if getattr(result, "success", False):
+            return result
+    notice_result = await _hfc_send_system_notice_card(
+        self,
+        chat_id=chat_id,
+        content=content,
+        reply_to=reply_to,
+        metadata=metadata,
+    )
+    if getattr(notice_result, "success", False):
+        return notice_result
+    if _hfc_classify_system_notice(content) is not None:
+        if getattr(notice_result, "error", None) == "delivery_disposition=native":
+            if callable(original):
+                return await original(
+                    self,
+                    chat_id,
+                    content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return _send_result(False, error="original Feishu send unavailable")
+        outcome = _hfc_send_result_delivery_outcome(notice_result)
+        if callable(original):
+            fallback_content = (
+                content if outcome == "not_sent" else _NOTICE_UNCERTAIN_WARNING
+            )
+            return await original(
+                self,
+                chat_id,
+                fallback_content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return _send_result(False, error="original Feishu send unavailable")
+    if callable(original):
+        result = await original(self, chat_id, content, reply_to=reply_to, metadata=metadata)
+        await _hfc_recall_plain_text_status_notice(
+            chat_id, content, metadata, result, reply_to=reply_to,
+        )
+        return result
+    return _send_result(False, error="original Feishu send unavailable")
+
+
+async def _hfc_recall_plain_text_status_notice(
+    chat_id: str,
+    content: Any,
+    metadata: Any,
+    result: Any,
+    *,
+    reply_to: str | None = None,
+    generated_restart_notice: bool = False,
+) -> bool:
+    """Best-effort recall of known status templates on the task's own route.
+
+    Preserve native send success even if recall fails. A foreign or invalid
+    context cannot select the bot that will delete the message.
+    """
+    try:
+        context = _HFC_FEISHU_DELIVERY_CONTEXT.get()
+        if not isinstance(context, dict):
+            context = _HFC_FEISHU_NOTICE_CONTEXT.get()
+        if isinstance(context, dict):
+            if context.get("chat_id") != chat_id or context.get("profile_invalid"):
+                return False
+        else:
+            context = {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        source = SimpleNamespace(
+            platform="feishu",
+            chat_id=str(chat_id or ""),
+            profile_id=str(context.get("profile_id") or ""),
+            thread_id=str(metadata.get("thread_id") or context.get("thread_id") or ""),
+        )
+        # Text recognition alone never authorizes withdrawal: an ordinary answer
+        # can quote the exact template. Only HFC's dedicated notice producer sets
+        # this provenance bit; native/home/adapter.send text has no such proof.
+        if generated_restart_notice and str(content or "") == _HFC_GATEWAY_ONLINE_TEXT:
+            if getattr(result, "success", False) is not True:
+                return False
+            profile, provenance = _profile_identity({}, source, None)
+            if provenance.startswith("sanitized_"):
+                return False
+            # With no explicit topic, a reply anchor is safer than guessing home.
+            thread_id = source.thread_id or str(reply_to or "")
+            return await schedule_message_recall_async(
+                str(getattr(result, "message_id", "") or ""),
+                route={"profile_id": profile, "chat_id": source.chat_id,
+                       "conversation_id": thread_id},
+                notice_family="restart",
+            )
+        return await recall_transient_thread_notice_async(source, content, result)
+    except Exception:
+        return False
+
+
+async def _hfc_edit_message_with_system_notice_card(self: Any, *args: Any, **kwargs: Any) -> Any:
+    original = getattr(type(self), "_hfc_original_edit_message", None)
+    parsed = _hfc_parse_edit_message_args(args, kwargs)
+    if parsed is not None:
+        chat_id, message_id, content, metadata = parsed
+        notice_result = await _hfc_send_system_notice_card(
+            self,
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+            existing_message_id=message_id,
+        )
+        if getattr(notice_result, "success", False):
+            return notice_result
+    if callable(original):
+        forwarded_kwargs = dict(kwargs)
+        try:
+            parameters = inspect.signature(original).parameters
+            accepts_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if not accepts_var_kwargs and "metadata" not in parameters:
+                forwarded_kwargs.pop("metadata", None)
+        except (TypeError, ValueError):
+            # ``metadata`` is consumed by this wrapper for card routing. Some
+            # Hermes Feishu adapters do not accept it on ``edit_message``.
+            forwarded_kwargs.pop("metadata", None)
+        return await original(self, *args, **forwarded_kwargs)
+    return _send_result(False, error="original Feishu edit_message unavailable")
+
+
+def handle_platform_notice_from_hermes(runner: Any, source: Any, content: str) -> bool:
+    """Route Hermes native platform notices into Feishu cards before text fallback."""
+    try:
+        if _platform_name({}, source) != "feishu":
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        if not chat_id:
+            return False
+        if not _hfc_direct_card_allowed_sync(chat_id):
+            return False
+        if _hfc_classify_system_notice(str(content or "")) is None:
+            return False
+        adapter = _hfc_feishu_adapter_from_runner(runner, source)
+        if adapter is None:
+            return False
+        # Preserve Hermes' private-notice policy, including per-profile adapter
+        # overrides; a recognized setup message must not become a public card.
+        extra = getattr(getattr(adapter, "config", None), "extra", None)
+        delivery = extra.get("notice_delivery") if isinstance(extra, dict) else None
+        if delivery is None:
+            resolve_delivery = getattr(getattr(runner, "config", None), "get_notice_delivery", None)
+            if callable(resolve_delivery):
+                delivery = resolve_delivery(getattr(source, "platform", None))
+        if delivery == "private":
+            return False
+        _hfc_schedule_platform_notice_card(
+            adapter=adapter,
+            chat_id=chat_id,
+            content=str(content or ""),
+            reply_to=str(getattr(source, "message_id", "") or "").strip() or None,
+            notice_context=_hfc_notice_context_from_source(source),
+        )
+        return True
+    except Exception as exc:
+        _hfc_warn(
+            "platform notice hook failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+        return False
+
+
+async def _hfc_deliver_platform_notice_with_card(
+    self: Any,
+    source: Any,
+    content: str,
+) -> Any:
+    original = getattr(type(self), "_hfc_original_deliver_platform_notice", None)
+    if handle_platform_notice_from_hermes(self, source, content):
+        return _send_result(
+            True,
+            message_id=str(getattr(source, "message_id", "") or "").strip() or None,
+        )
+    if callable(original):
+        return await original(self, source, content)
+    return None
+
+
+def _hfc_registered_adapter_items(runner: Any) -> list[tuple[Any, Any]]:
+    """Include connected secondary transports without duplicating shared instances."""
+    registries = [getattr(runner, "adapters", None)]
+    profiles = getattr(runner, "_profile_adapters", None)
+    if isinstance(profiles, dict):
+        registries.extend(list(profiles.values()))
+    result = []
+    seen = set()
+    for registry in registries:
+        if not isinstance(registry, dict):
+            continue
+        for key, adapter in list(registry.items()):
+            if adapter is not None and id(adapter) not in seen:
+                seen.add(id(adapter))
+                result.append((key, adapter))
+    return result
+
+
+def _hfc_delivery_resolver(runner: Any) -> Any:
+    # New Hermes separates intake authorization from outbound delivery. A
+    # callable resolver returning None is an authoritative refusal, not an
+    # invitation to guess another profile's bot.
+    for name in ("_delivery_adapter_for", "_adapter_for_source", "_intake_adapter_for"):
+        resolver = getattr(runner, name, None)
+        if callable(resolver):
+            return resolver
+    return None
+
+
+def _hfc_feishu_adapter_from_runner(runner: Any, source: Any) -> Any:
+    if source is None or _platform_name({}, source) != "feishu":
+        return None
+    # Current Hermes validates retained transport provenance before profile lookup.
+    # A shared bot may own a turn routed to another profile; preserve that contract.
+    resolver = _hfc_delivery_resolver(runner)
+    if callable(resolver):
+        try:
+            adapter = resolver(source)
+        except Exception:
+            return None
+        return adapter if adapter is not None and _is_feishu_adapter_key(None, adapter) else None
+    adapters = getattr(runner, "adapters", None)
+    profile = _first_attr_string(source, ("profile", "profile_id", "hermes_profile"))
+    if profile and profile != "default":
+        profiles = getattr(runner, "_profile_adapters", None)
+        if isinstance(profiles, dict) and profile in profiles:
+            adapters = profiles[profile]
+        elif profile != getattr(runner, "_primary_profile_name", None):
+            return None
+    if not isinstance(adapters, dict):
+        return None
+    for key, adapter in list(adapters.items()):
+        if _is_feishu_adapter_key(key, adapter):
+            return adapter
+    return None
+
+
+def _hfc_schedule_platform_notice_card(
+    *,
+    adapter: Any,
+    chat_id: str,
+    content: str,
+    reply_to: str | None,
+    notice_context: dict[str, str] | None,
+) -> None:
+    async def send_notice() -> None:
+        token = None
+        if notice_context is not None:
+            token = _HFC_FEISHU_NOTICE_CONTEXT.set(notice_context)
+        try:
+            notice_result = await _hfc_send_system_notice_card(
+                adapter,
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=None,
+            )
+            if not getattr(notice_result, "success", False):
+                _hfc_warn(
+                    "system notice card delivery failed; native notice suppressed"
+                )
+        except Exception as exc:
+            _hfc_warn(
+                "system notice card delivery failed; native notice suppressed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
+        finally:
+            if token is not None:
+                _HFC_FEISHU_NOTICE_CONTEXT.reset(token)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(send_notice())
+        return
+    loop.create_task(send_notice())
+
+
+def _hfc_parse_edit_message_args(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[str, str, str, dict[str, Any] | None] | None:
+    chat_id = str(kwargs.get("chat_id") or "").strip()
+    message_id = str(kwargs.get("message_id") or kwargs.get("msg_id") or "").strip()
+    content = kwargs.get("content", kwargs.get("text"))
+    metadata = kwargs.get("metadata")
+    if len(args) >= 3:
+        chat_id = chat_id or str(args[0] or "").strip()
+        message_id = message_id or str(args[1] or "").strip()
+        if content is None:
+            content = args[2]
+        if metadata is None and len(args) >= 4 and isinstance(args[3], dict):
+            metadata = args[3]
+    elif len(args) >= 2:
+        message_id = message_id or str(args[0] or "").strip()
+        if content is None:
+            content = args[1]
+    if not chat_id:
+        context = _HFC_FEISHU_NOTICE_CONTEXT.get()
+        if isinstance(context, dict):
+            chat_id = str(context.get("chat_id") or "").strip()
+    if not chat_id or not message_id or content is None:
+        return None
+    return chat_id, message_id, str(content or ""), metadata if isinstance(metadata, dict) else None
+
+
+def _hfc_slash_choice_label(choice: str) -> tuple[str, str]:
+    if choice == "always":
+        return "已始终允许", "green"
+    if choice == "cancel":
+        return "已取消", "red"
+    return "已允许一次", "green"
+
+
+async def _hfc_send_native_slash_confirm(
+    self: Any,
+    chat_id: str,
+    title: str,
+    message: str,
+    session_key: str,
+    confirm_id: str,
+    metadata: dict[str, Any] | None = None,
+):
+    if not await _hfc_direct_card_allowed_async(
+        chat_id,
+        event_name="interaction.requested",
+    ):
+        original = getattr(self, "_hfc_original_send_slash_confirm", None)
+        if callable(original):
+            return await original(
+                chat_id,
+                title,
+                message,
+                session_key,
+                confirm_id,
+                metadata=metadata,
+            )
+        return _send_result(False, error="delivery_disposition=native")
+    if not getattr(self, "_client", None):
+        _hfc_warn("send_slash_confirm skipped: Feishu adapter is not connected")
+        return _send_result(False, error="not connected")
+    if not hasattr(self, "_feishu_send_with_retry"):
+        _hfc_warn("send_slash_confirm skipped: Feishu adapter send helper is unavailable")
+        return _send_result(False, error="feishu send unavailable")
+
+    prompt_title = str(title or "").strip() or "确认命令"
+    detail = _hfc_slash_confirm_detail(message)
+    card = {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "title": {"content": prompt_title, "tag": "plain_text"},
+            "template": "orange",
+        },
+        "elements": [
+            {"tag": "markdown", "content": detail},
+            {
+                "tag": "action",
+                "actions": [
+                    _hfc_button(
+                        "允许一次",
+                        {
+                            "hfc_action": "slash_confirm",
+                            "hfc_confirm_id": confirm_id,
+                            "hfc_choice": "once",
+                        },
+                        "primary",
+                    ),
+                    _hfc_button(
+                        "始终允许",
+                        {
+                            "hfc_action": "slash_confirm",
+                            "hfc_confirm_id": confirm_id,
+                            "hfc_choice": "always",
+                        },
+                    ),
+                    _hfc_button(
+                        "取消",
+                        {
+                            "hfc_action": "slash_confirm",
+                            "hfc_confirm_id": confirm_id,
+                            "hfc_choice": "cancel",
+                        },
+                        "danger",
+                    ),
+                ],
+            },
+        ],
+    }
+    try:
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=serialize_card_for_delivery(card),
+            reply_to=_metadata_reply_to(metadata) or None,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        _hfc_warn(f"send_slash_confirm failed: {_hfc_exception_summary(exc)}")
+        return _send_result(False, error=str(exc))
+
+    success, message_id = _hfc_feishu_send_success(response)
+    if not success:
+        _hfc_warn(
+            f"send_slash_confirm failed: response={_hfc_response_summary(response)}"
+        )
+        return _send_result(False, error="send_slash_confirm failed")
+    _hfc_info(
+        "send_slash_confirm stored "
+        f"{_hfc_log_reference('confirm', confirm_id)} "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
+    state = getattr(self, "_hfc_slash_confirm_state", None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(self, "_hfc_slash_confirm_state", state)
+    state[str(confirm_id)] = {
+        **_hfc_pending_command_identity(str(chat_id or "")),
+        "session_key": str(session_key or ""),
+        "chat_id": str(chat_id or ""),
+        "message_id": message_id,
+    }
+    return _send_result(True, message_id=message_id)
+
+
+async def _hfc_send_native_model_picker(
+    self: Any,
+    chat_id: str,
+    providers: Any,
+    current_model: str = "",
+    current_provider: str = "",
+    session_key: str = "",
+    on_model_selected: Any = None,
+    metadata: dict[str, Any] | None = None,
+):
+    if not await _hfc_direct_card_allowed_async(
+        chat_id,
+        event_name="interaction.requested",
+    ):
+        original = getattr(self, "_hfc_original_send_model_picker", None)
+        if callable(original):
+            return await original(
+                chat_id,
+                providers,
+                current_model=current_model,
+                current_provider=current_provider,
+                session_key=session_key,
+                on_model_selected=on_model_selected,
+                metadata=metadata,
+            )
+        return _send_result(False, error="delivery_disposition=native")
+    if not getattr(self, "_client", None) or not hasattr(self, "_feishu_send_with_retry"):
+        return await _hfc_send_model_picker(
+            self,
+            chat_id,
+            providers,
+            current_model=current_model,
+            current_provider=current_provider,
+            session_key=session_key,
+            on_model_selected=on_model_selected,
+            metadata=metadata,
+        )
+
+    provider_tree = _model_picker_provider_tree(providers)
+    if not provider_tree:
+        return _send_result(False, error="no model options")
+    picker_id = "model_" + sha256(
+        f"{chat_id}:{session_key}:{time.time()}".encode("utf-8")
+    ).hexdigest()[:16]
+    card = _hfc_native_model_picker_card(
+        picker_id=picker_id,
+        providers=provider_tree,
+        current_provider=current_provider,
+        current_model=current_model,
+    )
+    try:
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=serialize_card_for_delivery(card),
+            reply_to=_metadata_reply_to(metadata) or None,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        return _send_result(False, error=str(exc))
+
+    success, message_id = _hfc_feishu_send_success(response)
+    if not success:
+        return _send_result(False, error="send_model_picker failed")
+    _hfc_info(
+        "send_model_picker stored "
+        f"{_hfc_log_reference('picker', picker_id)} "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
+    state = getattr(self, "_hfc_model_picker_state", None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(self, "_hfc_model_picker_state", state)
+    state[picker_id] = {
+        **_hfc_pending_command_identity(str(chat_id or "")),
+        "chat_id": str(chat_id or ""),
+        "session_key": str(session_key or ""),
+        "message_id": message_id,
+        "on_model_selected": on_model_selected,
+        "providers": provider_tree,
+        "current_provider": str(current_provider or ""),
+        "current_model": str(current_model or ""),
+        "selected_provider": "",
+    }
+    return _send_result(True, message_id=message_id)
+
+
+async def _hfc_send_native_resume_picker(
+    self: Any,
+    *,
+    chat_id: str,
+    sessions: Any,
+    current_session_id: str = "",
+    runner: Any,
+    event: Any,
+    original_handler: Any,
+    metadata: dict[str, Any] | None = None,
+):
+    if not await _hfc_direct_card_allowed_async(
+        chat_id,
+        event_name="interaction.requested",
+    ):
+        original = getattr(self, "_hfc_original_send_resume_picker", None)
+        if callable(original):
+            return await original(
+                chat_id=chat_id,
+                sessions=sessions,
+                current_session_id=current_session_id,
+                runner=runner,
+                event=event,
+                original_handler=original_handler,
+                metadata=metadata,
+            )
+        return _send_result(False, error="delivery_disposition=native")
+    if not getattr(self, "_client", None) or not hasattr(
+        self, "_feishu_send_with_retry"
+    ):
+        return _send_result(False, error="native resume picker unavailable")
+    options = _resume_picker_options(
+        sessions,
+        current_session_id=current_session_id,
+        max_options=10,
+    )
+    if not options:
+        return _send_result(False, error="no resume options")
+    picker_id = "resume_" + sha256(
+        f"{chat_id}:{time.time()}:{secrets.token_hex(8)}".encode("utf-8")
+    ).hexdigest()[:16]
+    initial_option = next(
+        (
+            option["value"]
+            for option in options
+            if option["value"] == str(current_session_id or "")
+        ),
+        "",
+    )
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": "恢复会话", "tag": "plain_text"},
+            "template": "blue",
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": "选择一个最近的命名会话。",
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    _hfc_select_static(
+                        placeholder="选择会话",
+                        value={
+                            "hfc_action": "resume_picker",
+                            "hfc_resume_picker_id": picker_id,
+                        },
+                        options=options,
+                        initial_option=initial_option,
+                    )
+                ],
+            },
+        ],
+    }
+    try:
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=serialize_card_for_delivery(card),
+            reply_to=_metadata_reply_to(metadata) or None,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        return _send_result(False, error=str(exc))
+    success, message_id = _hfc_feishu_send_success(response)
+    if not success:
+        return _send_result(
+            False,
+            error=(
+                "send_resume_picker failed: "
+                f"code={getattr(response, 'code', 'unknown')} "
+                f"msg={str(getattr(response, 'msg', '') or '')}"
+            ),
+        )
+
+    source = getattr(event, "source", None)
+    state = getattr(self, "_hfc_resume_picker_state", None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(self, "_hfc_resume_picker_state", state)
+    state[picker_id] = {
+        "allowed_session_ids": {option["value"] for option in options},
+        "chat_id": str(chat_id or ""),
+        "chat_type": str(getattr(source, "chat_type", "") or "").lower(),
+        "operator_open_id": _hfc_resume_operator_open_id(event),
+        "message_id": message_id,
+        "runner": runner,
+        "event": event,
+        "original_handler": original_handler,
+        "expires_at": time.time() + 300,
+    }
+    _hfc_info(
+        "send_resume_picker stored "
+        f"{_hfc_log_reference('picker', picker_id)} "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
+    return _send_result(True, message_id=message_id)
+
+
+def _hfc_action_value_from_data(data: Any) -> dict[str, Any]:
+    event = getattr(data, "event", None)
+    action = getattr(event, "action", None)
+    action_value = getattr(action, "value", {}) or {}
+    if isinstance(action_value, dict):
+        value = dict(action_value)
+    elif isinstance(action_value, str):
+        try:
+            parsed = json.loads(action_value)
+        except Exception:
+            parsed = {}
+        value = dict(parsed) if isinstance(parsed, dict) else {}
+    else:
+        value = {}
+
+    form_value = getattr(action, "form_value", {}) or {}
+    if isinstance(form_value, dict):
+        for key in (
+            "hfc_action",
+            "hfc_confirm_id",
+            "hfc_choice",
+            "hfc_model_picker_id",
+            "hfc_model_picker_view",
+            "hfc_model_picker_nav",
+            "hfc_resume_picker_id",
+            "hfc_command_center_id",
+            "hfc_command_center_nav",
+            "hfc_command_center_category",
+            "hfc_command_center_command",
+        ):
+            if key not in value and form_value.get(key):
+                value[key] = form_value.get(key)
+
+    option = str(getattr(action, "option", "") or "").strip()
+    if option and "hfc_choice" not in value:
+        value["hfc_choice"] = option
+    return value
+
+
+def _hfc_action_metadata(data: Any) -> dict[str, Any] | None:
+    """Best-effort extraction of message metadata from a card-action event.
+
+    Used when sending a follow-up card so Feishu threading/metadata stays
+    consistent. Returns None if not available (callers must accept None).
+    """
+    event = getattr(data, "event", None)
+    if event is None:
+        return None
+    meta = getattr(event, "message", None)
+    if isinstance(meta, dict):
+        return meta.get("metadata")
+    meta = getattr(event, "metadata", None)
+    if isinstance(meta, dict):
+        return meta
+    return None
+
+
+def _hfc_action_chat_id(data: Any) -> str:
+    event = getattr(data, "event", None)
+    context = getattr(event, "context", None)
+    return str(getattr(context, "open_chat_id", "") or "")
+
+
+def _hfc_action_open_id(data: Any) -> str:
+    event = getattr(data, "event", None)
+    operator = getattr(event, "operator", None)
+    return str(getattr(operator, "open_id", "") or "")
+
+
+def _hfc_pending_command_identity(chat_id: str) -> dict[str, str]:
+    """Snapshot the admitted command, never the callback's claimed chat type."""
+    context = _HFC_FEISHU_COMMAND_RESULT_CONTEXT.get()
+    if not isinstance(context, dict) or context.get("chat_id") != chat_id:
+        return {}
+    try:
+        if float(context.get("expires_at") or 0) <= time.monotonic():
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {
+        "chat_type": str(context.get("chat_type") or "").strip().lower(),
+        "operator_open_id": str(context.get("operator_open_id") or "").strip(),
+    }
+
+
+def _hfc_card_operator_allowed(
+    adapter: Any, data: Any, chat_id: str, *, pending: dict[str, Any] | None = None,
+) -> bool:
+    open_id = _hfc_action_open_id(data)
+    if not open_id:
+        return False
+    if isinstance(pending, dict):
+        chat_type = str(pending.get("chat_type") or "").strip().lower()
+        if chat_type in {"dm", "p2p", "private"}:
+            # This command already passed Hermes admission. Reuse only its
+            # exact actor/chat; being in a DM is not itself authorization.
+            return bool(
+                pending.get("operator_open_id") == open_id
+                and chat_id and _hfc_action_chat_id(data) == chat_id
+                and pending.get("chat_id") == chat_id
+            )
+    sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(getattr(getattr(data, "event", None), "operator", None), "user_id", "") or ""))
+    # Token-backed forms/operations have no local pending command. Only real
+    # platform metadata may select DM admission; get_chat_info's DM fallback
+    # and callback-supplied chat_type are not evidence. The sidecar still
+    # validates the token, actor, route, expiry and original permission handle.
+    cache = getattr(adapter, "_chat_info_cache", None)
+    info = cache.get(chat_id) if isinstance(cache, dict) else None
+    if pending is None and isinstance(info, dict) and info.get("raw_type") == "p2p":
+        admit = getattr(adapter, "_admit", None)
+        if not callable(admit) or _hfc_action_chat_id(data) != chat_id:
+            return False
+        try:
+            return admit(
+                SimpleNamespace(sender_id=sender_id, sender_type="user"),
+                SimpleNamespace(chat_id=chat_id, chat_type="p2p", mentions=[]),
+            ) is None
+        except Exception:
+            return False
+    allow_group_message = getattr(adapter, "_allow_group_message", None)
+    if not callable(allow_group_message):
+        return True
+    try:
+        try:
+            return bool(allow_group_message(sender_id, chat_id, is_bot=False))
+        except TypeError:
+            return bool(allow_group_message(sender_id, chat_id))
+    except Exception:
+        return False
+
+
+def _hfc_prepare_native_slash_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+    *,
+    claim: bool = False,
+) -> dict[str, Any] | None:
+    loop = getattr(adapter, "_loop", None)
+    loop_accepts = getattr(adapter, "_loop_accepts_callbacks", None)
+    if callable(loop_accepts) and not loop_accepts(loop):
+        return None
+    if loop is None:
+        return None
+
+    confirm_id = str(action_value.get("hfc_confirm_id") or "")
+    choice = str(action_value.get("hfc_choice") or "")
+    if choice not in {"once", "always", "cancel"}:
+        return None
+    state = getattr(adapter, "_hfc_slash_confirm_state", {})
+    if not isinstance(state, dict):
+        return None
+    item = state.get(confirm_id)
+    if not isinstance(item, dict):
+        return None
+    chat_id = _hfc_action_chat_id(data)
+    expected_chat_id = str(item.get("chat_id") or "")
+    if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        return None
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
+        return None
+    if claim:
+        claimed_item = state.pop(confirm_id, None)
+        if claimed_item is not item:
+            if isinstance(claimed_item, dict):
+                state.setdefault(confirm_id, claimed_item)
+            return None
+    return {
+        "loop": loop,
+        "state": state,
+        "item": item,
+        "resolution_started": False,
+        "confirm_id": confirm_id,
+        "choice": choice,
+        "session_key": str(item.get("session_key") or ""),
+        "message_id": str(item.get("message_id") or ""),
+    }
+
+
+def _hfc_native_slash_result_card(
+    adapter: Any,
+    data: Any,
+    choice: str,
+    result: Any,
+) -> dict[str, Any]:
+    label, template = _hfc_slash_choice_label(choice)
+    open_id = _hfc_action_open_id(data)
+    get_cached_name = getattr(adapter, "_get_cached_sender_name", None)
+    user_name = get_cached_name(open_id) if callable(get_cached_name) else ""
+    actor = f"\n\n操作人：{user_name or open_id}" if (user_name or open_id) else ""
+    return _hfc_command_result_card(
+        title=f"{label}",
+        content=f"{str(result or label).strip()}{actor}",
+        template=template,
+    )
+
+
+def _hfc_prepare_native_model_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> dict[str, Any] | None:
+    loop = getattr(adapter, "_loop", None)
+    loop_accepts = getattr(adapter, "_loop_accepts_callbacks", None)
+    if callable(loop_accepts) and not loop_accepts(loop):
+        return None
+    if loop is None:
+        return None
+
+    picker_id = str(action_value.get("hfc_model_picker_id") or "")
+    state = getattr(adapter, "_hfc_model_picker_state", {})
+    if not isinstance(state, dict):
+        return None
+    item = state.get(picker_id)
+    if not isinstance(item, dict):
+        return None
+    chat_id = _hfc_action_chat_id(data)
+    expected_chat_id = str(item.get("chat_id") or "")
+    if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        return None
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
+        return None
+    return {
+        "loop": loop,
+        "state": state,
+        "picker_id": picker_id,
+        "item": item,
+        "chat_id": chat_id,
+        "expected_chat_id": expected_chat_id,
+        "choice": str(action_value.get("hfc_choice") or ""),
+        "view": str(action_value.get("hfc_model_picker_view") or "").strip(),
+        "navigation": str(action_value.get("hfc_model_picker_nav") or "").strip(),
+    }
+
+
+def _hfc_prepare_native_resume_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> dict[str, Any] | None:
+    loop = getattr(adapter, "_loop", None)
+    loop_accepts = getattr(adapter, "_loop_accepts_callbacks", None)
+    if callable(loop_accepts) and not loop_accepts(loop):
+        return None
+    if loop is None:
+        return None
+    picker_id = str(action_value.get("hfc_resume_picker_id") or "")
+    state = getattr(adapter, "_hfc_resume_picker_state", {})
+    if not picker_id or not isinstance(state, dict):
+        return None
+    item = state.get(picker_id)
+    if not isinstance(item, dict):
+        return None
+    if float(item.get("expires_at") or 0) <= time.time():
+        state.pop(picker_id, None)
+        return None
+    chat_id = _hfc_action_chat_id(data)
+    expected_chat_id = str(item.get("chat_id") or "")
+    if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        return None
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
+        return None
+    chat_type = str(item.get("chat_type") or "").strip().lower()
+    initiating_operator = str(item.get("operator_open_id") or "").strip()
+    action_operator = _hfc_action_open_id(data)
+    if chat_type not in {"", "dm", "p2p", "private"}:
+        if not initiating_operator or action_operator != initiating_operator:
+            return None
+    choice = str(action_value.get("hfc_choice") or "").strip()
+    allowed = item.get("allowed_session_ids")
+    if not choice or not isinstance(allowed, (set, frozenset, list, tuple)):
+        return None
+    if choice not in {str(value) for value in allowed}:
+        return None
+    state.pop(picker_id, None)
+    return {
+        "loop": loop,
+        "picker_id": picker_id,
+        "item": item,
+        "choice": choice,
+        "chat_id": chat_id,
+        "expected_chat_id": expected_chat_id,
+    }
+
+
+def _hfc_command_center_entry(
+    item: dict[str, Any],
+    command: str,
+    *,
+    safe_only: bool = False,
+) -> dict[str, Any] | None:
+    catalog = item.get("catalog")
+    if not isinstance(catalog, list):
+        return None
+    normalized = str(command or "").strip().lower().lstrip("/")
+    for entry in catalog:
+        if not isinstance(entry, dict) or str(entry.get("name") or "") != normalized:
+            continue
+        if safe_only and not command_is_safe_quick_action(entry):
+            return None
+        return entry
+    return None
+
+
+def _hfc_prepare_command_center_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> dict[str, Any] | None:
+    center_id = str(action_value.get("hfc_command_center_id") or "").strip()
+    state = getattr(adapter, "_hfc_command_center_state", None)
+    if not center_id or not isinstance(state, dict):
+        return None
+    item = state.get(center_id)
+    if not isinstance(item, dict):
+        return None
+    if _hfc_command_center_state_expired(item):
+        state.pop(center_id, None)
+        return None
+    chat_id = _hfc_action_chat_id(data)
+    expected_chat_id = str(item.get("chat_id") or "")
+    if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        return None
+    if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id, pending=item):
+        return None
+    chat_type = str(item.get("chat_type") or "").strip().lower()
+    initiating_operator = str(item.get("operator_open_id") or "").strip()
+    action_operator = _hfc_action_open_id(data)
+    if chat_type not in {"", "dm", "p2p", "private"}:
+        if not initiating_operator or action_operator != initiating_operator:
+            return None
+    nav = str(action_value.get("hfc_command_center_nav") or "").strip().lower()
+    if nav not in {"home", "category", "detail", "run"}:
+        return None
+    choice = str(action_value.get("hfc_choice") or "").strip()
+    category = str(action_value.get("hfc_command_center_category") or "").strip()
+    command = str(action_value.get("hfc_command_center_command") or "").strip()
+    if nav == "category" and choice:
+        category = choice
+    if nav == "detail" and choice:
+        command = choice
+    return {
+        "state": state,
+        "center_id": center_id,
+        "item": item,
+        "nav": nav,
+        "category": category,
+        "command": command,
+        "message_id": str(item.get("message_id") or ""),
+    }
+
+
+def _hfc_command_center_card_from_action(
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    item = prepared["item"]
+    catalog = item.get("catalog")
+    if not isinstance(catalog, list):
+        return _hfc_command_result_card(
+            title="命令中心已失效",
+            content="请重新发送 `/commands`。",
+            template="red",
+        )
+    nav = prepared["nav"]
+    category = prepared["category"]
+    command = prepared["command"]
+    if nav == "home":
+        item["selected_category"] = ""
+        return build_command_center_card(
+            catalog,
+            center_id=prepared["center_id"],
+        )
+    if nav == "category":
+        item["selected_category"] = category
+        return build_command_center_card(
+            catalog,
+            center_id=prepared["center_id"],
+            selected_category=category,
+        )
+    if nav == "detail":
+        if _hfc_command_center_entry(item, command) is None:
+            return _hfc_command_result_card(
+                title="命令不存在",
+                content="Hermes 注册表已变化，请重新发送 `/commands`。",
+                template="red",
+            )
+        selected_category = category or str(item.get("selected_category") or "")
+        return build_command_center_card(
+            catalog,
+            center_id=prepared["center_id"],
+            selected_category=selected_category,
+            selected_command=command,
+        )
+    return _hfc_command_result_card(
+        title="命令中心",
+        content="请选择一个分类或命令。",
+        template="blue",
+    )
+
+
+async def _hfc_run_command_center_action_async(
+    adapter: Any,
+    item: dict[str, Any],
+    command: str,
+) -> bool:
+    if _hfc_command_center_entry(item, command, safe_only=True) is None:
+        return False
+    event = item.get("event")
+    handle_message = getattr(adapter, "handle_message", None)
+    if event is None or not callable(handle_message):
+        return False
+    try:
+        command_event = copy.copy(event)
+        source = getattr(event, "source", None)
+        if source is not None:
+            command_event.source = copy.copy(source)
+        command_event.text = f"/{str(command).strip().lstrip('/')}"
+        await handle_message(command_event)
+        return True
+    except Exception as exc:
+        _hfc_warn(
+            "command center dispatch failed: "
+            f"command=/{str(command).strip().lstrip('/')} "
+            f"error={_hfc_exception_summary(exc)}"
+        )
+        return False
+
+
+def _hfc_schedule_command_center_action(
+    adapter: Any,
+    item: dict[str, Any],
+    command: str,
+) -> bool:
+    coroutine = _hfc_run_command_center_action_async(adapter, item, command)
+    loop = getattr(adapter, "_loop", None)
+    submit = getattr(adapter, "_submit_on_loop", None)
+    submitted = False
+    try:
+        if loop is not None and callable(submit):
+            submitted = bool(submit(loop, coroutine))
+            return submitted
+        if loop is not None and getattr(loop, "is_running", lambda: False)():
+            asyncio.run_coroutine_threadsafe(coroutine, loop)
+            submitted = True
+            return True
+        return False
+    except Exception as exc:
+        _hfc_warn(
+            "command center schedule failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+        return False
+    finally:
+        if not submitted:
+            coroutine.close()
+
+
+def _hfc_handle_command_center_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> Any:
+    prepared = _hfc_prepare_command_center_action(adapter, data, action_value)
+    if prepared is None:
+        return _hfc_empty_feishu_callback_response(adapter)
+    if prepared["nav"] != "run":
+        return _hfc_raw_feishu_callback_response(
+            adapter,
+            _hfc_command_center_card_from_action(prepared),
+        )
+    command = prepared["command"]
+    if _hfc_command_center_entry(prepared["item"], command, safe_only=True) is None:
+        card = _hfc_command_result_card(
+            title="请在消息框确认",
+            content=(
+                f"`/{command}` 需要参数或可能改变状态，"
+                "请在消息框中发送完整命令。"
+            ),
+            template="orange",
+        )
+        return _hfc_raw_feishu_callback_response(adapter, card)
+    scheduled = _hfc_schedule_command_center_action(
+        adapter,
+        prepared["item"],
+        command,
+    )
+    card = _hfc_command_result_card(
+        title=f"正在打开 /{command}" if scheduled else "命令启动失败",
+        content=(
+            "已交回 Hermes 原生命令入口处理。"
+            if scheduled
+            else "Gateway 事件循环不可用，请直接发送命令。"
+        ),
+        template="blue" if scheduled else "red",
+    )
+    return _hfc_raw_feishu_callback_response(adapter, card)
+
+
+def _hfc_on_feishu_card_action_trigger(self: Any, data: Any) -> Any:
+    action_value = _hfc_action_value_from_data(data)
+    action = str(action_value.get("hfc_action") or "").strip()
+
+    # FIX-1: dedupe duplicate card-action deliveries (Feishu retries on
+    # callback timeout). A repeated delivery after the first resolve finds the
+    # picker/confirm state already popped and would otherwise return an empty
+    # ack -> Feishu shows "callback error". Reply success immediately so a
+    # retried click never triggers a false callback error.
+    if action in (
+        "slash_confirm",
+        "model_picker",
+        "resume_picker",
+        "command_center",
+        "interaction.select",
+    ):
+        if _hfc_is_duplicate_card_action(self, data):
+            return _hfc_empty_feishu_callback_response(self)
+
+    if action == "slash_confirm":
+        return _hfc_handle_native_slash_action(self, data, action_value)
+    if action == "model_picker":
+        return _hfc_handle_native_model_action(self, data, action_value)
+    if action == "resume_picker":
+        return _hfc_handle_native_resume_action(self, data, action_value)
+    if action == "command_center":
+        return _hfc_handle_command_center_action(self, data, action_value)
+    if action == "interaction.select":
+        return _hfc_handle_interaction_select_action(self, data, action_value)
+    if action == "operations.select":
+        return _hfc_handle_operations_select_action(self, data, action_value)
+
+    if not action:
+        # Form-submit buttons (form_action_type=submit) cannot carry
+        # behaviors, so their callbacks arrive with an EMPTY value. The
+        # interaction is identified by the button name
+        # (hfc_confirm_<token> / hfc_other_<token>) and the submitted data lives
+        # in action.form_value. Without this branch such callbacks fell
+        # through to the original adapter handler and were dropped — the
+        # card looked unresponsive.
+        form_payload = _hfc_form_submit_payload(data)
+        if form_payload is not None:
+            chat_id = _hfc_action_chat_id(data)
+            if not chat_id or not _hfc_card_operator_allowed(self, data, chat_id):
+                _hfc_warn("card_action_admission_rejected: form submit")
+                return _hfc_empty_feishu_callback_response(self)
+            return _hfc_forward_form_submit_action(self, data, form_payload)
+
+    original = getattr(type(self), "_hfc_original_on_card_action_trigger", None)
+    if callable(original):
+        return original(self, data)
+    return _hfc_empty_feishu_callback_response(self)
+
+
+def _hfc_form_submit_payload(data: Any) -> dict[str, Any] | None:
+    """Extract a clarify form-submit callback into a sidecar /card/actions
+    payload, or None when the action isn't one of ours.
+
+    Form-submit callbacks carry ``event.action.name`` (button name) and
+    ``event.action.form_value`` (submitted component values) but an empty
+    ``value``. The sidecar's ``_parse_form_action_name`` resolves the mode
+    (confirm/other) and interaction id from the button name."""
+    event = getattr(data, "event", None)
+    action = getattr(event, "action", None)
+    name = str(getattr(action, "name", "") or "").strip()
+    if not (name.startswith("hfc_confirm_") or name.startswith("hfc_other_")):
+        return None
+    form_value = getattr(action, "form_value", {}) or {}
+    if not isinstance(form_value, dict):
+        try:
+            form_value = json.loads(str(form_value)) if str(form_value).strip() else {}
+        except Exception:
+            form_value = {}
+    if not isinstance(form_value, dict):
+        form_value = {}
+    action_value = _hfc_action_value_from_data(data)
+    raw_profile_id = action_value.get("profile_id")
+    profile_id = (
+        _safe_profile_id(raw_profile_id)
+        if type(raw_profile_id) is str
+        else "default"
+    )
+
+    payload: dict[str, Any] = {
+        "event": {
+            "action": {
+                "value": {"profile_id": profile_id},
+                "name": name,
+                "form_value": form_value,
+            },
+            "context": {
+                "open_chat_id": _hfc_action_chat_id(data),
+                "profile_id": profile_id,
+            },
+            "operator": {},
+        }
+    }
+    open_id = _hfc_action_open_id(data)
+    if open_id:
+        payload["event"]["operator"]["open_id"] = open_id
+    operator_name = ""
+    operator_obj = getattr(event, "operator", None)
+    if operator_obj is not None:
+        operator_name = str(
+            getattr(operator_obj, "user_name", "")
+            or getattr(operator_obj, "name", "")
+            or ""
+        ).strip()
+    if operator_name:
+        payload["event"]["operator"]["name"] = operator_name
+    return payload
+
+
+def _hfc_forward_form_submit_action(
+    adapter: Any,
+    data: Any,
+    sidecar_payload: dict[str, Any],
+) -> Any:
+    """Forward a clarify form-submit callback to the sidecar's /card/actions
+    and echo back the updated card so Feishu refreshes it in place."""
+    _hfc_info("inline card action received: form submit")
+    try:
+        config = load_runtime_config()
+        url = f"{_summary_base_url(config.event_url)}/card/actions"
+        result = _post_json_sync_response(url, sidecar_payload, INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS)
+    except Exception as exc:
+        _hfc_warn(
+            "form submit forward failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    if isinstance(result, dict) and isinstance(result.get("card"), dict):
+        _hfc_info("form submit resolved and card updated")
+        return _hfc_interaction_success_response(
+            adapter,
+            result["card"],
+            "已选择",
+        )
+    _hfc_info("form submit forwarded but no card returned")
+    return _hfc_empty_feishu_callback_response(adapter)
+
+
+def _hfc_handle_operations_select_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> Any:
+    _hfc_info("inline card action received: operations.select")
+    operation_action = str(action_value.get("operation_action") or "").strip()
+    token = str(action_value.get("token") or "").strip()
+    transport_lineage_id = str(action_value.get("transport_lineage_id") or "").strip()
+    profile_scope = str(action_value.get("profile_scope") or "").strip()
+    update_evidence_fingerprint = str(
+        action_value.get("update_evidence_fingerprint") or ""
+    ).strip()
+    chat_id = _hfc_action_chat_id(data)
+    if not operation_action or not token or not chat_id:
+        _hfc_info("operations.select ignored: missing action/token/chat")
+        return _hfc_empty_feishu_callback_response(adapter)
+    if not _hfc_card_operator_allowed(adapter, data, chat_id):
+        _hfc_warn("card_action_admission_rejected: operations.select")
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    open_id = _hfc_action_open_id(data)
+    operation_id = _operation_id_from_token(token)
+    transport_context = _operation_transport_context(transport_lineage_id or operation_id)
+    if transport_context is None:
+        _hfc_info("operations.select rejected: authentication session expired")
+        return _hfc_empty_feishu_callback_response(adapter)
+    transport_secret, profile_id = transport_context
+    timestamp = int(time.time())
+    forwarded_value = {
+        "hfc_action": "operations.select",
+        "operation_action": operation_action,
+        "token": token,
+    }
+    if profile_scope:
+        forwarded_value["profile_scope"] = profile_scope
+    if transport_lineage_id:
+        forwarded_value["transport_lineage_id"] = transport_lineage_id
+    if update_evidence_fingerprint:
+        forwarded_value["update_evidence_fingerprint"] = (
+            update_evidence_fingerprint
+        )
+    sidecar_payload = {
+        "adapter_transport_proof": {
+            "timestamp": timestamp,
+            "signature": sign_transport_proof(
+                transport_secret,
+                token=token,
+                action=operation_action,
+                callback_chat_id=chat_id,
+                callback_profile_id=profile_id,
+                callback_profile_scope=profile_scope,
+                operator_open_id=open_id,
+                timestamp=timestamp,
+            ),
+        },
+        "event": {
+            "action": {"value": forwarded_value},
+            "context": {
+                "open_chat_id": chat_id,
+                "profile_id": profile_id,
+            },
+            "operator": {"open_id": open_id},
+        }
+    }
+    try:
+        config = load_runtime_config()
+        url = f"{_summary_base_url(config.event_url)}/card/actions"
+    except Exception as exc:
+        _hfc_warn(
+            "operations.select background forward setup failed: "
+            f"{exc.__class__.__name__}"
+        )
+        return _hfc_toast_feishu_callback_response(
+            adapter, "操作暂不可用，请稍后重试"
+        )
+
+    def forward() -> None:
+        last_error: Exception | None = None
+        for attempt in range(OPERATIONS_ACTION_FORWARD_ATTEMPTS):
+            try:
+                result = _post_json_sync_response(
+                    url,
+                    sidecar_payload,
+                    OPERATIONS_ACTION_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < OPERATIONS_ACTION_FORWARD_ATTEMPTS:
+                    time.sleep(OPERATIONS_ACTION_RETRY_DELAY_SECONDS)
+                    continue
+                break
+            if isinstance(result, dict):
+                successor_id = str(result.get("operation_id") or "").strip()
+                if successor_id:
+                    _remember_operation_transport(
+                        successor_id,
+                        transport_secret,
+                        profile_id,
+                        transport_lineage_id or operation_id,
+                    )
+            return
+        if last_error is not None:
+            _hfc_warn(
+                "operations.select background forward failed: "
+                f"{last_error.__class__.__name__}"
+            )
+
+    try:
+        accepted = _OPERATIONS_ACTION_DISPATCHER.submit(forward)
+    except Exception as exc:
+        _hfc_warn(
+            "operations.select background dispatch failed: "
+            f"{exc.__class__.__name__}"
+        )
+        accepted = False
+    if not accepted:
+        _hfc_warn("operations.select background dispatch unavailable: capacity")
+        return _hfc_toast_feishu_callback_response(
+            adapter, "操作繁忙，请稍后重试"
+        )
+    return _hfc_empty_feishu_callback_response(adapter)
+
+
+def _hfc_interaction_failure_response(adapter: Any, error: BaseException | None = None) -> Any:
+    # A transport failure can occur after the choice was accepted. Never claim
+    # that execution failed or invite a second approval when the outcome is unknown.
+    code = getattr(error, "code", None)
+    if code == 404:
+        content = "此交互卡片已不可用，请查看最新卡片。"
+    elif code == 409:
+        content = "此选择正在处理或已结束，请查看最新卡片，勿重复点击。"
+    elif code == 403:
+        content = "此操作未获验证，请由任务发起者操作最新卡片。"
+    else:
+        content = "暂未确认选择结果，请先查看任务状态，勿连续点击。"
+    return _hfc_toast_feishu_callback_response(adapter, content)
+
+
+_HFC_SIDECAR_ERROR_NOTICES: dict[str, str] = {
+    "interaction expired": "本次审批已过期，请重新审批。",
+    "interaction already completed": "该选择已处理，请查看最新卡片。",
+    "interaction not found": "此交互卡片已不可用，请查看最新卡片。",
+    "interaction changed": "审批状态已变化，请重新确认完整操作。",
+    "interaction delivery pending": "此选择正在处理，请稍候，勿重复点击。",
+    "interaction resolution unavailable": "审批暂时无法提交，请稍后重试。",
+}
+_HFC_INTERACTION_UNKNOWN_NOTICE = "暂未确认选择结果，请先查看任务状态，勿连续点击。"
+
+
+def _hfc_sidecar_notice(result: Any) -> tuple[str, str] | None:
+    """The sidecar's own words for this click, when it explained itself.
+
+    A rejected click still carries an answer — ``ok:false`` plus a toast and/or an error code.
+    Dropping them made every rejection look like a transport failure, which is why an expired
+    approval showed "暂未确认选择结果" instead of the sidecar's "交互已过期". (The code-keyed
+    messages in ``_hfc_interaction_failure_response`` are unreachable for these: an HTTP error
+    body carrying a boolean ``ok`` is returned to the caller instead of being raised.)
+    """
+    if not isinstance(result, dict):
+        return None
+    toast = result.get("toast")
+    if isinstance(toast, dict):
+        content = str(toast.get("content") or "").strip()
+        if content:
+            raw_type = str(toast.get("type") or "").strip().lower()
+            toast_type = (
+                raw_type
+                if raw_type in {"info", "success", "warning", "error"}
+                else "warning"
+            )
+            return content, toast_type
+    error = str(result.get("error") or "").strip()
+    if error:
+        return (
+            _HFC_SIDECAR_ERROR_NOTICES.get(error, _HFC_INTERACTION_UNKNOWN_NOTICE),
+            "warning",
+        )
+    return None
+
+
+def _hfc_interaction_notice_response(
+    adapter: Any,
+    card_data: dict[str, Any] | None,
+    content: str,
+    *,
+    toast_type: str = "warning",
+) -> Any:
+    """Repaint the card AND show the sidecar's message in one callback response.
+
+    The rejection path used to return a toast only, so the card never changed: an expired
+    approval stayed on screen looking clickable while every click answered in the same vague
+    sentence. A card that cannot take the decision has to be repainted to say so.
+    """
+    if (
+        not isinstance(card_data, dict)
+        or card_data.get("schema") == "2.0"
+        or "body" in card_data
+    ):
+        return _hfc_toast_feishu_callback_response(adapter, content, toast_type=toast_type)
+    response = _hfc_raw_feishu_callback_response(adapter, card_data)
+    if response is None:
+        return None
+    module = sys.modules.get(type(adapter).__module__)
+    callback_toast_type = getattr(module, "CallBackToast", None) if module else None
+    if callback_toast_type is None:
+        response_types = getattr(type(response), "_types", {})
+        if isinstance(response_types, dict):
+            callback_toast_type = response_types.get("toast")
+    if callback_toast_type is None:
+        return response
+    toast = callback_toast_type()
+    toast.type = toast_type
+    toast.content = content
+    response.toast = toast
+    return response
+
+
+def _hfc_handle_interaction_select_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> Any:
+    """Forward an agent clarify/approval interaction card click to the sidecar.
+
+    Agent-initiated interaction option cards (``interaction.requested``) render
+    Feishu ``callback`` buttons whose value carries
+    ``hfc_action=interaction.select`` plus ``interaction_id`` / ``choice`` /
+    ``choice_label`` / ``token``. Under a Feishu/Lark WebSocket long-connection
+    deployment the click is delivered here (the adapter's card action channel),
+    NOT to the sidecar's ``/card/actions`` HTTP endpoint — the sidecar is on
+    localhost and Feishu cannot POST to it. Prior to this, such clicks fell
+    through to the original adapter handler and were dropped, so the card looked
+    unresponsive (and ``card.interaction_mode: auto`` had to fall back to text).
+
+    This mirrors the existing ``slash_confirm`` / ``model_picker`` WS-native
+    paths: rebuild the native Feishu card-action payload, POST it to the
+    sidecar's ``/card/actions`` endpoint (which marks the interaction completed
+    so the Hermes hook polling ``/interactions/{id}`` unblocks), and return the
+    sidecar's updated card so Feishu updates the card in place.
+    """
+    _hfc_info("inline card action received: interaction.select")
+    interaction_id = str(action_value.get("interaction_id") or "").strip()
+    token = str(action_value.get("token") or "").strip()
+    choice = str(action_value.get("choice") or action_value.get("hfc_choice") or "").strip()
+    choice_label = str(action_value.get("choice_label") or choice).strip()
+    raw_profile_id = action_value.get("profile_id")
+    profile_id = (
+        _safe_profile_id(raw_profile_id)
+        if type(raw_profile_id) is str
+        else "default"
+    )
+    if not interaction_id or not token or not choice:
+        _hfc_info("interaction.select ignored: missing interaction_id/token/choice")
+        return _hfc_interaction_failure_response(adapter)
+
+    chat_id = _hfc_action_chat_id(data)
+    open_id = _hfc_action_open_id(data)
+    operator_name = ""
+    event_obj = getattr(data, "event", None)
+    operator_obj = getattr(event_obj, "operator", None)
+    if operator_obj is not None:
+        operator_name = str(
+            getattr(operator_obj, "user_name", "")
+            or getattr(operator_obj, "name", "")
+            or ""
+        ).strip()
+
+    operator_payload: dict[str, Any] = {}
+    if operator_name:
+        operator_payload["name"] = operator_name
+    if open_id:
+        operator_payload["open_id"] = open_id
+
+    sidecar_payload = {
+        "event": {
+            "action": {
+                "value": {
+                    "hfc_action": "interaction.select",
+                    "interaction_id": interaction_id,
+                    "choice": choice,
+                    "choice_label": choice_label,
+                    "token": token,
+                    "profile_id": profile_id,
+                }
+            },
+            "context": {
+                "open_chat_id": chat_id,
+                "profile_id": profile_id,
+            },
+            "operator": operator_payload,
+        }
+    }
+
+    try:
+        config = load_runtime_config()
+        base_url = _summary_base_url(config.event_url)
+        url = f"{base_url}/card/actions"
+    except Exception as exc:
+        _hfc_warn(
+            "interaction.select forward setup failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+        return _hfc_interaction_failure_response(adapter)
+
+    started_at = time.monotonic()
+    result: Any = None
+    last_error: BaseException | None = None
+    for attempt in range(INTERACTION_ACTION_FORWARD_ATTEMPTS):
+        if attempt == 0:
+            timeout = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+        else:
+            timeout = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS - (
+                time.monotonic() - started_at
+            )
+        if timeout <= 0:
+            break
+        try:
+            result = _post_json_sync_response(url, sidecar_payload, timeout)
+        except Exception as exc:
+            last_error = exc
+            if (
+                not _hfc_is_transient_sidecar_error(exc)
+                or attempt + 1 >= INTERACTION_ACTION_FORWARD_ATTEMPTS
+            ):
+                break
+            remaining = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS - (
+                time.monotonic() - started_at
+            )
+            if remaining <= 0:
+                break
+            time.sleep(min(INTERACTION_ACTION_RETRY_DELAY_SECONDS, remaining))
+            continue
+        last_error = None
+        break
+
+    if last_error is not None:
+        _hfc_warn(
+            "interaction.select forward failed: "
+            f"{_hfc_exception_summary(last_error)}"
+        )
+        return _hfc_interaction_failure_response(adapter, last_error)
+
+    if isinstance(result, dict):
+        # Maintainer note (contract change): this used to be
+        #     if result.get("ok") is not False and isinstance(result.get("card"), dict):
+        # so a rejected click (``ok:false``) threw away BOTH the sidecar's explanation and its
+        # repainted card, and every rejection collapsed into the generic "暂未确认选择结果" below.
+        # That is what a user saw when clicking an expired approval: a message about "not
+        # confirmed yet" while the card sat there looking clickable. The sidecar had answered
+        # properly ("交互已过期" / "已重新发起") — the plugin just refused to relay it.
+        # Note the code-keyed notices in ``_hfc_interaction_failure_response`` cannot cover this:
+        # an HTTP error body that carries a boolean ``ok`` is RETURNED, not raised, so that
+        # classification never runs for these responses.
+        # Also keep the ``ok:true`` + no-card case working: a renewal is delivered as its own
+        # message and still carries a toast, which is a success to relay, not a failure.
+        card = result["card"] if isinstance(result.get("card"), dict) else None
+        accepted = result.get("ok") is not False
+        notice = _hfc_sidecar_notice(result)
+        if card is not None and accepted and (notice is None or notice[1] == "success"):
+            _hfc_info(
+                "interaction.select resolved: "
+                f"{_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return _hfc_interaction_success_response(adapter, result["card"], "已选择")
+        if card is not None or notice is not None:
+            # The sidecar explained itself (expired / re-issued / unknown): pass its words and
+            # its repainted card through instead of replacing both with a generic guess.
+            content, toast_type = notice or (_HFC_INTERACTION_UNKNOWN_NOTICE, "warning")
+            _hfc_info(
+                "interaction.select answered: "
+                f"{_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return _hfc_interaction_notice_response(
+                adapter, card, content, toast_type=toast_type
+            )
+    _hfc_info("interaction.select forwarded but no card returned")
+    return _hfc_interaction_failure_response(adapter)
+
+
+def _hfc_resolve_native_slash_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+    *,
+    prepared: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str] | None:
+    if prepared is None:
+        prepared = _hfc_prepare_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            claim=True,
+        )
+    if prepared is None:
+        return None
+    if prepared.get("resolution_started"):
+        return None
+    prepared["resolution_started"] = True
+
+    try:
+        from tools import slash_confirm
+
+        result = slash_confirm.resolve_sync_compat(
+            prepared["loop"],
+            prepared["session_key"],
+            prepared["confirm_id"],
+            prepared["choice"],
+        )
+    except Exception as exc:
+        result = f"处理失败：{exc}"
+    return (
+        _hfc_native_slash_result_card(adapter, data, prepared["choice"], result),
+        prepared["message_id"],
+    )
+
+
+async def _hfc_resolve_native_slash_action_async(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+    *,
+    prepared: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str] | None:
+    if prepared is None:
+        prepared = _hfc_prepare_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            claim=True,
+        )
+    if prepared is None:
+        return None
+    if prepared.get("resolution_started"):
+        return None
+    prepared["resolution_started"] = True
+
+    try:
+        from tools import slash_confirm
+
+        resolve = getattr(slash_confirm, "resolve", None)
+        if callable(resolve):
+            result = await resolve(
+                prepared["session_key"],
+                prepared["confirm_id"],
+                prepared["choice"],
+            )
+        else:
+            result = slash_confirm.resolve_sync_compat(
+                prepared["loop"],
+                prepared["session_key"],
+                prepared["confirm_id"],
+                prepared["choice"],
+            )
+    except Exception as exc:
+        result = f"处理失败：{exc}"
+    return (
+        _hfc_native_slash_result_card(adapter, data, prepared["choice"], result),
+        prepared["message_id"],
+    )
+
+
+def _hfc_schedule_native_command_card_update(
+    adapter: Any,
+    message_id: str,
+    card: dict[str, Any],
+) -> None:
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        _hfc_warn("native command card update skipped: missing message_id")
+        return
+    loop = getattr(adapter, "_loop", None)
+    loop_accepts = getattr(adapter, "_loop_accepts_callbacks", None)
+    if callable(loop_accepts) and not loop_accepts(loop):
+        _hfc_warn("native command card update skipped: adapter loop is not ready")
+        return
+    submit = getattr(adapter, "_submit_on_loop", None)
+    if not callable(submit):
+        _hfc_warn("native command card update skipped: submit helper unavailable")
+        return
+    coro = _hfc_update_native_command_card(adapter, message_id, card)
+    submitted = False
+    try:
+        submitted = bool(submit(loop, coro))
+    except Exception as exc:
+        _hfc_warn(
+            "native command card update schedule failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+    finally:
+        if not submitted:
+            try:
+                coro.close()
+            except Exception:
+                pass
+    if not submitted:
+        _hfc_warn("native command card update schedule failed")
+
+
+def _hfc_handle_native_slash_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> Any:
+    """Resolve a slash-confirm button click without blocking the Feishu callback.
+
+    The Feishu card-action callback has a hard timeout of a few seconds; the
+    confirm handler can be arbitrarily slow (e.g. /reload-mcp runs a full MCP
+    reload).  Resolving synchronously inside the callback would exceed that
+    timeout and the returned result card would be discarded by Feishu, leaving
+    the card visually unresponsive even though the action succeeded.
+
+    Strategy: acknowledge the click immediately (empty callback response),
+    then resolve the confirm on the event loop in the background and push the
+    result card via a message PATCH update.  When the loop/submit helpers are
+    unavailable, fall back to the previous synchronous resolve so the confirm
+    still completes.
+    """
+    _hfc_info("inline card action received: slash_confirm")
+    prepared = _hfc_prepare_native_slash_action(
+        adapter,
+        data,
+        action_value,
+        claim=True,
+    )
+    if prepared is None:
+        _hfc_warn("card_action_unresolved: slash_confirm (missing, expired or unauthorized)")
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    loop = getattr(adapter, "_loop", None)
+    submit = getattr(adapter, "_submit_on_loop", None)
+    if loop is None or not callable(submit):
+        # No event loop to schedule on — resolve synchronously (legacy path)
+        # so the confirmation still takes effect.
+        resolved = _hfc_resolve_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            prepared=prepared,
+        )
+        if resolved is None:
+            return _hfc_empty_feishu_callback_response(adapter)
+        card, _message_id = resolved
+        return _hfc_raw_feishu_callback_response(adapter, card)
+
+    coroutine = _hfc_resolve_slash_confirm_background(
+        adapter,
+        data,
+        action_value,
+        prepared,
+    )
+    submitted = False
+    try:
+        submitted = bool(submit(loop, coroutine))
+        if not submitted:
+            _hfc_warn("background slash_confirm schedule failed")
+    except Exception as exc:
+        _hfc_warn(
+            "background slash_confirm schedule failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+    finally:
+        if not submitted:
+            coroutine.close()
+    if not submitted:
+        resolved = _hfc_resolve_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            prepared=prepared,
+        )
+        if resolved is not None:
+            card, _message_id = resolved
+            return _hfc_raw_feishu_callback_response(adapter, card)
+    return _hfc_empty_feishu_callback_response(adapter)
+
+
+async def _hfc_resolve_slash_confirm_background(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+    prepared: dict[str, Any],
+) -> None:
+    """Resolve a slash-confirm off the Feishu callback path, then update the card.
+
+    After the confirm handler finishes (which may take seconds), the original
+    message card is updated in place via PATCH.  If the card cannot be
+    updated (e.g. message too old or update_multi not supported), a fresh
+    result card is sent as a follow-up message so the user still sees the
+    outcome.
+    """
+    resolved = await _hfc_resolve_native_slash_action_async(
+        adapter,
+        data,
+        action_value,
+        prepared=prepared,
+    )
+    if resolved is None:
+        _hfc_info("background slash_confirm ignored: unresolved")
+        return
+    card, message_id = resolved
+    _hfc_info(
+        "background slash_confirm resolved: "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
+    if message_id and await _hfc_update_native_command_card(adapter, message_id, card):
+        _hfc_info("background slash_confirm: original card updated")
+        return
+    chat_id = _hfc_action_chat_id(data)
+    if not chat_id:
+        _hfc_warn("background slash_confirm: cannot determine chat_id for result card")
+        return
+    if not hasattr(adapter, "_feishu_send_with_retry"):
+        _hfc_warn("background slash_confirm: adapter has no _feishu_send_with_retry")
+        return
+    try:
+        await adapter._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=serialize_card_for_delivery(card),
+            reply_to=message_id or None,
+            metadata=_hfc_action_metadata(data),
+        )
+        _hfc_info("background slash_confirm: result card sent")
+    except Exception as exc:
+        _hfc_warn(
+            "background slash_confirm: result card send failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+
+
+def _hfc_model_picker_choice_allowed(
+    item: dict[str, Any], provider_slug: str, model_id: str
+) -> bool:
+    providers = item.get("providers")
+    if not isinstance(providers, list):
+        # Picker state created by older plugin code did not retain the tree.
+        return True
+    provider = _model_picker_provider(providers, provider_slug)
+    if provider is None:
+        return False
+    selected_provider = str(item.get("selected_provider") or "").strip()
+    if not selected_provider or selected_provider.casefold() != provider_slug.casefold():
+        return False
+    models = provider.get("models")
+    return isinstance(models, list) and model_id in {
+        str(model or "").strip() for model in models
+    }
+
+
+def _hfc_model_picker_card_from_state(
+    picker_id: str,
+    item: dict[str, Any],
+    *,
+    selected_provider: str = "",
+) -> dict[str, Any] | None:
+    providers = item.get("providers")
+    if not isinstance(providers, list) or not providers:
+        return None
+    return _hfc_native_model_picker_card(
+        picker_id=picker_id,
+        providers=providers,
+        current_provider=str(item.get("current_provider") or ""),
+        current_model=str(item.get("current_model") or ""),
+        selected_provider=selected_provider,
+    )
+
+
+def _hfc_invalid_model_picker_card() -> dict[str, Any]:
+    return _hfc_command_result_card(
+        title="模型选择无效",
+        content="请重新选择，或重新发送 `/model`。",
+        template="red",
+    )
+
+
+def _hfc_resolve_native_model_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> tuple[dict[str, Any], str] | None:
+    prepared = _hfc_prepare_native_model_action(adapter, data, action_value)
+    if prepared is None:
+        return None
+
+    item = prepared["item"]
+    selected = _parse_model_picker_choice(prepared["choice"])
+    if selected is None:
+        return (
+            _hfc_invalid_model_picker_card(),
+            str(item.get("message_id") or ""),
+        )
+    provider_slug, model_id = selected
+    if not _hfc_model_picker_choice_allowed(item, provider_slug, model_id):
+        return (
+            _hfc_invalid_model_picker_card(),
+            str(item.get("message_id") or ""),
+        )
+    callback = item.get("on_model_selected")
+    try:
+        if callback is None:
+            result = f"已选择 {provider_slug}/{model_id}"
+        else:
+            future = asyncio.run_coroutine_threadsafe(
+                callback(
+                    prepared["expected_chat_id"] or prepared["chat_id"],
+                    model_id,
+                    provider_slug,
+                ),
+                prepared["loop"],
+            )
+            result = future.result(timeout=30)
+    except Exception as exc:
+        result = f"模型切换失败：{exc}"
+    prepared["state"].pop(prepared["picker_id"], None)
+    return (
+        _hfc_command_result_card(
+            title="模型已更新",
+            content=str(result or f"已选择 {provider_slug}/{model_id}"),
+            template="green",
+        ),
+        str(item.get("message_id") or ""),
+    )
+
+
+async def _hfc_resolve_native_model_action_async(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> tuple[dict[str, Any], str] | None:
+    prepared = _hfc_prepare_native_model_action(adapter, data, action_value)
+    if prepared is None:
+        return None
+
+    item = prepared["item"]
+    selected = _parse_model_picker_choice(prepared["choice"])
+    if selected is None:
+        return (
+            _hfc_invalid_model_picker_card(),
+            str(item.get("message_id") or ""),
+        )
+    provider_slug, model_id = selected
+    if not _hfc_model_picker_choice_allowed(item, provider_slug, model_id):
+        return (
+            _hfc_invalid_model_picker_card(),
+            str(item.get("message_id") or ""),
+        )
+    callback = item.get("on_model_selected")
+    try:
+        if callback is None:
+            result = f"已选择 {provider_slug}/{model_id}"
+        else:
+            result = await callback(
+                prepared["expected_chat_id"] or prepared["chat_id"],
+                model_id,
+                provider_slug,
+            )
+    except Exception as exc:
+        result = f"模型切换失败：{exc}"
+    prepared["state"].pop(prepared["picker_id"], None)
+    return (
+        _hfc_command_result_card(
+            title="模型已更新",
+            content=str(result or f"已选择 {provider_slug}/{model_id}"),
+            template="green",
+        ),
+        str(item.get("message_id") or ""),
+    )
+
+
+def _hfc_switch_model_background_task(adapter: Any, data: Any, action_value: dict[str, Any], message_id: str) -> None:
+    """Run the real model switch off the callback path.
+
+    The synchronous card-action callback must return within Feishu's callback
+    timeout (a few seconds). The actual switch_model call can be much slower
+    (provider slow / network jitter), so we resolve the click instantly with a
+    "switching" card and perform the switch in the background.
+
+    After the switch finishes, update the original card when Feishu permits it.
+    A single result card is sent only when the original message cannot be
+    updated.
+    """
+    async def _run() -> None:
+        resolved = await _hfc_resolve_native_model_action_async(adapter, data, action_value)
+        if resolved is None:
+            _hfc_info("background model_picker ignored: unresolved")
+            return
+        card, resolved_message_id = resolved
+        target_message_id = resolved_message_id or message_id
+        if target_message_id and await _hfc_update_native_command_card(
+            adapter, target_message_id, card
+        ):
+            _hfc_info("background model switch: original card updated")
+            return
+        chat_id = _hfc_action_chat_id(data)
+        if not chat_id:
+            _hfc_warn("background model switch: cannot determine chat_id for result card")
+            return
+        if not hasattr(adapter, "_feishu_send_with_retry"):
+            _hfc_warn("background model switch: adapter has no _feishu_send_with_retry")
+            return
+        metadata = _hfc_action_metadata(data)
+        try:
+            await adapter._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=serialize_card_for_delivery(card),
+                reply_to=message_id or None,
+                metadata=metadata,
+            )
+            _hfc_info("background model switch: result card sent")
+        except Exception as exc:
+            _hfc_warn(
+                "background model switch: direct send failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
+            # Fallback: reuse the well-tested native command result card sender
+            # (it passes metadata correctly and handles reply threading).
+            try:
+                await _hfc_send_native_command_result_card(
+                    adapter,
+                    chat_id=chat_id,
+                    content=str(card.get("elements", [{}])[0].get("content", "") or ""),
+                    reply_to=message_id or None,
+                    metadata=metadata,
+                    context={"command": "model"},
+                )
+                _hfc_info("background model switch: result card sent (fallback)")
+            except Exception as exc2:
+                _hfc_warn(
+                    "background model switch: fallback send failed: "
+                    f"{_hfc_exception_summary(exc2)}"
+                )
+
+    loop = getattr(adapter, "_loop", None)
+    submit = getattr(adapter, "_submit_on_loop", None)
+    if loop is not None and callable(submit):
+        coroutine = _run()
+        submitted = False
+        try:
+            submitted = bool(submit(loop, coroutine))
+            if not submitted:
+                _hfc_warn("background model switch schedule failed")
+            return
+        except Exception as exc:
+            _hfc_warn(
+                "background model switch schedule failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
+        finally:
+            if not submitted:
+                coroutine.close()
+
+
+def _hfc_handle_native_model_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> Any:
+    _hfc_info("inline card action received: model_picker")
+    prepared = _hfc_prepare_native_model_action(adapter, data, action_value)
+    if prepared is None:
+        _hfc_info("inline model_picker ignored: unresolved")
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    item = prepared["item"]
+    picker_id = prepared["picker_id"]
+    navigation = prepared["navigation"]
+    if navigation == "cancel":
+        prepared["state"].pop(picker_id, None)
+        card = _hfc_command_result_card(
+            title="模型选择已取消",
+            content="当前模型未更改。",
+            template="grey",
+        )
+        return _hfc_raw_feishu_callback_response(adapter, card)
+    if navigation == "back":
+        item["selected_provider"] = ""
+        card = _hfc_model_picker_card_from_state(picker_id, item)
+        if card is None:
+            card = _hfc_invalid_model_picker_card()
+        return _hfc_raw_feishu_callback_response(adapter, card)
+    if navigation:
+        return _hfc_raw_feishu_callback_response(
+            adapter, _hfc_invalid_model_picker_card()
+        )
+
+    if prepared["view"] == "providers":
+        providers = item.get("providers")
+        provider = (
+            _model_picker_provider(providers, prepared["choice"])
+            if isinstance(providers, list)
+            else None
+        )
+        if provider is None:
+            return _hfc_raw_feishu_callback_response(
+                adapter, _hfc_invalid_model_picker_card()
+            )
+        provider_slug = str(provider.get("slug") or "").strip()
+        item["selected_provider"] = provider_slug
+        card = _hfc_model_picker_card_from_state(
+            picker_id,
+            item,
+            selected_provider=provider_slug,
+        )
+        if card is None:
+            card = _hfc_invalid_model_picker_card()
+        return _hfc_raw_feishu_callback_response(adapter, card)
+
+    message_id = str(item.get("message_id") or "")
+    # Parse the model choice properly — prepared["choice"] is a raw JSON string
+    # like '{"provider":"zai","model":"glm-5.2"}', not a "provider/model" path.
+    parsed = _parse_model_picker_choice(prepared["choice"])
+    if parsed is None:
+        return _hfc_raw_feishu_callback_response(
+            adapter, _hfc_invalid_model_picker_card()
+        )
+    provider_slug, model_id = parsed
+    if not _hfc_model_picker_choice_allowed(item, provider_slug, model_id):
+        return _hfc_raw_feishu_callback_response(
+            adapter, _hfc_invalid_model_picker_card()
+        )
+
+    # FIX-3: acknowledge the click immediately with a "switching" card and run
+    # the real (potentially slow) switch off the callback path.
+    switching_card = _hfc_command_result_card(
+        title="模型切换中",
+        content=f"正在切换到 `{provider_slug}/{model_id}` …",
+        template="blue",
+    )
+    _hfc_switch_model_background_task(adapter, data, action_value, message_id)
+    return _hfc_raw_feishu_callback_response(adapter, switching_card)
+
+
+def _hfc_resume_result_card(result: Any) -> dict[str, Any]:
+    content = str(result or "会话已恢复。").strip()
+    template = _hfc_command_result_template(content)
+    title = "会话已恢复" if template == "green" else "会话恢复失败"
+    return _hfc_command_result_card(
+        title=title,
+        content=content,
+        template=template,
+    )
+
+
+def _hfc_resume_picker_background_task(
+    adapter: Any,
+    data: Any,
+    prepared: dict[str, Any],
+) -> None:
+    async def _run() -> None:
+        item = prepared["item"]
+        runner = item.get("runner")
+        original_handler = item.get("original_handler")
+        original_event = item.get("event")
+        if runner is None or not callable(original_handler) or original_event is None:
+            card = _hfc_command_result_card(
+                title="会话选择已失效",
+                content="请重新发送 `/resume`。",
+                template="red",
+            )
+        else:
+            try:
+                resume_event = copy.copy(original_event)
+                resume_event.text = f"/resume {prepared['choice']}"
+                result = await original_handler(runner, resume_event)
+                card = _hfc_resume_result_card(result)
+            except Exception as exc:
+                card = _hfc_command_result_card(
+                    title="会话恢复失败",
+                    content=f"请重新发送 `/resume`。\n\n{exc.__class__.__name__}: {exc}",
+                    template="red",
+                )
+
+        message_id = str(item.get("message_id") or "")
+        if message_id and await _hfc_update_native_command_card(
+            adapter, message_id, card
+        ):
+            _hfc_info("background resume: original card updated")
+            return
+        chat_id = prepared["expected_chat_id"] or prepared["chat_id"]
+        if not chat_id or not hasattr(adapter, "_feishu_send_with_retry"):
+            _hfc_warn("background resume: result card cannot be delivered")
+            return
+        try:
+            await adapter._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=serialize_card_for_delivery(card),
+                reply_to=message_id or None,
+                metadata=_hfc_action_metadata(data),
+            )
+            _hfc_info("background resume: fallback result card sent")
+        except Exception as exc:
+            _hfc_warn(
+                "background resume: fallback send failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
+
+    loop = prepared["loop"]
+    submit = getattr(adapter, "_submit_on_loop", None)
+    if not callable(submit):
+        _hfc_warn("background resume schedule failed: submit helper unavailable")
+        return
+    coroutine = _run()
+    submitted = False
+    try:
+        submitted = bool(submit(loop, coroutine))
+        if not submitted:
+            _hfc_warn("background resume schedule failed")
+    except Exception as exc:
+        _hfc_warn(
+            "background resume schedule failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+    finally:
+        if not submitted:
+            coroutine.close()
+
+
+def _hfc_handle_native_resume_action(
+    adapter: Any,
+    data: Any,
+    action_value: dict[str, Any],
+) -> Any:
+    _hfc_info("inline card action received: resume_picker")
+    prepared = _hfc_prepare_native_resume_action(adapter, data, action_value)
+    if prepared is None:
+        return _hfc_raw_feishu_callback_response(
+            adapter,
+            _hfc_command_result_card(
+                title="会话选择已失效",
+                content="请由原发起者重新发送 `/resume`。",
+                template="red",
+            ),
+        )
+    switching_card = _hfc_command_result_card(
+        title="会话恢复中",
+        content="正在恢复所选会话…",
+        template="blue",
+    )
+    _hfc_resume_picker_background_task(adapter, data, prepared)
+    return _hfc_raw_feishu_callback_response(adapter, switching_card)
+
+
+def _hfc_build_patch_message_request(message_id: str, content: str) -> Any:
+    try:
+        from lark_oapi.api.im.v1 import (
+            PatchMessageRequest,
+            PatchMessageRequestBody,
+        )
+
+        request_body = PatchMessageRequestBody.builder().content(content).build()
+        return (
+            PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(request_body)
+            .build()
+        )
+    except Exception:
+        return None
+
+
+async def _hfc_update_native_command_card(adapter: Any, message_id: str, card: dict[str, Any]) -> bool:
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        _hfc_warn("native command card update skipped: missing message_id")
+        return False
+    client = getattr(adapter, "_client", None)
+    if client is None:
+        _hfc_warn("native command card update skipped: Feishu client unavailable")
+        return False
+    try:
+        run_blocking = getattr(adapter, "_run_blocking", None)
+        if not callable(run_blocking):
+            _hfc_warn("native command card update skipped: Feishu run helper unavailable")
+            return False
+        content = serialize_card_for_delivery(card)
+        message_api = client.im.v1.message
+        patch_call = getattr(message_api, "patch", None)
+        request = _hfc_build_patch_message_request(message_id, content)
+        if callable(patch_call) and request is not None:
+            update_call = patch_call
+        else:
+            body_builder = getattr(adapter, "_build_update_message_body", None)
+            request_builder = getattr(adapter, "_build_update_message_request", None)
+            if not (callable(body_builder) and callable(request_builder)):
+                _hfc_warn(
+                    "native command card update skipped: Feishu patch/update helpers unavailable"
+                )
+                return False
+            request_body = body_builder(msg_type="interactive", content=content)
+            request = request_builder(message_id, request_body)
+            update_call = message_api.update
+        message_ref = _hfc_log_reference("message", message_id)
+        _hfc_info(f"native command card update attempting: {message_ref}")
+        response = await run_blocking(update_call, request)
+        success = _hfc_update_response_success(response)
+        if not success:
+            _hfc_warn(f"native command card update failed: {_hfc_update_response_error(response)}")
+        else:
+            _hfc_info(f"native command card update succeeded: {message_ref}")
+        return success
+    except Exception as exc:
+        _hfc_warn(
+            "native command card update failed: "
+            f"{_hfc_exception_summary(exc)} "
+            f"{_hfc_log_reference('message', message_id)}"
+        )
+        return False
+
+
+def _hfc_is_duplicate_card_action(adapter: Any, data: Any) -> bool:
+    event = getattr(data, "event", None)
+    token = str(getattr(event, "token", "") or "").strip()
+    is_duplicate = getattr(adapter, "_is_card_action_duplicate", None)
+    if token and callable(is_duplicate):
+        try:
+            return bool(is_duplicate(token))
+        except Exception:
+            return False
+    return False
+
+
+async def _hfc_handle_feishu_card_action_event(self: Any, data: Any) -> None:
+    action_value = _hfc_action_value_from_data(data)
+    action = str(action_value.get("hfc_action") or "").strip()
+    if action:
+        _hfc_info(f"background card action received: {action}")
+    if action == "slash_confirm":
+        if _hfc_is_duplicate_card_action(self, data):
+            return
+        prepared = _hfc_prepare_native_slash_action(self, data, action_value, claim=True)
+        if prepared is None:
+            _hfc_info("background slash_confirm ignored: unresolved")
+            return
+        # A dispatcher retained before installation reaches this async fallback.
+        # It cannot return a card to the SDK, so publish the result just as the
+        # inline callback's background task does. Use the stored IM message ID,
+        # never the callback token or a CardKit container ID.
+        await _hfc_resolve_slash_confirm_background(self, data, action_value, prepared)
+        return
+    if action == "model_picker":
+        if _hfc_is_duplicate_card_action(self, data):
+            return
+        resolved = await _hfc_resolve_native_model_action_async(self, data, action_value)
+        if resolved is not None:
+            card, message_id = resolved
+            _hfc_info(
+                "background model_picker resolved without direct update: "
+                f"{_hfc_log_reference('message', message_id)}"
+            )
+        else:
+            _hfc_info("background model_picker ignored: unresolved")
+        return
+    if action == "resume_picker":
+        if _hfc_is_duplicate_card_action(self, data):
+            return
+        prepared = _hfc_prepare_native_resume_action(self, data, action_value)
+        if prepared is not None:
+            _hfc_resume_picker_background_task(self, data, prepared)
+        else:
+            _hfc_info("background resume_picker ignored: unresolved")
+        return
+    if action == "command_center":
+        if _hfc_is_duplicate_card_action(self, data):
+            return
+        prepared = _hfc_prepare_command_center_action(self, data, action_value)
+        if prepared is None:
+            _hfc_info("background command_center ignored: unresolved")
+            return
+        if prepared["nav"] == "run":
+            command = prepared["command"]
+            succeeded = await _hfc_run_command_center_action_async(
+                self,
+                prepared["item"],
+                command,
+            )
+            card = _hfc_command_result_card(
+                title=f"已打开 /{command}" if succeeded else "命令启动失败",
+                content=(
+                    "已交回 Hermes 原生命令入口处理。"
+                    if succeeded
+                    else "该命令不可从卡片运行，请在消息框中发送。"
+                ),
+                template="blue" if succeeded else "red",
+            )
+        else:
+            card = _hfc_command_center_card_from_action(prepared)
+        message_id = prepared["message_id"]
+        if message_id:
+            await _hfc_update_native_command_card(self, message_id, card)
+        return
+    if action == "interaction.select":
+        if _hfc_is_duplicate_card_action(self, data):
+            return
+        await asyncio.to_thread(
+            _hfc_handle_interaction_select_action,
+            self,
+            data,
+            action_value,
+        )
+        return
+    if action == "operations.select":
+        _hfc_info("background operations.select claimed by HFC")
+        return
+
+    original = getattr(type(self), "_hfc_original_handle_card_action_event", None)
+    if callable(original):
+        await original(self, data)
+
+
+def _hfc_refresh_feishu_event_handler(adapter: Any) -> bool:
+    current_handler = getattr(adapter, "_event_handler", None)
+    ws_client = getattr(adapter, "_ws_client", None)
+    ws_handler = getattr(ws_client, "_event_handler", None) if ws_client is not None else None
+    if current_handler is None and ws_handler is None:
+        return False
+
+    callback = getattr(adapter, "_on_card_action_trigger", None)
+    if not callable(callback):
+        return False
+
+    handlers = []
+    for handler in (current_handler, ws_handler):
+        if handler is not None and all(handler is not item for item in handlers):
+            handlers.append(handler)
+
+    # A boolean "refreshed once" becomes stale after reconnect. Inspect the
+    # currently attached processors so a new dispatcher can be refreshed too.
+    processors = []
+    for handler in handlers:
+        mapping = getattr(handler, "_callback_processor_map", None)
+        processor = mapping.get("p2.card.action.trigger") if isinstance(mapping, dict) else None
+        if processor is not None and hasattr(processor, "f"):
+            processors.append(processor)
+    from .feishu_ws_compat import card_frame_dispatch_needs_repair, repair_card_frame_dispatch
+    transport_repair = card_frame_dispatch_needs_repair(ws_client)
+    if not transport_repair and (not processors or all(processor.f == callback for processor in processors)):
+        return False
+
+    def refresh_card_action_callback() -> bool:
+        refreshed = repair_card_frame_dispatch(ws_client)
+        if refreshed:
+            _hfc_info("Feishu SDK CARD-frame dispatch repaired for this WebSocket client")
+        for handler in handlers:
+            processor_map = getattr(handler, "_callback_processor_map", None)
+            if not isinstance(processor_map, dict):
+                continue
+            processor = processor_map.get("p2.card.action.trigger")
+            if processor is None or not hasattr(processor, "f"):
+                continue
+            try:
+                setattr(processor, "f", callback)
+                refreshed = True
+            except Exception:
+                continue
+        if refreshed:
+            setattr(adapter, "_hfc_command_card_event_handler_refreshed", True)
+            _hfc_info(
+                "Feishu card action callback refreshed without replacing live event handler"
+            )
+        return refreshed
+
+    if ws_client is None:
+        return refresh_card_action_callback()
+
+    ws_loop = getattr(adapter, "_ws_thread_loop", None)
+    call_soon_threadsafe = getattr(ws_loop, "call_soon_threadsafe", None)
+    is_closed = getattr(ws_loop, "is_closed", None)
+    try:
+        ws_loop_closed = callable(is_closed) and bool(is_closed())
+    except Exception as exc:
+        _hfc_warn(
+            "Feishu card action callback refresh skipped: "
+            f"WS loop state unavailable ({exc.__class__.__name__})"
+        )
+        return False
+    if not callable(call_soon_threadsafe) or ws_loop_closed:
+        _hfc_warn("Feishu card action callback refresh skipped: WS loop unavailable")
+        return False
+    target = (current_handler, ws_handler, ws_client, ws_loop)
+    pending = getattr(adapter, "_hfc_command_card_event_handler_refresh_target", None)
+    if (getattr(adapter, "_hfc_command_card_event_handler_refresh_scheduled", False)
+            and isinstance(pending, tuple) and len(pending) == len(target)
+            and all(before is now for before, now in zip(pending, target))):
+        return False
+    try:
+        setattr(adapter, "_hfc_command_card_event_handler_refresh_target", target)
+        setattr(adapter, "_hfc_command_card_event_handler_refresh_scheduled", True)
+
+        def refresh_on_ws_loop() -> None:
+            try:
+                # An old WS loop must never mutate the transport that replaced
+                # it. The next turn/interaction can schedule the new target.
+                if (getattr(adapter, "_event_handler", None) is current_handler
+                        and getattr(adapter, "_ws_client", None) is ws_client
+                        and getattr(ws_client, "_event_handler", None) is ws_handler
+                        and getattr(adapter, "_ws_thread_loop", None) is ws_loop):
+                    refresh_card_action_callback()
+            finally:
+                if getattr(adapter, "_hfc_command_card_event_handler_refresh_target", None) is target:
+                    setattr(adapter, "_hfc_command_card_event_handler_refresh_scheduled", False)
+                    setattr(adapter, "_hfc_command_card_event_handler_refresh_target", None)
+
+        call_soon_threadsafe(refresh_on_ws_loop)
+        return True
+    except Exception as exc:
+        if getattr(adapter, "_hfc_command_card_event_handler_refresh_target", None) is target:
+            setattr(adapter, "_hfc_command_card_event_handler_refresh_scheduled", False)
+            setattr(adapter, "_hfc_command_card_event_handler_refresh_target", None)
+        _hfc_warn(
+            "Feishu card action callback refresh failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+        return False
+
+
+def _command_card_answer_text(answer: Any) -> str:
+    if answer is None:
+        return ""
+    text = str(answer).strip()
+    return text
+
+
+def resolve_approval_choice(approval_data: dict[str, Any], session_key: str, choice: str) -> int:
+    """Bind delayed consent to the original queue entry when Hermes exposes IDs."""
+    from tools.approval import resolve_gateway_approval
+    request_id = approval_data.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        if "request_id" not in inspect.signature(resolve_gateway_approval).parameters:
+            _hfc_warn("approval resolver lacks exact request identity")
+            return 0
+        return resolve_gateway_approval(session_key, choice, request_id=request_id)
+    return resolve_gateway_approval(session_key, choice)
+
+
+def request_approval_choice_from_hermes_locals(
+    local_vars: dict[str, Any],
+    approval_data: dict[str, Any],
+    *,
+    interaction_id: str,
+    timeout_seconds: float | None = None,
+) -> str | None:
+    import html
+
+    command = str(approval_data.get("command") or "").strip()
+    description = str(approval_data.get("description") or "dangerous command").strip()
+    # Ordinary Markdown wraps long commands on mobile, unlike fenced blocks.
+    # Escape formatting so command text cannot hide parts behind links or tags.
+    def approval_text(value: str) -> str:
+        return re.sub(r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1", html.escape(value, quote=False))
+
+    approval_description = (
+        f"**操作说明**\n{approval_text(description)}\n\n"
+        f"**完整命令**\n{approval_text(command)}"
+    )
+    # Reserve room for the header, options, callbacks, and footer inside the
+    # 28 KB card envelope. Never offer approval for a truncated command.
+    if len(json.dumps(approval_description, ensure_ascii=False).encode("utf-8")) > 12_000:
+        return None
+    smart_denied = approval_data.get("smart_denied") is True
+    allow_session = approval_data.get("allow_session", True) is not False
+    allow_permanent = approval_data.get("allow_permanent", True) is not False
+    allow_custom_input = approval_data.get("allow_custom_input") is True
+    options = [{"label": "允许一次", "value": "once", "style": "primary"}]
+    if not smart_denied and allow_session:
+        options.append({"label": "本会话允许", "value": "session"})
+        if allow_permanent:
+            options.append({"label": "始终允许", "value": "always"})
+    options.append({"label": "拒绝", "value": "deny", "style": "danger"})
+    current = local_vars.get("_run_still_current")
+    if not callable(current):
+        context = local_vars.get("_hfc_turn_ctx") or local_vars.get("ctx")
+        current = getattr(context, "_run_still_current", None)
+    approval_locals = dict(local_vars)
+    if callable(current):
+        request_id = approval_data.get("request_id")
+        pending_probe = None
+        if isinstance(request_id, str) and request_id:
+            try:
+                from tools.approval import list_gateway_approvals
+                pending_probe = list_gateway_approvals
+            except ImportError:
+                pass
+        session_key = str(local_vars.get("_approval_session_key") or local_vars.get("conversation_id") or "")
+        def still_waiting():
+            if not current():
+                return False
+            if pending_probe is not None:
+                return any(item.get("request_id") == request_id for item in pending_probe(session_key))
+            return True
+        approval_locals.update(_hfc_pause_approval=True, _hfc_wait_current=still_waiting)
+    result = request_interaction_from_hermes_locals(
+        approval_locals,
+        kind="approval",
+        interaction_id=interaction_id,
+        prompt="需要授权后继续执行",
+        description=approval_description,
+        options=options,
+        timeout_seconds=timeout_seconds,
+        allow_custom_input=allow_custom_input,
+    )
+    if isinstance(result, dict) and result.get("status") in {"failed", "timeout"}:
+        # The card was accepted. Expiry must resolve this approval safely,
+        # rather than return None and reopen native approval outside its topic.
+        return "deny"
+    if isinstance(result, dict) and result.get("status") == "completed":
+        choice = str(result.get("choice") or "").strip()
+        allowed_choices = {str(option["value"]) for option in options}
+        if allow_custom_input:
+            return choice or None
+        return choice if choice in allowed_choices else None
+    return None
+
+
+async def complete_command_card_from_hermes_locals_async(
+    local_vars: dict[str, Any],
+    *,
+    answer: Any,
+) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        if not (
+            await _policy_gate_async(
+                config,
+                local_vars,
+                "message.completed",
+            )
+        ).card:
+            return False
+        payload = build_event(
+            "message.completed",
+            {
+                **local_vars,
+                "answer": _command_card_answer_text(answer),
+                "delivery_kind": "command",
+            },
+        )
+        post_result = await _post_json_ordered_response(
+            config.event_url,
+            payload,
+            _timeout_for_event(config, payload["event"]),
+        )
+        _register_native_handoff_descriptor(payload, post_result)
+        return _event_was_applied(post_result, strict=True)
+    except Exception:
+        return False
+
+
+def _hfc_install_policy_adapter_method(
+    adapter_type: type,
+    *,
+    method_name: str,
+    wrapper: Callable[..., Any],
+    original_name: str,
+    internal_methods: tuple[Callable[..., Any], ...] = (),
+) -> bool:
+    current = getattr(adapter_type, method_name, None)
+    if current is wrapper:
+        # Repair an older install that shadowed an inherited Hermes method
+        # without preserving it first.
+        if not callable(getattr(adapter_type, original_name, None)):
+            for base in adapter_type.__mro__[1:]:
+                inherited = base.__dict__.get(method_name)
+                if callable(inherited) and inherited not in {
+                    wrapper,
+                    *internal_methods,
+                }:
+                    setattr(adapter_type, original_name, inherited)
+                    break
+        return True
+    if (
+        original_name not in adapter_type.__dict__
+        and callable(current)
+        and current not in {wrapper, *internal_methods}
+    ):
+        setattr(adapter_type, original_name, current)
+    setattr(adapter_type, method_name, wrapper)
+    return True
+
+
+def _hfc_preserve_native_card_callback(
+    adapter_type: type, current: Callable[..., Any], wrapper: Callable[..., Any], original_name: str,
+) -> None:
+    # A previous HFC import has the same wrapper name but a different identity.
+    # Keep its saved native fallback, rather than stacking HFC on itself.
+    previous_hfc = (
+        getattr(current, "__module__", None) == wrapper.__module__
+        and getattr(current, "__name__", None) == wrapper.__name__
+    )
+    if not previous_hfc:
+        setattr(adapter_type, original_name, current)
+
+
+def _hfc_thread_metadata_for_target_with_feishu_reply_anchor(
+    self: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    original = getattr(
+        type(self),
+        "_hfc_original_thread_metadata_for_target",
+        None,
+    )
+    if not callable(original):
+        return None
+    metadata = original(self, *args, **kwargs)
+    platform = kwargs.get("platform", args[0] if len(args) > 0 else None)
+    thread_id = kwargs.get("thread_id", args[2] if len(args) > 2 else None)
+    reply_to_message_id = kwargs.get("reply_to_message_id")
+    platform_name = str(getattr(platform, "value", platform) or "").strip().lower()
+    thread = str(thread_id or "").strip()
+    reply_anchor = str(reply_to_message_id or "").strip()
+    if platform_name != "feishu" or not thread or not reply_anchor:
+        return metadata
+    routed = dict(metadata) if isinstance(metadata, dict) else {}
+    routed.setdefault("thread_id", thread)
+    routed.setdefault("reply_to_message_id", reply_anchor)
+    return routed
+
+
+async def _wait_for_startup_card_policy(source) -> None:
+    """Give a restarting sidecar a bounded chance before a boot-resume pins native.
+
+    A valid native policy and deliberate HTTP refusal return immediately. This
+    does not pin/override policy, publish an event, or resume an agent itself.
+    """
+    config = load_runtime_config()
+    if not config.enabled or _platform_name({}, source) != "feishu":
+        return
+    profile, provenance = _profile_identity({}, source, None)
+    chat = _first_attr_string(source, ("chat_id",))
+    if not chat or provenance.startswith("sanitized_"):
+        return
+    payload = {"schema_version":"1", "profile_id":profile, "chat_id":chat,
+               "conversation_id":_first_attr_string(source,("thread_id",)) or chat}
+    deadline = time.monotonic() + TERMINAL_DELIVERY_RETRY_BUDGET_SECONDS
+    for delay in (0.0, *TERMINAL_DELIVERY_RETRY_DELAYS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if delay:
+            await asyncio.sleep(min(delay, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            # Query only. Normal admission runs in the original handler afterwards.
+            await asyncio.wait_for(_post_json_ordered_response(
+                f"{_summary_base_url(config.event_url)}/delivery/policy", payload,
+                min(config.timeout_seconds, remaining)), timeout=remaining)
+            return
+        except Exception as exc:
+            if not _terminal_delivery_retryable(exc):
+                return
+
+
+def _install_startup_resume_wait(runner_type) -> bool:
+    import inspect
+    original = getattr(runner_type, "_run_startup_resume_event", None)
+    if getattr(original, "_hfc_startup_policy_wait", False):
+        return True
+    if not inspect.iscoroutinefunction(original):
+        return False
+    parameters = list(inspect.signature(original).parameters.values())
+    if ([p.name for p in parameters] != ["self","adapter","event","session_key"]
+            or any(p.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD for p in parameters)):
+        return False
+
+    async def resume(self, adapter, event, session_key):
+        try:
+            await _wait_for_startup_card_policy(getattr(event, "source", None))
+        except Exception:
+            pass
+        return await original(self, adapter, event, session_key)
+    resume._hfc_startup_policy_wait = True
+    resume._hfc_original_callback = original
+    setattr(runner_type, "_run_startup_resume_event", resume)
+    return True
+
+
+def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) -> bool:
+    try:
+        _remember_gateway_runner(runner)
+        _ensure_runtime_control_started()
+        _install_delivery_ledger_mark_delivered_wrapper()
+        adapters = _hfc_registered_adapter_items(runner)
+        if not isinstance(getattr(runner, "adapters", None), dict) and not isinstance(
+            getattr(runner, "_profile_adapters", None), dict
+        ):
+            if event is not None:
+                _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
+            _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+            _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
+            return False
+        runner_type = type(runner)
+        from .notice_producers import install_notice_producers
+        install_notice_producers(runner_type)
+        _install_startup_resume_wait(runner_type)
+        if callable(getattr(runner_type, "_thread_metadata_for_target", None)):
+            _hfc_install_policy_adapter_method(
+                runner_type,
+                method_name="_thread_metadata_for_target",
+                wrapper=_hfc_thread_metadata_for_target_with_feishu_reply_anchor,
+                original_name="_hfc_original_thread_metadata_for_target",
+            )
+        _hfc_install_resume_picker_handler(runner_type)
+        _hfc_install_compress_command_handler(runner_type)
+        _hfc_install_update_command_handler(runner_type)
+        current_notice_delivery = runner_type.__dict__.get("_deliver_platform_notice")
+        if current_notice_delivery is _hfc_deliver_platform_notice_with_card:
+            setattr(runner_type, "_hfc_platform_notice_wrapped", True)
+        else:
+            original_notice_delivery = (
+                getattr(runner_type, "_hfc_original_deliver_platform_notice", None)
+                or current_notice_delivery
+                or getattr(runner_type, "_deliver_platform_notice", None)
+            )
+            if callable(original_notice_delivery):
+                setattr(
+                    runner_type,
+                    "_hfc_original_deliver_platform_notice",
+                    original_notice_delivery,
+                )
+                setattr(
+                    runner_type,
+                    "_deliver_platform_notice",
+                    _hfc_deliver_platform_notice_with_card,
+                )
+                setattr(runner_type, "_hfc_platform_notice_wrapped", True)
+
+        command_result_context = (
+            _hfc_command_result_context_from_event(event) if event is not None else None
+        )
+        if isinstance(command_result_context, dict):
+            command_result_context["runner"] = runner
+            command_result_context["event"] = event
+        notice_context = _hfc_notice_context_from_event(event) if event is not None else None
+        delivery_context = (
+            _hfc_delivery_context_from_event(event) if event is not None else None
+        )
+        installed = False
+        for key, adapter in adapters:
+            if not _is_feishu_adapter_key(key, adapter):
+                continue
+            adapter_type = type(adapter)
+            adapter_ready = False
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="send_slash_confirm",
+                wrapper=_hfc_send_native_slash_confirm,
+                original_name="_hfc_original_send_slash_confirm",
+            )
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="send_model_picker",
+                wrapper=_hfc_send_native_model_picker,
+                original_name="_hfc_original_send_model_picker",
+                internal_methods=(_hfc_send_model_picker,),
+            ) or adapter_ready
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="send_resume_picker",
+                wrapper=_hfc_send_native_resume_picker,
+                original_name="_hfc_original_send_resume_picker",
+            ) or adapter_ready
+
+            # Installation markers can survive upstream method rebinding or be
+            # inherited by a subclass overriding the callbacks. Inspect actual
+            # methods: otherwise HFC buttons leak into Hermes' /card fallback.
+            current_action_handler = getattr(adapter_type, "_on_card_action_trigger", None)
+            if current_action_handler is _hfc_on_feishu_card_action_trigger:
+                setattr(adapter_type, "_hfc_command_card_action_wrapped", True)
+                adapter_ready = True
+            elif callable(current_action_handler):
+                _hfc_preserve_native_card_callback(
+                    adapter_type, current_action_handler, _hfc_on_feishu_card_action_trigger,
+                    "_hfc_original_on_card_action_trigger",
+                )
+                setattr(adapter_type, "_on_card_action_trigger", _hfc_on_feishu_card_action_trigger)
+                setattr(adapter_type, "_hfc_command_card_action_wrapped", True)
+                adapter_ready = True
+
+            current_event_handler = getattr(adapter_type, "_handle_card_action_event", None)
+            if current_event_handler is _hfc_handle_feishu_card_action_event:
+                setattr(adapter_type, "_hfc_command_card_event_wrapped", True)
+                adapter_ready = True
+            elif callable(current_event_handler):
+                _hfc_preserve_native_card_callback(
+                    adapter_type, current_event_handler, _hfc_handle_feishu_card_action_event,
+                    "_hfc_original_handle_card_action_event",
+                )
+                setattr(
+                    adapter_type,
+                    "_handle_card_action_event",
+                    _hfc_handle_feishu_card_action_event,
+                )
+                setattr(adapter_type, "_hfc_command_card_event_wrapped", True)
+                adapter_ready = True
+
+            current_send = adapter_type.__dict__.get("send")
+            from .notice_producers import install_adapter_notice_producers
+            install_adapter_notice_producers(adapter, runner)
+            if current_send is _hfc_send_with_native_command_result_card:
+                setattr(adapter_type, "_hfc_command_result_send_wrapped", True)
+                adapter_ready = True
+            elif not adapter_type.__dict__.get(
+                "_hfc_command_result_send_wrapped", False
+            ):
+                original_send = current_send or getattr(adapter_type, "send", None)
+                if callable(original_send):
+                    setattr(adapter_type, "_hfc_original_send", original_send)
+                    setattr(adapter_type, "send", _hfc_send_with_native_command_result_card)
+                    setattr(adapter_type, "_hfc_command_result_send_wrapped", True)
+                    adapter_ready = True
+            elif callable(getattr(adapter_type, "send", None)):
+                adapter_ready = True
+
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="_feishu_send_with_retry",
+                wrapper=_hfc_feishu_send_with_native_handoff_tracking,
+                original_name="_hfc_original_feishu_send_with_retry",
+            ) or adapter_ready
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="_send_raw_message",
+                wrapper=_hfc_send_raw_message_with_native_handoff_route,
+                original_name="_hfc_original_send_raw_message",
+            ) or adapter_ready
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="_build_reply_message_body",
+                wrapper=_hfc_build_reply_message_body_with_native_uuid,
+                original_name="_hfc_original_build_reply_message_body",
+            ) or adapter_ready
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="_build_create_message_body",
+                wrapper=_hfc_build_create_message_body_with_native_uuid,
+                original_name="_hfc_original_build_create_message_body",
+            ) or adapter_ready
+
+            current_edit_message = adapter_type.__dict__.get("edit_message")
+            if current_edit_message is _hfc_edit_message_with_system_notice_card:
+                setattr(adapter_type, "_hfc_system_notice_edit_wrapped", True)
+                adapter_ready = True
+            elif not getattr(adapter_type, "_hfc_system_notice_edit_wrapped", False):
+                original_edit_message = current_edit_message or getattr(
+                    adapter_type, "edit_message", None
+                )
+                if callable(original_edit_message):
+                    setattr(
+                        adapter_type,
+                        "_hfc_original_edit_message",
+                        original_edit_message,
+                    )
+                    setattr(
+                        adapter_type,
+                        "edit_message",
+                        _hfc_edit_message_with_system_notice_card,
+                    )
+                    setattr(adapter_type, "_hfc_system_notice_edit_wrapped", True)
+                    adapter_ready = True
+            elif callable(getattr(adapter_type, "edit_message", None)):
+                adapter_ready = True
+
+            if adapter_ready:
+                _hfc_refresh_feishu_event_handler(adapter)
+                setattr(adapter_type, "_hfc_command_card_methods_installed", True)
+                installed = True
+        if event is not None:
+            _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(
+                command_result_context if installed else None
+            )
+            _HFC_FEISHU_NOTICE_CONTEXT.set(notice_context if installed else None)
+            _HFC_FEISHU_DELIVERY_CONTEXT.set(
+                delivery_context if installed else None
+            )
+        return installed
+    except Exception:
+        if event is not None:
+            try:
+                _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
+                _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+                _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
+            except Exception:
+                pass
+        return False
+
+
+def request_clarify_response_from_hermes_locals(
+    local_vars: dict[str, Any],
+    *,
+    interaction_id: str,
+    question: str,
+    choices: Any,
+    timeout_seconds: float | None = None,
+    multi_select: bool = False,
+) -> str | None:
+    if not choices:
+        return None
+    options = []
+    for index, choice in enumerate(list(choices)):
+        label = str(choice).strip()
+        if label:
+            options.append(
+                {
+                    "label": label,
+                    "value": label,
+                    "style": "default" if multi_select else ("primary" if index == 0 else "default"),
+                }
+            )
+    if not options:
+        return None
+    result = request_interaction_from_hermes_locals(
+        local_vars,
+        kind="clarify",
+        interaction_id=interaction_id,
+        prompt=str(question or "请选择").strip(),
+        options=options,
+        timeout_seconds=_interaction_timeout(timeout_seconds),
+        multi_select=multi_select,
+        allow_custom_input=True,
+    )
+    if isinstance(result, dict) and result.get("status") == "completed":
+        choice = str(result.get("choice") or "").strip()
+        return choice or None
+    _hfc_warn(
+        "clarify fell back to native text: "
+        + _hfc_log_reference("interaction", interaction_id)
+        + " result="
+        + _hfc_summarize_post_result(result)
+    )
+    return None
+
+
+def should_suppress_native_response(
+    platform: str,
+    delivered: bool,
+    attachments: Any = None,
+    native_delivery: Any = None,
+) -> bool:
+    if not delivered:
+        return False
+    if str(platform or "").lower() != "feishu":
+        return False
+    if str(native_delivery or "").strip().lower() == "required":
+        return False
+    if native_delivery is None and attachments:
+        return False
+    return True
+
+
+def _post_json_sync(url: str, payload: dict[str, Any], timeout: float) -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(_post_json(url, payload, timeout))
+        except Exception:
+            return False
+        return True
+
+    result: dict[str, BaseException | None] = {"error": None}
+
+    def run_in_thread() -> None:
+        try:
+            asyncio.run(_post_json(url, payload, timeout))
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread.start()
+    thread.join()
+    return result["error"] is None
+
+
+def _post_interaction_event(
+    local_vars: dict[str, Any],
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any] | None | object:
+    """POST an interaction event once.
+
+    The caller performs a read-only interaction lookup after an ambiguous
+    transport failure. It must not replay /events because a response loss does
+    not prove that the first event was rejected.
+    """
+    loop = local_vars.get("_hfc_loop")
+    try:
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                _post_json_ordered_response(url, payload, timeout),
+                loop,
+            )
+            return future.result(timeout=max(1.0, timeout + 1.0))
+        return _post_json_sync_response(url, payload, timeout)
+    except Exception:
+        return _POST_FAILED
+
+
+def _hfc_interaction_card_confirmed(
+    config: RuntimeConfig, interaction_id: str, *, timeout_seconds: float | None = None
+) -> bool:
+    """Return True when the sidecar already tracks the interaction (card sent).
+
+    Used after a POST to /events failed at the transport layer: the event may
+    have been delivered even though the response was lost, in which case
+    falling back to native text would produce a duplicate (card + text).
+    """
+    try:
+        base_url = _summary_base_url(config.event_url)
+        url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
+        result = _get_json_sync(url, config.timeout_seconds if timeout_seconds is None else timeout_seconds)
+        return isinstance(result, dict) and result.get("status") in (
+            "pending",
+            "paused",
+            "completed",
+            "failed",
+        )
+    except Exception:
+        return False
+
+
+def _wait_for_interaction_card_confirmation(
+    config: RuntimeConfig, interaction_id: str, *, grace_seconds: float = 3.0
+) -> bool:
+    """Boundedly confirm a card after an ambiguous event POST.
+
+    The sidecar may have accepted and started the Feishu send while the POST
+    response timed out. Do not replay the event; poll the read-only interaction
+    endpoint briefly so native text fallback is used only when no card exists.
+    """
+    deadline = time.monotonic() + max(0.0, min(float(grace_seconds), 5.0))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # The read itself consumes the grace budget. A slow lookup must not add
+        # a full configured timeout after the deadline has already expired.
+        if _hfc_interaction_card_confirmed(
+            config, interaction_id, timeout_seconds=min(config.timeout_seconds, remaining)
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+
+
+def _timeout_for_event(config: RuntimeConfig, event_name: str) -> float:
+    if event_name in {"message.completed", "message.failed"}:
+        return max(config.timeout_seconds, TERMINAL_TIMEOUT_SECONDS)
+    if event_name == "interaction.requested":
+        return max(config.timeout_seconds, INTERACTION_ADMISSION_TIMEOUT_SECONDS)
+    return config.timeout_seconds
+
+
+async def _send_fail_open(
+    url: str, payload: dict[str, Any], timeout: float
+) -> None:
+    try:
+        await _post_json(url, payload, timeout)
+    except Exception:
+        return
+
+
+async def _send_fail_open_ordered(
+    url: str, payload: dict[str, Any], timeout: float
+) -> None:
+    try:
+        await _post_json_ordered(url, payload, timeout)
+    except Exception:
+        return
+
+
+async def _post_json_ordered(
+    url: str, payload: dict[str, Any], timeout: float
+) -> None:
+    lock = _send_lock(url, payload)
+    if lock is None:
+        await _post_json(url, payload, timeout)
+        return
+    async with lock:
+        await _post_json(url, payload, timeout)
+
+
+async def _post_json_ordered_response(
+    url: str, payload: dict[str, Any], timeout: float
+) -> Any:
+    lock = _send_lock(url, payload)
+    if lock is None:
+        return await _post_json_response(url, payload, timeout)
+    async with lock:
+        return await _post_json_response(url, payload, timeout)
+
+
+def _terminal_delivery_retryable(exc: BaseException) -> bool:
+    """Whether a failed terminal POST is worth repeating.
+
+    Only failures that mean "the sidecar never ruled on this request" qualify: transport errors
+    (connection refused, timeout, DNS) and 5xx. A 4xx is a deliberate refusal, so repeating it
+    would fight the admission logic and delay the turn for nothing.
+
+    Repeating is safe because applying a terminal event twice is idempotent: the sidecar reports
+    applied=True for a session that is already terminal, so a request that did land before its
+    response was lost cannot double-apply.
+    """
+    if isinstance(exc, urlerror.HTTPError):
+        code = exc.code
+        return isinstance(code, int) and 500 <= code < 600
+    return isinstance(exc, (urlerror.URLError, TimeoutError, OSError))
+
+
+async def _post_terminal_with_retry(
+    config: RuntimeConfig, payload: dict[str, Any], event_name: str
+) -> Any:
+    """Bound the whole attempt, including queueing for the per-turn lock.
+
+    Cancelling the async transport does not prove a remote request was not applied;
+    retries retain the original event identity and require server-side deduplication.
+    Logs deliberately exclude message IDs, URLs and exception bodies.
+    """
+    deadline = time.monotonic() + TERMINAL_DELIVERY_RETRY_BUDGET_SECONDS
+    timeout = _timeout_for_event(config, event_name)
+    for attempt in range(len(TERMINAL_DELIVERY_RETRY_DELAYS) + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("terminal delivery budget exhausted")
+        try:
+            result = await asyncio.wait_for(
+                _post_json_ordered_response(config.event_url, payload, min(timeout, remaining)),
+                timeout=remaining,
+            )
+        except Exception as exc:
+            if not _terminal_delivery_retryable(exc):
+                raise
+            if attempt == len(TERMINAL_DELIVERY_RETRY_DELAYS):
+                logger.warning("terminal delivery retries exhausted (%s)", type(exc).__name__)
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("terminal delivery budget exhausted") from None
+            logger.warning("terminal delivery retry %d (%s)", attempt + 1, type(exc).__name__)
+            await asyncio.sleep(min(TERMINAL_DELIVERY_RETRY_DELAYS[attempt], remaining))
+        else:
+            if attempt:
+                logger.warning("terminal delivery recovered after %d retries", attempt)
+            return result
+
+
+def _send_lock(url: str, payload: dict[str, Any]) -> asyncio.Lock | None:
+    canonical_id = payload.get("turn_id") or payload.get("message_id")
+    if not isinstance(canonical_id, str) or not canonical_id:
+        return None
+    loop = asyncio.get_running_loop()
+    key = (id(loop), url, canonical_id)
+    with _SEND_LOCKS_GUARD:
+        lock = _SEND_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SEND_LOCKS[key] = lock
+        return lock
+
+
+async def _post_json(url: str, payload: dict[str, Any], timeout: float) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = request.Request(
+        url,
+        data=body,
+        headers=_post_headers(url, body),
+        method="POST",
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _open_request, req, timeout)
+
+
+async def _post_json_response(url: str, payload: dict[str, Any], timeout: float) -> Any:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = request.Request(
+        url,
+        data=body,
+        headers=_post_headers(url, body),
+        method="POST",
+    )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _open_json_request, req, timeout)
+
+
+def _post_json_sync_response(url: str, payload: dict[str, Any], timeout: float) -> Any:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = request.Request(
+        url,
+        data=body,
+        headers=_post_headers(url, body),
+        method="POST",
+    )
+    return _open_json_request(req, timeout)
+
+
+def _task_heartbeat_probe(source: Any) -> dict[str, str] | None:
+    if _platform_name({}, source) != "feishu":
+        return None
+    turn_id = _first_attr_string(source, ("_hfc_turn_id",))
+    conversation_id = _first_attr_string(source, ("_hfc_conversation_id",))
+    chat_id = _first_attr_string(source, ("chat_id",))
+    thread_id = _first_attr_string(source, ("thread_id",))
+    profile, provenance = _profile_identity({}, source, None)
+    if (not turn_id or not conversation_id or not chat_id
+            or provenance.startswith("sanitized_")
+            or thread_id and thread_id != conversation_id):
+        return None
+    return {"schema_version": "1", "profile_id": profile, "chat_id": chat_id,
+            "conversation_id": conversation_id, "turn_id": turn_id, "message_id": turn_id}
+
+
+async def suppress_task_heartbeat_async(source: Any) -> bool:
+    """Suppress only this producer's heartbeat after an exact task-card proof.
+
+    No policy cache, synthetic send result, extra event or card mutation. Older
+    sidecars and unbound/native sources without this identity remain fail-open.
+    """
+    try:
+        config = load_runtime_config()
+        payload = _task_heartbeat_probe(source)
+        if not config.enabled or payload is None:
+            return False
+        timeout = min(config.timeout_seconds, POLICY_QUERY_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(_post_json_response(
+            f"{_summary_base_url(config.event_url)}/delivery/policy", payload, timeout),
+            timeout=timeout + 0.1)
+        current_config = load_runtime_config()
+        return bool(
+            current_config.enabled and current_config.event_url == config.event_url
+            and payload == _task_heartbeat_probe(source)
+            and isinstance(result, dict) and result.get("ok") is True
+            and result.get("disposition") == "card"
+            and result.get("accepted_task_card") is True
+        )
+    except Exception:
+        return False
+
+
+def _transient_notice_recall_seconds(content: Any) -> Optional[float]:
+    """Compatibility entry point for exact known transient notice recognition."""
+    return transient_notice_recall_seconds(content)
+
+
+def _notice_source(candidate: Any) -> Any:
+    """Accept either an event (``event.source``) or a SessionSource passed directly."""
+    source = getattr(candidate, "source", None)
+    return source if source is not None else candidate
+
+
+async def recall_transient_thread_notice_async(candidate: Any, content: Any, result: Any) -> bool:
+    """Withdraw a transient thread notice once the user has had a chance to read it.
+
+    See ``transient_notices`` for the exact known templates and exclusions. ``candidate`` is either an
+    event carrying ``source`` or a ``SessionSource`` itself (the long-running heartbeat call site has
+    only the source). Best-effort throughout: a failed request must never disturb the send that
+    already succeeded, so every failure path returns False instead of raising.
+    """
+    try:
+        delay = _transient_notice_recall_seconds(content)
+        if delay is None:
+            return False
+        if getattr(result, "success", False) is not True:
+            return False
+        platform = getattr(_notice_source(candidate), "platform", "")
+        if str(getattr(platform, "value", platform) or "").lower() != "feishu":
+            return False
+        message_id = str(getattr(result, "message_id", "") or "")
+        if not message_id:
+            return False
+        source = _notice_source(candidate)
+        profile, provenance = _profile_identity({}, source, None)
+        if provenance.startswith("sanitized_"):
+            return False
+        route = {"profile_id": profile,
+                 "chat_id": _first_attr_string(source, ("chat_id",)) or "",
+                 "conversation_id": _first_attr_string(source, ("thread_id",)) or ""}
+        return await schedule_message_recall_async(message_id, delay_seconds=delay, route=route)
+    except Exception:
+        return False
+
+
+async def recall_busy_redirect_ack_async(event: Any, content: Any, result: Any) -> bool:
+    """Recall redirect/interrupt/steer acknowledgements using the actual event route.
+
+    Keep the historical entry-point name for installed hook compatibility.
+    Queue acknowledgements and interrupt/steer onboarding guidance are retained.
+    """
+    if not is_transient_busy_ack(content):
+        return False
+    return await recall_transient_thread_notice_async(event, content, result)
+
+
+def _bind_stop_turn_owner(source: Any, event: Any, conversation_id: str) -> None:
+    """Keep one exact, nonpersistent display owner on its processing task."""
+    try:
+        task = asyncio.current_task()
+        if task is not None:
+            # A queued child without a verified identity must not inherit its
+            # predecessor's display owner on the same processing task.
+            task._hfc_stop_turn_owner = None
+        turn_id = _first_attr_string(source, ("_hfc_turn_id",))
+        profile, provenance = _profile_identity({}, source, None)
+        if (task is not None and turn_id and conversation_id
+                and turn_id == _first_attr_string(event, ("message_id",))
+                and _platform_name({}, source) == "feishu"
+                and not provenance.startswith("sanitized_")):
+            task._hfc_stop_turn_owner = (
+                source, event, turn_id, conversation_id, profile,
+                getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+            )
+    except Exception:
+        pass
+
+
+def capture_stop_cancellation(adapter: Any, event: Any, session_key: Any, cmd: Any) -> Any:
+    """Observe the exact old task just before Hermes' verified /stop cancel call."""
+    try:
+        if cmd != "stop" or _platform_name({}, getattr(event, "source", None)) != "feishu":
+            return None
+        task = adapter._session_tasks.get(session_key)
+        if (not isinstance(task, asyncio.Task) or task.done()
+                or (getattr(task, "cancelling", lambda: 0)() != 0)
+                or task in adapter._expected_cancelled_tasks):
+            return None
+        owner = getattr(task, "_hfc_stop_turn_owner", None)
+        if not isinstance(owner, tuple) or len(owner) != 7:
+            return None
+        source, original, turn_id, conversation, profile, chat_id, thread_id = owner
+        if (adapter._event_session_key(original) != session_key
+                or adapter._event_session_key(event) != session_key
+                or original is event or original.message_id != turn_id
+                or event.message_id == turn_id
+                or _first_attr_string(source, ("_hfc_turn_id",)) != turn_id
+                or _first_attr_string(source, ("_hfc_conversation_id",)) != conversation
+                or _profile_identity({}, source, None)[0] != profile
+                or _profile_identity({}, event.source, None)[0] != profile
+                or getattr(source, "chat_id", None) != chat_id
+                or getattr(source, "thread_id", None) != thread_id
+                or any(getattr(source, key, None) != getattr(event.source, key, None)
+                       for key in ("chat_id", "thread_id"))):
+            return None
+        return task, owner
+    except Exception:
+        return None
+
+
+async def emit_cancelled_stop_turn_async(proof: Any) -> bool:
+    """Close only the owner whose handler the verified stop call actually cancelled."""
+    try:
+        if not isinstance(proof, tuple) or len(proof) != 2:
+            return False
+        task, owner = proof
+        if (not isinstance(task, asyncio.Task) or not task.cancelled()
+                or getattr(task, "_hfc_stop_turn_owner", None) is not owner):
+            return False
+        source, event, turn_id, conversation, profile, chat_id, thread_id = owner
+        if (_profile_identity({}, source, None)[0] != profile
+                or _profile_identity({}, getattr(event, "source", None), None)[0] != profile
+                or _platform_name({}, source) != "feishu"
+                or _platform_name({}, getattr(event, "source", None)) != "feishu"
+                or _first_attr_string(source, ("_hfc_turn_id",)) != turn_id
+                or _first_attr_string(event, ("message_id",)) != turn_id
+                or _first_attr_string(source, ("_hfc_conversation_id",)) != conversation
+                or getattr(source, "chat_id", None) != chat_id
+                or getattr(source, "thread_id", None) != thread_id
+                or getattr(getattr(event, "source", None), "chat_id", None) != chat_id
+                or getattr(getattr(event, "source", None), "thread_id", None) != thread_id):
+            return False
+        # Share terminal deduplication with the result-first stale-drain path.
+        return await emit_stale_interrupted_turn_async({
+            "source": source, "event": event, "turn_id": turn_id,
+            "conversation_id": conversation, "profile_id": profile,
+            "agent_result": {"interrupted": True},
+        })
+    except Exception:
+        return False
+
+
+def schedule_cancelled_stop_turn(adapter: Any, proof: Any) -> bool:
+    """Use Hermes' shutdown-owned task set; never delay its pending-message drain."""
+    if not isinstance(proof, tuple) or len(proof) != 2:
+        return False
+    original, owner = proof
+    background = getattr(adapter, "_background_tasks", None)
+    expected = getattr(adapter, "_expected_cancelled_tasks", None)
+    if (not isinstance(original, asyncio.Task)
+            or not (original.cancelled() or (not original.done()
+                    and isinstance(expected, set) and original in expected))
+            or getattr(original, "_hfc_stop_turn_owner", None) is not owner
+            or getattr(original, "_hfc_stop_delivery_scheduled", False)
+            or not isinstance(background, set)
+            or sum(bool(getattr(task, "_hfc_stop_display_delivery", False))
+                   for task in background if not task.done()) >= 16):
+        return False
+
+    async def deliver():
+        async def observe_and_emit():
+            if not original.done():
+                # Hermes' 5s cancel wait can end while its handler is still in
+                # cleanup. Observe completion without awaiting/cancelling that
+                # business task when this display task times out or shuts down.
+                finished = asyncio.get_running_loop().create_future()
+
+                def original_done(done):
+                    if not finished.done():
+                        finished.set_result(None)
+
+                original.add_done_callback(original_done)
+                try:
+                    await finished
+                finally:
+                    original.remove_done_callback(original_done)
+            # A handler that swallowed cancellation is not interrupted evidence.
+            await emit_cancelled_stop_turn_async(proof)
+
+        try:
+            await asyncio.wait_for(observe_and_emit(),
+                                   timeout=TERMINAL_DELIVERY_RETRY_BUDGET_SECONDS)
+        except (Exception, asyncio.CancelledError):
+            pass
+
+    original._hfc_stop_delivery_scheduled = True
+    task = asyncio.create_task(deliver())
+    task._hfc_stop_display_delivery = True
+    background.add(task)
+
+    def completed(done):
+        # Also runs if shutdown cancels the task before its coroutine starts.
+        original._hfc_stop_delivery_scheduled = False
+        background.discard(done)
+        if isinstance(expected, set):
+            expected.discard(done)
+
+    task.add_done_callback(completed)
+    return True
+
+
+async def emit_stale_interrupted_turn_async(local_vars: dict[str, Any]) -> bool:
+    """Close the original card when Hermes discards its explicit interrupt result.
+
+    The managed call site sits inside the verified stale-generation branch. That
+    branch alone is not terminal evidence: only the returned interrupted flag is.
+    A source-bound immutable identity prevents the old drain from closing a newer
+    sender/turn sharing the chat, session or reply anchor.
+    """
+    result = local_vars.get("agent_result")
+    source = local_vars.get("source")
+    event = local_vars.get("event")
+    if (not isinstance(result, dict) or result.get("interrupted") is not True
+            or _platform_name(local_vars, source) != "feishu"):
+        return False
+    turn_id = _first_attr_string(source, ("_hfc_turn_id",))
+    incoming_id = _first_attr_string(event, ("message_id",))
+    internal_id = _first_attr_string(source, ("_hfc_internal_turn_id",))
+    if not turn_id or (incoming_id != turn_id and not (not incoming_id and internal_id == turn_id)):
+        return False
+    # A queued chain returns its last child's result to the original handler;
+    # that child already owns the existing queued-final terminal hook.
+    queued_terminal = result.get("queued_terminal_inbound_id")
+    if queued_terminal and queued_terminal != turn_id:
+        return False
+    marker = "_hfc_stale_interrupted_terminal"
+    if getattr(source, marker, None) == turn_id:
+        return False
+    try:
+        # Set before awaiting so duplicate drains cannot race the same card.
+        setattr(source, marker, turn_id)
+    except Exception:
+        return False
+    accepted = False
+    try:
+        terminal_locals = {
+            **local_vars,
+            **interrupted_turn_locals(source, turn_id, result),
+            "turn_id": turn_id,
+            "error": "任务已中断",
+        }
+        if local_vars.get("_turn_seconds") is not None:
+            terminal_locals["duration"] = local_vars["_turn_seconds"]
+        accepted = await emit_from_hermes_locals_async(terminal_locals, event_name="message.failed")
+        return accepted
+    finally:
+        # A failed transport can retry; accepted duplicates remain suppressed.
+        if not accepted:
+            setattr(source, marker, None)
+
+
+def interrupted_turn_locals(source: Any, message_id: str, result: Any) -> dict[str, Any]:
+    """Carry measured old-turn metrics into the queued-followup failure event.
+
+    The installed block stays minimal; the session ignores missing placeholders.
+    """
+    locals_: dict[str, Any] = {
+        "source": source,
+        "chat_id": getattr(source, "chat_id", None),
+        "message_id": message_id,
+        "error": "用户已打断当前任务",
+    }
+    if not isinstance(result, dict):
+        return locals_
+    metrics: dict[str, Any] = {
+        "duration": result.get("_hfc_turn_seconds"),
+        "model": result.get("model", ""),
+        "tokens": {
+            "input_tokens": result.get("input_tokens", 0),
+            "output_tokens": result.get("output_tokens", 0),
+        },
+        "context": {
+            "used_tokens": result.get("last_prompt_tokens", 0),
+            "max_tokens": result.get("context_length", 0),
+        },
+    }
+    locals_.update(metrics)
+    return locals_
+
+
+async def schedule_message_recall_async(
+    message_id: str,
+    *,
+    delay_seconds: float = 15.0,
+    bot_id: str = "",
+    route: dict[str, str] | None = None,
+    notice_family: str = "",
+) -> bool:
+    """Ask the sidecar to withdraw ``message_id`` ``delay_seconds`` after it was posted.
+
+    Used for acknowledgements the user reads once and that then only clutter the thread — the
+    core's "↪ Redirected current run …" notice. The gateway's own adapter cannot delete (its Feishu
+    implementation inherits the ``return False`` default), so the sidecar owns this path.
+    """
+    try:
+        recall_id = str(message_id or "").strip()
+        if not recall_id:
+            return False
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        payload: dict[str, Any] = {
+            "message_id": recall_id,
+            "delay_seconds": float(delay_seconds),
+        }
+        if bot_id:
+            payload["bot_id"] = str(bot_id)
+        if route is not None:
+            payload["route"] = dict(route)
+        if notice_family:
+            payload.pop("delay_seconds", None)
+            payload["notice_family"] = notice_family
+            payload["record_only"] = True
+        url = f"{_summary_base_url(config.event_url)}/recall/schedule"
+        result = await _post_json_ordered_response(url, payload, config.timeout_seconds)
+        return isinstance(result, dict) and result.get("ok") is True
+    except Exception:
+        return False
+
+
+def _post_headers(url: str, body: bytes) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    path = parse.urlsplit(url).path.rstrip("/")
+    if _is_sensitive_sidecar_path(path):
+        try:
+            root_secret = read_transport_root_secret()
+            if root_secret is not None:
+                headers.update(sign_sidecar_request(root_secret, "POST", path, body))
+        except Exception:
+            pass
+        return headers
+    if not path.endswith(
+        (
+            "/events",
+            "/delivery/policy",
+            "/native-handoff/ack",
+            "/native-handoff/recover",
+        )
+    ):
+        return headers
+    try:
+        root_secret = read_transport_root_secret()
+        if root_secret is not None:
+            if path.endswith("/native-handoff/recover"):
+                headers.update(sign_native_handoff_recovery_request(root_secret, body))
+            elif path.endswith("/native-handoff/ack"):
+                headers.update(sign_native_handoff_ack_request(root_secret, body))
+            elif path.endswith("/delivery/policy"):
+                headers.update(sign_policy_request(root_secret, body))
+            else:
+                headers.update(sign_event_request(root_secret, body))
+    except Exception:
+        pass
+    return headers
+
+
+def _get_headers(url: str) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    path = parse.urlsplit(url).path.rstrip("/")
+    if not _is_sensitive_sidecar_path(path):
+        return headers
+    try:
+        root_secret = read_transport_root_secret()
+        if root_secret is not None:
+            headers.update(sign_sidecar_request(root_secret, "GET", path, b""))
+    except Exception:
+        pass
+    return headers
+
+
+def _is_sensitive_sidecar_path(path: str) -> bool:
+    normalized = str(path or "").rstrip("/")
+    return (
+        normalized.endswith("/card/actions")
+        or normalized.endswith("/recall/schedule")
+        or "/interactions/" in normalized
+        or ("/messages/" in normalized and normalized.endswith("/summary"))
+    )
+
+
+async def lookup_card_summary(
+    message_id: str,
+    event_url: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> str | None:
+    try:
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return None
+        base_url = _summary_base_url(event_url or load_runtime_config().event_url)
+        quoted_message_id = parse.quote(message_id, safe="")
+        url = f"{base_url}/messages/{quoted_message_id}/summary"
+        result = await _get_json(url, timeout)
+        if not isinstance(result, dict) or result.get("ok") is False:
+            return None
+        summary = result.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+        return summary
+    except Exception:
+        return None
+
+
+def _summary_base_url(event_url: str) -> str:
+    parsed = parse.urlsplit(event_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/events"):
+        path = path[: -len("/events")]
+    rebuilt = parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return rebuilt.rstrip("/")
+
+
+async def _get_json(url: str, timeout: float) -> Any:
+    req = request.Request(
+        url,
+        headers=_get_headers(url),
+        method="GET",
+    )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _open_json_request, req, timeout)
+
+
+_NO_PROXY_OPENER = request.build_opener(request.ProxyHandler({}))
+
+
+def _open_request(req: request.Request, timeout: float) -> None:
+    with _open_sidecar_request(req, timeout) as response:
+        response.read()
+
+
+def _open_json_request(req: request.Request, timeout: float) -> Any:
+    try:
+        with _open_sidecar_request(req, timeout) as response:
+            body = response.read()
+    except urlerror.HTTPError as exc:
+        try:
+            body = exc.read()
+        finally:
+            exc.close()
+        if not body:
+            raise
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+            raise exc
+        return payload
+    if not body:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+
+def _open_sidecar_request(req: request.Request, timeout: float):
+    if _should_bypass_proxy(req.full_url):
+        return _NO_PROXY_OPENER.open(req, timeout=timeout)
+    return request.urlopen(req, timeout=timeout)
+
+
+def _should_bypass_proxy(url: str) -> bool:
+    host = parse.urlsplit(url).hostname or ""
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        address = ip_address(normalized)
+    except ValueError:
+        return False
+    return (
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_unspecified
+    )
+
+
+def _get_json_sync(url: str, timeout: float) -> Any:
+    req = request.Request(
+        url,
+        headers=_get_headers(url),
+        method="GET",
+    )
+    return _open_json_request(req, timeout)
+
+
+def queued_followup_source(source: Any, event: Any) -> Any:
+    """Copy callback ownership; never put an internal identity in reply anchors."""
+    from copy import copy
+    from uuid import uuid4
+
+    copied = copy(source)
+    # Bind ownership before emit: startup/policy can fail before build_event.
+    # An unidentified non-internal turn must not retain copied canonical state.
+    copied._hfc_internal_turn_id = ""
+    copied._hfc_turn_id = str(getattr(event, "message_id", None) or "")
+    if getattr(event, "internal", False) is True and not copied._hfc_turn_id:
+        copied._hfc_internal_turn_id = "hfc-internal:" + uuid4().hex
+        copied._hfc_turn_id = copied._hfc_internal_turn_id
+    return copied
+
+
+def build_event(
+    event_name: str, local_vars: dict[str, Any], preview: bool = False
+) -> dict[str, Any] | None:
+    return _build_event(event_name, local_vars, preview=preview)
+
+
+def _build_event(
+    event_name: str, local_vars: dict[str, Any], *, preview: bool
+) -> dict[str, Any] | None:
+    if event_name not in SUPPORTED_RUNTIME_EVENTS:
+        return None
+    source_obj = local_vars.get("source")
+    platform = _platform_name(local_vars, source_obj)
+    if platform != "feishu":
+        return None
+    gateway_event_obj = local_vars.get("event")
+    chat_id = _first_string(local_vars, ("chat_id", "open_chat_id", "receive_id"))
+    message_obj = local_vars.get("message")
+    if chat_id is None:
+        chat_id = _first_attr_string(message_obj, ("chat_id", "open_chat_id", "receive_id"))
+    if chat_id is None:
+        chat_id = _first_attr_string(source_obj, ("chat_id", "open_chat_id", "receive_id"))
+    if chat_id is None:
+        return None
+    thread_id = _thread_id_for_runtime_event(local_vars, message_obj, source_obj)
+
+    conversation_id = (
+        _first_string(local_vars, ("conversation_id", "thread_id", "session_id"))
+        or _first_attr_string(message_obj, ("conversation_id", "thread_id", "session_id"))
+        or _first_attr_string(source_obj, ("conversation_id", "thread_id", "session_id"))
+        or chat_id
+    )
+    created_at_value = local_vars.get("created_at")
+    created_at = _created_at(created_at_value)
+    created_at_lifecycle_token = _created_at_lifecycle_token(created_at_value)
+    fallback_key = (conversation_id, chat_id)
+    explicit_message_id = _first_string(
+        local_vars, ("message_id", "msg_id", "event_message_id")
+    ) or _first_attr_string(
+        message_obj, ("message_id", "msg_id")
+    ) or _first_attr_string(
+        gateway_event_obj, ("message_id", "msg_id")
+    )
+    # Queued internal events have no platform message. Their source-bound
+    # identity is transport-local, not a Feishu message/reply anchor. Do not
+    # borrow the chat-wide fallback slot (another turn may own it).
+    internal_turn_id = _first_attr_string(source_obj, ("_hfc_internal_turn_id",))
+    message_id = internal_turn_id or explicit_message_id
+    is_terminal_event = event_name in {"message.completed", "message.failed"}
+    active_fallback_cache_key = None
+    if not internal_turn_id and event_name == "message.started" and explicit_message_id is not None:
+        active_fallback_cache_key = _active_fallback_cache_key(
+            fallback_key, created_at_lifecycle_token
+        )
+    elif not internal_turn_id and event_name != "message.started":
+        if is_terminal_event:
+            active_fallback_cache_key = _terminal_fallback_cache_key(
+                fallback_key, created_at_lifecycle_token
+            )
+        else:
+            active_fallback_cache_key = _active_fallback_cache_key(
+                fallback_key, created_at_lifecycle_token
+            )
+    if active_fallback_cache_key is _AMBIGUOUS_TERMINAL:
+        return None
+    active_fallback_message_id = (
+        _ACTIVE_FALLBACK_MESSAGE_IDS.get(active_fallback_cache_key)
+        if active_fallback_cache_key is not None
+        else None
+    )
+    if active_fallback_message_id is not None:
+        message_id = active_fallback_message_id
+    elif is_terminal_event and message_id is None:
+        return None
+    elif message_id is None:
+        message_id = _fallback_message_id(
+            event_name,
+            conversation_id,
+            chat_id,
+            created_at_lifecycle_token,
+            preview=preview,
+        )
+        if message_id is None:
+            return None
+    turn_id = _turn_id_for_runtime_event(event_name, local_vars) or ""
+    sequence_id = turn_id or message_id
+    sequence = (
+        _peek_next_sequence(sequence_id) if preview else _next_sequence(sequence_id)
+    )
+    event_data = _event_data(event_name, local_vars, source_obj, message_obj, preview=preview)
+    if thread_id:
+        event_data.setdefault("thread_id", thread_id)
+    payload = {
+        "schema_version": "1",
+        "event": event_name,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "platform": platform,
+        "sequence": sequence,
+        "created_at": created_at,
+        "data": event_data,
+    }
+    if turn_id:
+        payload["turn_id"] = turn_id
+    if event_name == "message.started" and not preview and source_obj is not None:
+        try:
+            setattr(source_obj, "_hfc_conversation_id", conversation_id)
+            _bind_stop_turn_owner(source_obj, gateway_event_obj, conversation_id)
+        except Exception:
+            pass
+    if is_terminal_event:
+        if not preview:
+            if (
+                not internal_turn_id
+                and explicit_message_id is not None
+                and created_at_lifecycle_token is None
+                and active_fallback_cache_key is None
+            ):
+                _retire_current_fallback_key(fallback_key)
+            if active_fallback_cache_key is not None:
+                _ACTIVE_FALLBACK_MESSAGE_IDS.pop(active_fallback_cache_key, None)
+                if _CURRENT_FALLBACK_KEYS.get(fallback_key) == active_fallback_cache_key:
+                    _CURRENT_FALLBACK_KEYS.pop(fallback_key, None)
+    return payload
+
+
+def build_cron_event(local_vars: dict[str, Any]) -> dict[str, Any] | None:
+    job = local_vars.get("job")
+    content = _first_string(
+        local_vars,
+        ("cleaned_delivery_content", "delivery_content", "content"),
+    )
+    if not isinstance(job, dict) or content is None:
+        return None
+
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        origin = {}
+    resolved_targets = _resolved_cron_targets(local_vars, job)
+    resolved_chat_id = _resolved_target_chat_id(resolved_targets, "feishu")
+    # Routing-intent tokens ("origin", "all") and comma-separated
+    # combinations are not real platform names.  When _deliver_platform()
+    # returns one of these, the platform chain short-circuits and never
+    # reaches origin.get("platform") — causing every deliver=origin or
+    # deliver=all cron job to silently fall back to plain-text delivery.
+    # Extract the first real platform name, skipping routing intents.
+    # "local" is NOT a routing intent — it means "no delivery" and will
+    # cause the platform check below to fail naturally.
+    deliver_platform = _extract_real_platform(job.get("deliver"))
+    platform = str(
+        deliver_platform
+        or _first_target_platform(resolved_targets)
+        or origin.get("platform")
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_PLATFORM")
+        or "feishu"
+    ).strip().lower()
+    origin_platform = str(origin.get("platform") or "").strip().lower()
+    origin_chat_id = origin.get("chat_id") if origin_platform == "feishu" else ""
+    origin_thread_id = origin.get("thread_id") if origin_platform == "feishu" else ""
+    origin_message_id = (
+        str(origin.get("message_id") or "").strip()
+        if origin_platform == "feishu"
+        else ""
+    )
+    chat_id = str(
+        resolved_chat_id
+        or _deliver_chat_id(job.get("deliver"))
+        or origin_chat_id
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+        or ""
+    ).strip()
+    if platform != "feishu" or not chat_id:
+        return None
+
+    # Resolve thread_id for topic-group delivery (cron jobs targeting a thread
+    # inside a topic group).  Priority: resolved targets > origin > env var.
+    thread_id = str(
+        _resolved_target_thread_id(resolved_targets, "feishu")
+        or (origin_thread_id if chat_id == str(origin_chat_id or "").strip() else "")
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "")
+    ).strip() or ""
+
+    profile_id, profile_source = _profile_identity(local_vars, None, None)
+    attachment_source = _first_string(
+        local_vars,
+        ("delivery_content", "content"),
+    ) or content
+    attachments = _extract_attachments(attachment_source, local_vars)
+    created_at = time.time()
+    job_id = str(job.get("id") or "").strip()
+    message_id = "cron_" + sha256(
+        f"{job_id}:{created_at}".encode("utf-8")
+    ).hexdigest()[:16]
+    return {
+        "schema_version": "1",
+        "event": "message.completed",
+        "conversation_id": thread_id or str(job.get("id") or chat_id),
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "platform": "feishu",
+        "sequence": 0,
+        "created_at": created_at,
+        "data": {
+            "answer": content,
+            "delivery_kind": "cron",
+            **(
+                {"reply_to_message_id": origin_message_id}
+                if origin_message_id.startswith("om_")
+                and chat_id == str(origin_chat_id or "").strip()
+                and thread_id == str(origin_thread_id or "").strip()
+                else {}
+            ),
+            "profile_id": profile_id,
+            "profile_source": profile_source,
+            "attachments": attachments,
+            "native_delivery": _native_delivery_policy(
+                attachment_source,
+                local_vars,
+            ),
+        },
+    }
+
+
+_APPROVAL_CARD_WINDOW_MARGIN_SECONDS = 60.0
+
+
+def _core_approval_timeout_seconds() -> float:
+    """The gateway's own approval wait (``approvals.timeout``), read from the core when available."""
+    try:
+        from tools.approval_context import _get_approval_timeout
+        value = float(_get_approval_timeout())
+    except Exception:
+        return 300.0
+    return value if math.isfinite(value) and value > 0 else 300.0
+
+
+def _approval_card_window(timeout_seconds: float | None) -> float:
+    """How long an approval card stays actionable, kept shorter than the agent's approval wait.
+
+    A card that outlives the waiting agent can never be completed: the user ends up clicking a
+    button whose runtime is gone. Expiring the card first makes the paused/resume cycle happen
+    while the waiter is still alive, so consent can always be re-armed.
+    """
+    if timeout_seconds is not None and math.isfinite(timeout_seconds) and timeout_seconds >= 0:
+        return timeout_seconds
+    env_value = _finite_float(os.environ.get("HERMES_FEISHU_CARD_INTERACTION_TIMEOUT_SECONDS"))
+    if env_value is not None and env_value >= 0:
+        return env_value
+    return max(30.0, _core_approval_timeout_seconds() - _APPROVAL_CARD_WINDOW_MARGIN_SECONDS)
+
+
+def _interaction_timeout(value: float | None) -> float:
+    if value is not None and math.isfinite(value) and value >= 0:
+        return value
+    env_value = _finite_float(os.environ.get("HERMES_FEISHU_CARD_INTERACTION_TIMEOUT_SECONDS"))
+    if env_value is not None and env_value >= 0:
+        return env_value
+    return 300.0
+
+
+def _interaction_timeout_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    failed = dict(payload)
+    sequence_id = str(
+        payload.get("turn_id") or payload.get("message_id") or ""
+    ).strip()
+    if sequence_id:
+        failed["sequence"] = _next_sequence(sequence_id)
+    else:
+        try:
+            failed["sequence"] = int(payload.get("sequence", 0)) + 1
+        except (TypeError, ValueError):
+            failed["sequence"] = 1
+    failed["event"] = "interaction.failed"
+    failed["created_at"] = time.time()
+    source_data = payload.get("data")
+    data = {
+        "interaction_id": (
+            str(source_data.get("interaction_id") or "").strip()
+            if isinstance(source_data, dict)
+            else ""
+        ),
+        "error": "交互已过期",
+    }
+    if isinstance(source_data, dict):
+        profile_id = str(source_data.get("profile_id") or "").strip()
+        if profile_id:
+            data["profile_id"] = profile_id
+    failed["data"] = data
+    return failed
+
+
+def _post_interaction_timeout_sync(
+    local_vars: dict[str, Any],
+    event_url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> None:
+    try:
+        _post_interaction_event(
+            local_vars,
+            event_url,
+            _interaction_timeout_payload(payload),
+            timeout,
+        )
+    except Exception:
+        return
+
+
+async def _post_interaction_timeout_async(
+    event_url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> None:
+    try:
+        await _post_json_ordered_response(
+            event_url,
+            _interaction_timeout_payload(payload),
+            timeout,
+        )
+    except Exception:
+        return
+
+
+def _interaction_poll_interval(value: float | None) -> float:
+    if value is not None and math.isfinite(value) and value >= 0:
+        return value
+    env_value = _finite_float(os.environ.get("HERMES_FEISHU_CARD_INTERACTION_POLL_SECONDS"))
+    if env_value is not None and 0 <= env_value <= 5:
+        return env_value
+    return 0.5
+
+
+def _coerce_interaction_options(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    options: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("text") or item.get("value") or "").strip()
+        option_value = str(item.get("value") or label).strip()
+        if not label or not option_value:
+            continue
+        style = str(item.get("style") or item.get("type") or "default").strip() or "default"
+        options.append({"label": label, "value": option_value, "style": style})
+    return options
+
+
+def _resolved_cron_targets(
+    local_vars: dict[str, Any], job: dict[str, Any]
+) -> list[dict[str, Any]]:
+    value = local_vars.get("_hfc_resolved_targets")
+    if value is None:
+        value = job.get("_hfc_resolved_targets")
+    if value is None:
+        value = job.get("resolved_targets")
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+_ROUTING_INTENT_TOKENS = frozenset({"origin", "all"})
+
+
+def _is_routing_intent(platform: str) -> bool:
+    """Return True if *platform* is a routing-intent token, not a real platform.
+
+    Routing intents (``origin``, ``all``) and comma-separated combinations
+    like ``origin,all`` must be resolved by the scheduler before they map to
+    a concrete platform name.  The hook runs before that resolution, so it
+    should skip them and let the platform chain fall through to
+    ``resolved_targets`` or ``origin``.
+
+    ``local`` is intentionally excluded — it is a delivery target (meaning
+    "no delivery"), not a routing intent that needs resolution.
+    """
+    if not platform:
+        return False
+    # Single token: "origin", "all"
+    if platform in _ROUTING_INTENT_TOKENS:
+        return True
+    # Comma-separated: "origin,all", "all,telegram:123", etc.
+    # If every part (after stripping) is a routing-intent token, treat the
+    # whole thing as a routing intent.  Mixed combos like "origin,feishu:123"
+    # contain a real platform and should NOT be skipped — the caller should
+    # extract the real platform part.
+    if "," in platform:
+        parts = [p.strip() for p in platform.split(",") if p.strip()]
+        if parts and all(p in _ROUTING_INTENT_TOKENS for p in parts):
+            return True
+    return False
+
+
+def _extract_real_platform(deliver: Any) -> str:
+    """Extract the first real platform name from a deliver value.
+
+    Handles comma-separated deliver strings (``"origin,feishu:chat_id"``)
+    by splitting on ``,`` and returning the first part whose platform is not
+    a routing intent.  Returns ``""`` when all parts are routing intents or
+    the value is empty.  ``"local"`` passes through as-is (it is not a
+    routing intent and will cause the platform check in ``build_cron_event``
+    to fail naturally).
+    """
+    if not deliver:
+        return ""
+    if isinstance(deliver, dict):
+        platform = _deliver_platform(deliver)
+        if platform in _ROUTING_INTENT_TOKENS:
+            return ""
+        return platform
+    text = str(deliver).strip().lower()
+    if not text:
+        return ""
+    # Fast path: no comma — just use _deliver_platform directly.
+    if "," not in text:
+        platform = _deliver_platform(text)
+        if platform in _ROUTING_INTENT_TOKENS:
+            return ""
+        return platform
+    # Split by comma and find the first real platform part.
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        platform = _deliver_platform(part)
+        if platform and platform not in _ROUTING_INTENT_TOKENS:
+            return platform
+    return ""
+
+
+def _deliver_platform(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("platform") or value.get("type") or "").strip().lower()
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if ":" in text:
+        return text.split(":", 1)[0].strip()
+    return text
+
+
+def _deliver_chat_id(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(
+            value.get("chat_id")
+            or value.get("open_chat_id")
+            or value.get("receive_id")
+            or value.get("target")
+            or ""
+        ).strip()
+    text = str(value or "").strip()
+    if ":" not in text:
+        return ""
+    return text.split(":", 1)[1].strip()
+
+
+def _first_target_platform(targets: list[dict[str, Any]]) -> str:
+    for target in targets:
+        platform = str(target.get("platform") or target.get("type") or "").strip().lower()
+        if platform:
+            return platform
+    return ""
+
+
+def _resolved_target_chat_id(targets: list[dict[str, Any]], platform: str) -> str:
+    for target in targets:
+        target_platform = str(target.get("platform") or target.get("type") or "").strip().lower()
+        if target_platform != platform:
+            continue
+        chat_id = str(
+            target.get("chat_id")
+            or target.get("open_chat_id")
+            or target.get("receive_id")
+            or ""
+        ).strip()
+        if chat_id:
+            return chat_id
+    return ""
+
+
+def _resolved_target_thread_id(targets: list[dict[str, Any]], platform: str) -> str:
+    for target in targets:
+        target_platform = str(target.get("platform") or target.get("type") or "").strip().lower()
+        if target_platform != platform:
+            continue
+        thread_id = str(target.get("thread_id") or "").strip()
+        if thread_id:
+            return thread_id
+    return ""
+
+
+def _event_data(
+    event_name: str, local_vars: dict[str, Any], source_obj: Any, message_obj: Any,
+    *, preview: bool = False,
+) -> dict[str, Any]:
+    profile_id, profile_source = _profile_identity(local_vars, source_obj, message_obj)
+    data: dict[str, Any] = {
+        "profile_id": profile_id,
+        "profile_source": profile_source,
+    }
+    admission_user_id = _message_admission_user_id(source_obj)
+    if admission_user_id:
+        data["admission_user_id"] = admission_user_id
+    # Any event can open a session when message.started is unavailable.
+    # Preserve requester identity on those fallback paths as well.
+    sender_open_id = _message_sender_open_id(
+        local_vars, source_obj, local_vars.get("event")
+    )
+    if sender_open_id:
+        data["sender_open_id"] = sender_open_id
+        sender_name = getattr(source_obj, "user_name", None)
+        if (getattr(source_obj, "user_id", None) == sender_open_id
+                and isinstance(sender_name, str) and 0 < len(sender_name) <= 80
+                and not any(ord(c) < 32 or c in "<>" for c in sender_name)):
+            data["sender_name"] = sender_name
+    chat_type = _command_chat_type(local_vars, source_obj, local_vars.get("event"))
+    if chat_type:
+        data["chat_type"] = chat_type.strip().lower()
+    native_handoff = _native_handoff_event_metadata(event_name, local_vars)
+    if native_handoff is not None:
+        data["native_handoff"] = native_handoff
+    if local_vars.get("_hfc_policy_new_turn") is True:
+        data["policy_new_turn"] = True
+    display_status = normalize_display_status(local_vars.get("display_status"))
+    if display_status:
+        data["display_status"] = display_status
+    reply_to_message_id = _reply_to_message_id_from_runtime(
+        local_vars,
+        message_obj,
+        local_vars.get("event"),
+    )
+    if reply_to_message_id:
+        data["reply_to_message_id"] = reply_to_message_id
+    if event_name in {"thinking.delta", "answer.delta"}:
+        text = _first_raw_string(local_vars, ("text", "delta", "delta_text", "content"))
+        if text is None:
+            text = _first_attr_raw_string(message_obj, ("text", "content"))
+        data["text"] = text or ""
+        mode = _first_string(local_vars, ("mode", "_hfc_text_mode"))
+        if mode:
+            data["mode"] = mode
+        return data
+    if event_name == "system.notice":
+        content = _first_raw_string(local_vars, ("content", "text", "message"))
+        if content is None:
+            content = _first_attr_raw_string(message_obj, ("text", "content"))
+        title = _first_string(local_vars, ("_hfc_notice_title", "title")) or "运行提示"
+        level = _first_string(local_vars, ("_hfc_notice_level", "level")) or "info"
+        notice_kind = _first_string(local_vars, ("_hfc_notice_kind", "notice_kind")) or "system"
+        notice_id = _first_string(local_vars, ("_hfc_notice_id", "notice_id")) or ""
+        notice_scope = (
+            _first_string(local_vars, ("_hfc_notice_scope", "notice_scope"))
+            or "session"
+        )
+        data.update(
+            {
+                "title": title,
+                "content": content or "",
+                "level": level,
+                "notice_kind": notice_kind,
+                "notice_id": notice_id,
+                "notice_scope": notice_scope,
+            }
+        )
+        notice_terminal = local_vars.get(
+            "_hfc_notice_terminal",
+            local_vars.get("notice_terminal"),
+        )
+        if isinstance(notice_terminal, bool):
+            data["notice_terminal"] = notice_terminal
+        notice_phase = _first_string(
+            local_vars,
+            ("_hfc_notice_phase", "notice_phase", "phase"),
+        )
+        if notice_phase:
+            data["phase"] = notice_phase
+        notice_create_session = local_vars.get(
+            "_hfc_notice_create_session",
+            local_vars.get("create_session"),
+        )
+        if isinstance(notice_create_session, bool):
+            data["create_session"] = notice_create_session
+        delivery_kind = _first_string(local_vars, ("delivery_kind",))
+        if delivery_kind:
+            data["delivery_kind"] = delivery_kind
+        reply_id = (
+            _first_string(
+                local_vars,
+                ("reply_to_message_id", "quote_message_id", "parent_message_id"),
+            )
+            or _first_attr_string(
+                message_obj,
+                ("reply_to_message_id", "quote_message_id", "parent_message_id"),
+            )
+        )
+        if reply_id:
+            data["reply_to_message_id"] = reply_id
+        return data
+    if event_name.startswith("interaction."):
+        data.update(
+            {
+                "interaction_id": (
+                    _first_string(local_vars, ("_hfc_interaction_id", "interaction_id"))
+                    or ""
+                ),
+                "kind": (
+                    _first_string(local_vars, ("_hfc_interaction_kind", "kind"))
+                    or "choice"
+                ),
+                "prompt": (
+                    _first_string(
+                        local_vars,
+                        ("_hfc_interaction_prompt", "prompt", "question"),
+                    )
+                    or ""
+                ),
+                "description": (
+                    _first_string(
+                        local_vars,
+                        ("_hfc_interaction_description", "description"),
+                    )
+                    or ""
+                ),
+                "options": _coerce_interaction_options(
+                    local_vars.get("_hfc_interaction_options", local_vars.get("options"))
+                ),
+            }
+        )
+        multi_select_value = local_vars.get("_hfc_interaction_multi_select")
+        if multi_select_value is None:
+            multi_select_value = local_vars.get("multi_select")
+        data["multi_select"] = bool(multi_select_value)
+        allow_custom_input = local_vars.get("_hfc_interaction_allow_custom_input")
+        if allow_custom_input is None:
+            allow_custom_input = local_vars.get("allow_custom_input")
+        if isinstance(allow_custom_input, bool):
+            data["allow_custom_input"] = allow_custom_input
+        timeout_value = _finite_float(local_vars.get("_hfc_interaction_timeout_seconds"))
+        if timeout_value is not None:
+            data["timeout_seconds"] = timeout_value
+        fallback_policy = _first_string(
+            local_vars,
+            ("_hfc_interaction_fallback_policy", "fallback_policy"),
+        )
+        if fallback_policy:
+            data["fallback_policy"] = fallback_policy
+        return data
+    if event_name == "tool.updated":
+        tool_id = _first_string(local_vars, ("tool_id", "tool_call_id", "name")) or "tool"
+        name = _first_string(local_vars, ("name", "tool_name")) or tool_id
+        status = _first_string(local_vars, ("status", "tool_status")) or "running"
+        detail = _first_string(local_vars, ("detail", "tool_detail")) or ""
+        data.update({"tool_id": tool_id, "name": name, "status": status, "detail": detail})
+        call_id = _first_string(local_vars, ("call_id", "tool_call_id"))
+        if call_id and len(call_id) <= 256:
+            data["call_id"] = call_id
+        arguments = _tool_arguments(local_vars)
+        if arguments is not None:
+            data["arguments"] = arguments
+        from .process_activity import process_activity
+        observed = process_activity(name, arguments, local_vars.get("result"))
+        if observed:
+            data["process_activity"] = observed
+        duration_ms = _tool_duration_milliseconds(local_vars)
+        if duration_ms is not None:
+            data["duration_ms"] = duration_ms
+        error = _tool_error(local_vars)
+        if error:
+            data["error"] = error
+        return data
+    if event_name == "message.completed":
+        answer = _completion_answer(local_vars)
+        # The completion envelope also carries failed/partial Gateway returns.
+        # Keep its delivery/attachment contract, but do not lose exact outcome
+        # flags or infer task success from the presence of response text.
+        outcome = completion_turn_outcome(local_vars.get("agent_result"))
+        if outcome is not None:
+            data["turn_outcome"] = outcome
+        attachments = _extract_attachments(answer, local_vars)
+        data.update({
+            "answer": _card_visible_answer(answer),
+            "attachments": attachments,
+            "native_delivery": _native_delivery_policy(answer, local_vars),
+            "duration": _completion_duration(local_vars),
+            "model": _completion_model(local_vars),
+            "tokens": _completion_tokens(local_vars, answer),
+            "context": _completion_context(local_vars),
+        })
+        # Preview checks body/media only; the actual terminal payload consumes
+        # observations once and is reused by exact staging and transport retries.
+        rate = None if preview else _completion_observed_rate(local_vars)
+        if rate is not None:
+            data["rate"] = rate
+        delivery_kind = _first_string(local_vars, ("delivery_kind",))
+        if delivery_kind:
+            data["delivery_kind"] = delivery_kind
+        return data
+    if event_name == "message.failed":
+        error = _first_string(local_vars, ("error", "exception")) or "消息处理失败"
+        data["error"] = error
+        # Reuse the completion field readers for failed/interrupted turns. The session
+        # ignores absent/placeholder values and preserves existing measured fields.
+        data.update({
+            "duration": _completion_duration(local_vars),
+            "model": _completion_model(local_vars),
+            "tokens": _completion_tokens(local_vars, ""),
+            "context": _completion_context(local_vars),
+        })
+        return data
+    if event_name == "message.started":
+        for source_key, data_key in (
+            ("tenant_key", "tenant_key"),
+            ("agent_id", "agent_id"),
+        ):
+            value = _first_string(local_vars, (source_key,)) or _first_attr_string(message_obj, (source_key,))
+            if value:
+                data[data_key] = value
+        reply_in_thread = (
+            _truthy_value(local_vars.get("reply_in_thread"))
+            or _truthy_value(getattr(source_obj, "reply_in_thread", None))
+            or _truthy_value(getattr(message_obj, "reply_in_thread", None))
+            or _truthy_value(getattr(local_vars.get("event"), "reply_in_thread", None))
+        )
+        if reply_in_thread:
+            data["reply_in_thread"] = True
+        reply_aliases = (
+            "reply_to_message_id",
+            "quote_message_id",
+            "parent_message_id",
+        )
+        canonical_reply_id = (
+            _first_string(data, ("reply_to_message_id",))
+            or _first_string(local_vars, reply_aliases)
+            or _first_attr_string(message_obj, reply_aliases)
+            or _first_attr_string(local_vars.get("event"), reply_aliases)
+        )
+        if not canonical_reply_id and reply_in_thread:
+            canonical_reply_id = (
+                _first_string(
+                    local_vars,
+                    ("reply_thread_anchor_message_id",),
+                )
+                or _first_attr_string(
+                    source_obj,
+                    ("reply_thread_anchor_message_id", "reply_to_message_id"),
+                )
+                or _first_attr_string(
+                    local_vars.get("event"),
+                    ("reply_thread_anchor_message_id", "reply_to_message_id"),
+                )
+                or _first_attr_string(
+                    message_obj,
+                    ("reply_thread_anchor_message_id", "reply_to_message_id"),
+                )
+                or _first_string(
+                    local_vars,
+                    ("message_id", "event_message_id"),
+                )
+                or _first_attr_string(
+                    source_obj,
+                    ("message_id", "event_message_id"),
+                )
+                or _first_attr_string(
+                    local_vars.get("event"),
+                    ("message_id",),
+                )
+            )
+        if canonical_reply_id:
+            data["reply_to_message_id"] = canonical_reply_id
+        for reply_key in reply_aliases:
+            if reply_key == "reply_to_message_id":
+                continue
+            value = _first_string(local_vars, (reply_key,))
+            if value is None:
+                value = _first_attr_string(message_obj, (reply_key,))
+            if value is None:
+                value = _first_attr_string(local_vars.get("event"), (reply_key,))
+            if value:
+                data[reply_key] = value
+        if local_vars.get("redirect_followup") is True:
+            data["redirect_followup"] = True
+            for key in ("redirect_from_turn_id", "redirect_from_message_id"):
+                value = _first_string(local_vars, (key,))
+                if value:
+                    data[key] = value
+        return data
+    return {}
+
+
+def _native_handoff_event_metadata(
+    event_name: str,
+    local_vars: dict[str, Any],
+) -> dict[str, Any] | None:
+    if event_name not in {"message.started", "message.completed", "message.failed"}:
+        return None
+    generation = _native_handoff_generation(local_vars)
+    # The ordinary completion hook runs before Base resolves exact text,
+    # obligation, route, and chunk plan. Advertising ACK here would let a raw
+    # answer create an authoritative descriptor. Exact Base finalization adds
+    # the capabilities and all matching fences later, in one terminal POST.
+    return {"generation": generation}
+
+
+def _native_handoff_generation(local_vars: dict[str, Any]) -> str:
+    explicit = str(local_vars.get("_hfc_native_handoff_generation") or "").strip()
+    if _is_lower_hex(explicit, 32):
+        return explicit
+    event = local_vars.get("event")
+    existing = str(
+        getattr(event, "_hfc_native_handoff_generation", "") or ""
+    ).strip()
+    if _is_lower_hex(existing, 32):
+        return existing
+    generation = secrets.token_hex(16)
+    local_vars["_hfc_native_handoff_generation"] = generation
+    try:
+        setattr(event, "_hfc_native_handoff_generation", generation)
+    except Exception:
+        pass
+    return generation
+
+
+def _native_handoff_obligation_id(local_vars: dict[str, Any]) -> str:
+    """Return only an obligation captured from Hermes' exact ledger path.
+
+    The completion hook runs before ``BasePlatformAdapter`` finishes media and
+    file extraction. Recomputing that pipeline here would drift across Hermes
+    upgrades, so raw answers are never used to infer a recovery identity.
+    """
+    explicit = str(local_vars.get("_hfc_delivery_obligation_id") or "").strip()
+    return explicit
+
+
+def _is_lower_hex(value: str, length: int) -> bool:
+    return len(value) == length and all(character in "0123456789abcdef" for character in value)
+
+
+def _profile_identity(local_vars: dict[str, Any], source_obj: Any, message_obj: Any) -> tuple[str, str]:
+    runner = local_vars.get("self") or local_vars.get("runner")
+    registered = _GATEWAY_RUNNER_REF() if _GATEWAY_RUNNER_REF is not None else None
+    multiplex = any(
+        getattr(getattr(item, "config", None), "multiplex_profiles", False) is True
+        for item in (runner, registered)
+    )
+    env_profile = os.environ.get("HERMES_FEISHU_CARD_PROFILE_ID", "").strip()
+    if env_profile and not multiplex:
+        return legacy_profile_identity(env_profile, "env")
+    direct = (
+        _first_string(local_vars, ("profile_id", "hermes_profile", "profile"))
+        or _first_attr_string(source_obj, ("profile_id", "hermes_profile", "profile"))
+        or _first_attr_string(message_obj, ("profile_id", "hermes_profile", "profile"))
+    )
+    if direct:
+        return legacy_profile_identity(direct, "locals")
+    if multiplex:
+        # Hermes scopes get_hermes_home() with a ContextVar for each turn;
+        # process-wide HERMES_HOME belongs to the primary profile only.
+        try:
+            from hermes_constants import get_hermes_home
+            profile = profile_from_hermes_home_path(str(get_hermes_home()))
+        except (ImportError, AttributeError):
+            profile = None
+        if profile:
+            return legacy_profile_identity(profile, "hermes_home")
+        return "default", "fallback_default"
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    profile = profile_from_hermes_home_path(hermes_home)
+    if profile:
+        return legacy_profile_identity(profile, "hermes_home")
+    return "default", "fallback_default"
+
+
+def _tool_arguments(local_vars: dict[str, Any]) -> Any:
+    for name in ("arguments", "parameters", "args", "tool_args", "tool_input", "input"):
+        if name not in local_vars:
+            continue
+        value = local_vars.get(name)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return _json_safe_tool_value(value)
+    return None
+
+
+def _tool_duration_milliseconds(local_vars: dict[str, Any]) -> int | float | None:
+    sources = [local_vars]
+    callback_kwargs = local_vars.get("kwargs")
+    if isinstance(callback_kwargs, dict):
+        sources.append(callback_kwargs)
+    for source in sources:
+        for name in ("duration_ms", "elapsed_ms", "tool_duration_ms"):
+            value = _finite_float(source.get(name))
+            if value is not None and value >= 0:
+                return int(value) if value.is_integer() else value
+        for name in ("duration", "elapsed", "tool_duration"):
+            value = _finite_float(source.get(name))
+            if value is not None and value >= 0:
+                milliseconds = value * 1000
+                return int(milliseconds) if milliseconds.is_integer() else milliseconds
+    return None
+
+
+def _tool_error(local_vars: dict[str, Any]) -> str:
+    for name in ("error", "exception", "tool_error", "error_message", "failure_reason"):
+        value = local_vars.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _json_safe_tool_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe_tool_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_tool_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _safe_profile_identity(value: str, source: str) -> tuple[str, str]:
+    return legacy_profile_identity(value, source)
+
+
+def _safe_profile_id(value: str) -> str:
+    return legacy_safe_profile_id(value)
+
+
+def _profile_from_path(path: str) -> str | None:
+    return profile_from_hermes_home_path(path)
+
+
+def _thread_id_for_runtime_event(
+    local_vars: dict[str, Any], message_obj: Any, source_obj: Any
+) -> str:
+    value = (
+        _first_string(local_vars, ("thread_id",))
+        or _first_attr_string(message_obj, ("thread_id",))
+        or _first_attr_string(source_obj, ("thread_id",))
+    )
+    if _is_feishu_thread_id(value):
+        return value or ""
+    return ""
+
+
+def _is_feishu_thread_id(value: str | None) -> bool:
+    return bool(value and value.startswith(("omt_", "om_")))
+
+
+def _first_string(source: dict[str, Any], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = source.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def bind_agent_reasoning(agent, source, message_id, loop, run_still_current) -> bool:
+    """Bind reasoning to one turn, retaining native fallback and stream boundaries.
+
+    Stream chunks are never string-deduplicated (repeated tokens are legitimate).
+    Only an exact post-response snapshot of already accepted streamed reasoning
+    is omitted. A digest keeps this comparison bounded without retaining content.
+    """
+    import inspect
+    previous = getattr(agent, "reasoning_callback", None)
+    if getattr(previous, "_hfc_reasoning_wrapper", False):
+        previous = getattr(previous, "_hfc_original_callback", None)
+    agent.reasoning_callback = previous
+    stream = getattr(agent, "_fire_reasoning_delta", None)
+    if getattr(stream, "_hfc_reasoning_stream_wrapper", False):
+        stream = stream._hfc_original_callback
+        agent._fire_reasoning_delta = stream
+    token = object()
+    agent._hfc_reasoning_owner = token
+    if _platform_name({}, source) != "feishu" or not callable(run_still_current):
+        return False
+    if not isinstance(message_id, str) or not message_id or loop is None or loop.is_closed():
+        return False
+    state = {"streaming":False, "hash":sha256(), "bytes":0, "accepted":True}
+
+    def reasoning(text):
+        if getattr(agent, "_hfc_reasoning_owner", None) is not token or not run_still_current():
+            return
+        accepted = False
+        if isinstance(text, str) and text:
+            raw = text.encode('utf-8', errors='replace')
+            duplicate = (not state['streaming'] and state['accepted'] and state['bytes'] == len(raw)
+                         and state['hash'].digest() == sha256(raw).digest())
+            if state['streaming']:
+                state['hash'].update(raw)
+                state['bytes'] += len(raw)
+            else:
+                state.update(hash=sha256(), bytes=0, accepted=True)
+            if duplicate:
+                return
+            accepted = emit_from_hermes_locals_threadsafe(
+                {"source": source, "message_id": message_id, "text": text, "_hfc_loop": loop},
+                event_name="thinking.delta",
+            )
+            if state['streaming'] and not accepted:
+                state['accepted'] = False
+        if not accepted and callable(previous):
+            previous(text)
+    reasoning._hfc_reasoning_wrapper = True
+    reasoning._hfc_original_callback = previous
+    agent.reasoning_callback = reasoning
+    if callable(stream):
+        try:
+            parameters = list(inspect.signature(stream).parameters.values())
+        except (TypeError, ValueError):
+            parameters = []
+        if (len(parameters) == 1 and parameters[0].name == 'text'
+                and parameters[0].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            def stream_reasoning(text):
+                if getattr(agent, '_hfc_reasoning_owner', None) is not token:
+                    return
+                state['streaming'] = True
+                try:
+                    return stream(text)
+                finally:
+                    state['streaming'] = False
+            stream_reasoning._hfc_reasoning_stream_wrapper = True
+            stream_reasoning._hfc_original_callback = stream
+            agent._fire_reasoning_delta = stream_reasoning
+    return True
+
+
+def bind_agent_turn_identity(agent: Any, source: Any) -> bool:
+    """Bind a cached agent to the already admitted source turn, never a reply anchor."""
+    try:
+        # Cached agents are reused: failure to prove this turn invalidates the
+        # previous binding rather than allowing a later redirect to reuse it.
+        setattr(agent, "_hfc_turn_binding", None)
+        setattr(agent, "_hfc_conversation_binding", None)
+        turn_id = getattr(source, _CANONICAL_TURN_ATTR, None)
+        if _platform_name({}, source) != "feishu" or not isinstance(turn_id, str) or not turn_id.strip():
+            return False
+        profile, profile_source = _profile_identity({}, source, None)
+        chat_id = _first_attr_string(source, ("chat_id",))
+        thread_id = _first_attr_string(source, ("thread_id",)) or ""
+        if not chat_id or profile_source.startswith("sanitized_"):
+            return False
+        setattr(agent, "_hfc_turn_binding", (turn_id.strip(), profile, chat_id, thread_id))
+        conversation_id = getattr(source, "_hfc_conversation_id", None)
+        if isinstance(conversation_id, str) and conversation_id.strip():
+            setattr(agent, "_hfc_conversation_binding", (turn_id.strip(), conversation_id.strip()))
+        return True
+    except Exception:
+        return False
+
+
+def redirect_turn_id_for_agent(agent: Any, source: Any) -> str:
+    """Return the exact callback owner only within the same profile/chat/topic."""
+    try:
+        binding = getattr(agent, "_hfc_turn_binding", None)
+        if not isinstance(binding, tuple) or len(binding) != 4:
+            return ""
+        profile, profile_source = _profile_identity({}, source, None)
+        scope = (profile, _first_attr_string(source, ("chat_id",)),
+                 _first_attr_string(source, ("thread_id",)) or "")
+        if _platform_name({}, source) != "feishu" or profile_source.startswith("sanitized_"):
+            return ""
+        return binding[0] if binding[1:] == scope else ""
+    except Exception:
+        return ""
+
+
+def redirect_conversation_id_for_agent(agent: Any, source: Any) -> str:
+    turn_id = redirect_turn_id_for_agent(agent, source)
+    binding = getattr(agent, "_hfc_conversation_binding", None)
+    if (turn_id and isinstance(binding, tuple) and len(binding) == 2
+            and binding[0] == turn_id and isinstance(binding[1], str)):
+        return binding[1]
+    return ""
+
+
+def _turn_id_for_runtime_event(
+    event_name: str,
+    local_vars: dict[str, Any],
+) -> Optional[str]:
+    explicit = _first_string(local_vars, ("turn_id",))
+    source_obj = local_vars.get("source")
+    handler_event = local_vars.get("event")
+    handler_message_id = None
+    if event_name in {"message.started", "message.completed", "message.failed"}:
+        handler_message_id = _first_attr_string(
+            handler_event,
+            ("message_id", "msg_id"),
+        )
+
+    candidate = explicit or handler_message_id
+    if candidate is not None:
+        if event_name == "message.started" and source_obj is not None:
+            try:
+                setattr(source_obj, _CANONICAL_TURN_ATTR, candidate)
+            except Exception:
+                pass
+        return candidate
+
+    if source_obj is None:
+        return None
+    try:
+        bound = getattr(source_obj, _CANONICAL_TURN_ATTR, None)
+    except Exception:
+        return None
+    return bound.strip() if isinstance(bound, str) and bound.strip() else None
+
+
+def _first_raw_string(source: dict[str, Any], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = source.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _extract_attachments(
+    text: str, local_vars: dict[str, Any] | None = None
+) -> list[dict[str, str]]:
+    seen = set()
+    attachments = []
+    for candidate in _structured_attachment_candidates(local_vars or {}):
+        attachment = _coerce_attachment(candidate)
+        if attachment is None:
+            continue
+        name = attachment["name"]
+        if name in seen:
+            continue
+        seen.add(name)
+        attachments.append(attachment)
+    visible_text = _mask_markdown_code(text)
+    for raw in list(MEDIA_RE.findall(visible_text)) + list(
+        LOCAL_FILE_RE.findall(visible_text)
+    ):
+        name = _attachment_name(raw)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        attachments.append({"kind": _attachment_kind(name), "name": name, "summary": name})
+    return attachments
+
+
+def _mask_markdown_code(text: Any) -> str:
+    source = str(text or "")
+    masked = list(source)
+    index = 0
+    while index < len(source):
+        marker = source[index]
+        if marker not in {"`", "~"}:
+            index += 1
+            continue
+        run_end = index + 1
+        while run_end < len(source) and source[run_end] == marker:
+            run_end += 1
+        width = run_end - index
+        if marker == "~" and width < 3:
+            index = run_end
+            continue
+        delimiter = marker * width
+        closing = source.find(delimiter, run_end)
+        if closing < 0:
+            index = run_end
+            continue
+        span_end = closing + width
+        for position in range(index, span_end):
+            if masked[position] not in {"\n", "\r"}:
+                masked[position] = " "
+        index = span_end
+    return "".join(masked)
+
+
+def _remove_media_paths_outside_markdown_code(text: str) -> str:
+    masked = _mask_markdown_code(text)
+    spans = [
+        match.span()
+        for pattern in (MEDIA_RE, LOCAL_FILE_RE)
+        for match in pattern.finditer(masked)
+    ]
+    if not spans:
+        return text
+    cleaned = text
+    for start, end in sorted(spans, reverse=True):
+        cleaned = cleaned[:start] + cleaned[end:]
+    return cleaned
+
+
+def _card_visible_answer(text: str) -> str:
+    cleaned = str(text or "")
+    for marker in NATIVE_DELIVERY_MARKERS:
+        cleaned = cleaned.replace(marker, "")
+    cleaned = _remove_media_paths_outside_markdown_code(cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def native_media_only_response(response: Any) -> Any:
+    if not isinstance(response, str) or not response:
+        return response
+
+    delivery_parts: list[tuple[int, str]] = []
+    for marker in NATIVE_DELIVERY_MARKERS:
+        offset = response.find(marker)
+        if offset >= 0:
+            delivery_parts.append((offset, marker))
+
+    has_delivery_path = False
+    visible_response = _mask_markdown_code(response)
+    for match in MEDIA_RE.finditer(visible_response):
+        path = match.group(1).rstrip(ATTACHMENT_TRAILING_PUNCTUATION)
+        if not path:
+            continue
+        has_delivery_path = True
+        delivery_parts.append((match.start(), f"MEDIA:{path}"))
+    for match in LOCAL_FILE_RE.finditer(visible_response):
+        path = match.group(1).rstrip(ATTACHMENT_TRAILING_PUNCTUATION)
+        if not path:
+            continue
+        has_delivery_path = True
+        delivery_parts.append((match.start(), path))
+
+    if not has_delivery_path:
+        return response
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for _, part in sorted(delivery_parts, key=lambda item: item[0]):
+        if part in seen:
+            continue
+        seen.add(part)
+        ordered.append(part)
+    return "\n".join(ordered)
+
+
+def _native_delivery_policy(
+    text: str, local_vars: dict[str, Any] | None = None
+) -> str:
+    visible_text = _mask_markdown_code(text)
+    if MEDIA_RE.search(visible_text) or LOCAL_FILE_RE.search(visible_text):
+        return "required"
+    for candidate in _structured_native_delivery_candidates(local_vars or {}):
+        if _coerce_attachment(candidate) is not None:
+            return "required"
+    return "allowed"
+
+
+def _structured_attachment_candidates(local_vars: dict[str, Any]) -> list[Any]:
+    return _structured_candidates(
+        local_vars,
+        (
+            "attachments",
+            "attachment",
+            *NATIVE_DELIVERY_ATTACHMENT_FIELDS,
+        ),
+    )
+
+
+def _structured_native_delivery_candidates(local_vars: dict[str, Any]) -> list[Any]:
+    return _structured_candidates(local_vars, NATIVE_DELIVERY_OUTPUT_ATTACHMENT_FIELDS)
+
+
+def _structured_candidates(
+    local_vars: dict[str, Any], names: tuple[str, ...]
+) -> list[Any]:
+    candidates: list[Any] = []
+    for name in names:
+        value = local_vars.get(name)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            candidates.extend(value)
+        else:
+            candidates.append(value)
+    return candidates
+
+
+def _coerce_attachment(value: Any) -> dict[str, str] | None:
+    if isinstance(value, (tuple, list)) and value:
+        value = value[0]
+    if isinstance(value, str):
+        name = _attachment_name(value)
+        if not name:
+            return None
+        return {"kind": _attachment_kind(name), "name": name, "summary": name}
+    if isinstance(value, dict):
+        raw_name = _first_attachment_mapping_value(
+            value,
+            ("name", "filename", "file_name", "path", "file_path", "url", "display_name", "summary"),
+        )
+        summary = _first_attachment_mapping_value(
+            value,
+            ("summary", "display_name", "title", "name", "filename", "file_name"),
+        )
+        kind_hint = _first_attachment_mapping_value(
+            value,
+            ("kind", "type", "media_type", "mime_type", "mime"),
+        )
+    else:
+        raw_name = _first_attachment_attr_value(
+            value,
+            ("name", "filename", "file_name", "path", "file_path", "url", "display_name", "summary"),
+        )
+        summary = _first_attachment_attr_value(
+            value,
+            ("summary", "display_name", "title", "name", "filename", "file_name"),
+        )
+        kind_hint = _first_attachment_attr_value(
+            value,
+            ("kind", "type", "media_type", "mime_type", "mime"),
+        )
+    name = _attachment_name(raw_name or "")
+    if not name:
+        return None
+    clean_summary = str(summary or name).strip() or name
+    return {
+        "kind": _attachment_kind_from_hint(name, kind_hint),
+        "name": name,
+        "summary": clean_summary,
+    }
+
+
+def _first_attachment_mapping_value(
+    value: dict[str, Any], names: tuple[str, ...]
+) -> str:
+    for name in names:
+        item = value.get(name)
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+    return ""
+
+
+def _first_attachment_attr_value(value: Any, names: tuple[str, ...]) -> str:
+    for name in names:
+        item = getattr(value, name, None)
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+    return ""
+
+
+def _attachment_name(raw: str) -> str:
+    return Path(raw.strip().rstrip(ATTACHMENT_TRAILING_PUNCTUATION)).name.strip()
+
+
+def _attachment_kind_from_hint(name: str, hint: str) -> str:
+    normalized = str(hint or "").strip().lower()
+    if normalized.startswith("image/") or normalized in {"image", "img", "photo"}:
+        return "image"
+    if normalized.startswith("audio/") or normalized in {"audio", "voice"}:
+        return "audio"
+    if normalized.startswith("video/") or normalized == "video":
+        return "video"
+    if normalized in {"file", "document", "doc"}:
+        return "file"
+    return _attachment_kind(name)
+
+
+def _attachment_kind(name: str) -> str:
+    ext = Path(name).suffix.lower()
+    if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        return "image"
+    if ext in {".mp3", ".wav", ".ogg"}:
+        return "audio"
+    if ext in {".mp4", ".mov", ".webm"}:
+        return "video"
+    if ext:
+        return "file"
+    return "unknown"
+
+
+def _completion_duration(local_vars: dict[str, Any]) -> float:
+    for name in ("duration", "duration_seconds", "response_time", "_response_time"):
+        value = _finite_float(local_vars.get(name))
+        if value is not None and value >= 0:
+            return value
+    return 0.0
+
+
+def _completion_answer(local_vars: dict[str, Any]) -> str:
+    direct = _first_string(
+        local_vars,
+        ("answer", "response", "final_answer", "final_response", "text", "content"),
+    )
+    if direct is not None:
+        return direct
+
+    agent_result = local_vars.get("agent_result")
+    answer = _first_attr_string(
+        agent_result,
+        ("answer", "response", "final_answer", "final_response", "text", "content"),
+    )
+    if answer is not None:
+        return answer
+    if isinstance(agent_result, dict):
+        for key in ("message", "assistant_message", "result", "output"):
+            nested = agent_result.get(key)
+            answer = _first_attr_string(
+                nested,
+                (
+                    "answer",
+                    "response",
+                    "final_answer",
+                    "final_response",
+                    "text",
+                    "content",
+                ),
+            )
+            if answer is not None:
+                return answer
+    return ""
+
+
+def _completion_model(local_vars: dict[str, Any]) -> str:
+    model = _first_string(local_vars, ("model", "current_model", "resolved_model"))
+    if model is not None:
+        return model
+    agent_result = local_vars.get("agent_result")
+    if isinstance(agent_result, dict):
+        result_model = _first_string(agent_result, ("model", "current_model", "resolved_model"))
+        if result_model is not None:
+            return result_model
+    return "Unknown"
+
+
+def effective_response_model(agent: Any) -> str:
+    """Capture the actual fallback route before Gateway discards result fields."""
+    route = getattr(agent, "_provider_fallback_route", None)
+    if isinstance(route, (tuple, list)) and len(route) == 2:
+        model, provider = route
+    else:
+        model, provider = getattr(agent, "model", None), getattr(agent, "provider", None)
+    if not isinstance(model, str) or not model.strip():
+        return ""
+    model = model.strip()
+    # A URL or arbitrary secret-bearing runtime value is not a provider label.
+    if isinstance(provider, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", provider):
+        if not model.startswith(provider + "/"):
+            return f"{provider}/{model}"
+    return model
+
+
+def _completion_observed_rate(local_vars):
+    """Consume display observations without making delivery depend on the plugin."""
+    try:
+        from .turn_metrics import RATE_MIN_OUTPUT_TOKENS, completion_output_rate, metric_count
+        result = local_vars.get("agent_result")
+        if type(result) is not dict:
+            return None
+        runtime = _plugin_runtime()
+        if runtime is None:
+            return None
+        observed = runtime.take_observed_rate(result.get("session_id"))
+        # A preflight/early return can reuse the session without ever calling
+        # pre_llm_call. Consume and discard unowned old observations unless the
+        # actual result proves this invocation made at least one API request.
+        api_calls = metric_count(result.get("api_calls"))
+        if observed is None or api_calls is None or api_calls == 0:
+            return None
+        rate, count = observed
+        # Legacy footer counts can be session-cumulative on cached agents.
+        # Only the independently validated per-invocation observations qualify.
+        exact = metric_count(count)
+        if exact is None or exact < RATE_MIN_OUTPUT_TOKENS:
+            return None
+        validated = completion_output_rate(rate)
+        if validated is None:
+            return None
+        return {"output_tps": validated[0], "basis": validated[1]}
+    except Exception:
+        return None
+
+
+def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int]:
+    explicit_tokens = local_vars.get("tokens")
+    agent_result = local_vars.get("agent_result")
+    if not isinstance(agent_result, dict):
+        agent_result = {}
+
+    input_tokens = _token_value(explicit_tokens, "input_tokens")
+    output_tokens = _token_value(explicit_tokens, "output_tokens")
+    last_prompt_tokens = _positive_int(agent_result.get("last_prompt_tokens"))
+    estimated_output_tokens = _estimate_output_tokens(answer) if answer else 0
+
+    if last_prompt_tokens > 0 and input_tokens > last_prompt_tokens * 2:
+        input_tokens = last_prompt_tokens
+    if estimated_output_tokens > 0 and output_tokens > max(estimated_output_tokens * 4, 256):
+        output_tokens = estimated_output_tokens
+
+    if input_tokens <= 0:
+        input_tokens = _positive_int(agent_result.get("input_tokens"))
+    if last_prompt_tokens > 0 and input_tokens > last_prompt_tokens * 2:
+        input_tokens = last_prompt_tokens
+    if input_tokens <= 0:
+        input_tokens = last_prompt_tokens
+    if input_tokens <= 0:
+        input_tokens = _positive_int(local_vars.get("input_tokens"))
+
+    if output_tokens <= 0:
+        output_tokens = _positive_int(agent_result.get("output_tokens"))
+    if estimated_output_tokens > 0 and output_tokens > max(estimated_output_tokens * 4, 256):
+        output_tokens = estimated_output_tokens
+    if output_tokens <= 0:
+        output_tokens = _positive_int(local_vars.get("output_tokens"))
+    if estimated_output_tokens > 0 and output_tokens > max(estimated_output_tokens * 4, 256):
+        output_tokens = estimated_output_tokens
+    if output_tokens <= 0 and answer:
+        output_tokens = estimated_output_tokens
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def _completion_context(local_vars: dict[str, Any]) -> dict[str, int]:
+    explicit_context = local_vars.get("context")
+    agent_result = local_vars.get("agent_result")
+    if not isinstance(agent_result, dict):
+        agent_result = {}
+
+    used_tokens = _context_value(explicit_context, "used_tokens")
+    max_tokens = _context_value(explicit_context, "max_tokens")
+    if used_tokens <= 0:
+        used_tokens = _positive_int(agent_result.get("last_prompt_tokens"))
+    if used_tokens <= 0:
+        used_tokens = _positive_int(agent_result.get("context_used_tokens"))
+    if max_tokens <= 0:
+        max_tokens = _positive_int(agent_result.get("context_window"))
+    if max_tokens <= 0:
+        max_tokens = _positive_int(agent_result.get("context_length"))
+    if max_tokens <= 0:
+        max_tokens = _model_context_length(_completion_model(local_vars))
+    return {"used_tokens": used_tokens, "max_tokens": max_tokens}
+
+
+def _context_value(context: Any, name: str) -> int:
+    if not isinstance(context, dict):
+        return 0
+    return _positive_int(context.get(name))
+
+
+def _model_context_length(model: str) -> int:
+    if not model or model == "Unknown":
+        return 0
+    try:
+        from agent.model_metadata import get_model_context_length
+    except Exception:
+        return 0
+    try:
+        return _positive_int(get_model_context_length(model))
+    except Exception:
+        return 0
+
+
+def _token_value(tokens: Any, name: str) -> int:
+    if not isinstance(tokens, dict):
+        return 0
+    return _positive_int(tokens.get(name))
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _estimate_output_tokens(text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    ascii_chars = sum(1 for char in stripped if ord(char) < 128)
+    non_ascii_chars = len(stripped) - ascii_chars
+    ascii_tokens = (ascii_chars + 3) // 4 if ascii_chars else 0
+    estimated = non_ascii_chars + ascii_tokens
+    return max(1, estimated)
+
+
+def _first_attr_string(obj: Any, names: tuple[str, ...]) -> str | None:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return _first_string(obj, names)
+    for name in names:
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _first_attr_raw_string(obj: Any, names: tuple[str, ...]) -> str | None:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return _first_raw_string(obj, names)
+    for name in names:
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            continue
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _platform_name(local_vars: dict[str, Any], source_obj: Any) -> str:
+    platform = _coerce_platform_value(local_vars.get("platform"))
+    if platform is None and source_obj is not None:
+        try:
+            platform = _coerce_platform_value(getattr(source_obj, "platform", None))
+        except Exception:
+            platform = None
+    if platform is None:
+        return "feishu"
+    if "." in platform:
+        platform = platform.rsplit(".", 1)[-1]
+    return platform.lower()
+
+
+def _coerce_platform_value(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, str) and enum_value.strip():
+        return enum_value.strip()
+    return None
+
+
+def _created_at(value: Any) -> float:
+    created_at = _finite_float(value)
+    if created_at is None:
+        return time.time()
+    return created_at
+
+
+def _created_at_lifecycle_token(value: Any) -> str | None:
+    created_at = _finite_float(value)
+    if created_at is None:
+        return None
+    return f"{created_at:.3f}"
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _truthy_value(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return False
+
+
+def _fallback_message_id(
+    event_name: str,
+    conversation_id: str,
+    chat_id: str,
+    created_at_lifecycle_token: str | None,
+    *,
+    preview: bool = False,
+) -> str | None:
+    key = (conversation_id, chat_id)
+    if event_name == "message.started":
+        if preview:
+            cache_key = _new_fallback_cache_key(key, created_at_lifecycle_token)
+            cached = _ACTIVE_FALLBACK_MESSAGE_IDS.get(cache_key)
+            if cached is not None:
+                return cached
+            return _preview_fallback_message_id(
+                key, conversation_id, chat_id, created_at_lifecycle_token
+            )
+        cache_key = _new_fallback_cache_key(key, created_at_lifecycle_token)
+        cached = _ACTIVE_FALLBACK_MESSAGE_IDS.get(cache_key)
+        if cached is not None:
+            _CURRENT_FALLBACK_KEYS[key] = cache_key
+            return cached
+        return _create_active_fallback_message_id(
+            key, cache_key, conversation_id, chat_id, created_at_lifecycle_token
+        )
+
+    active_cache_key = _active_fallback_cache_key(key, created_at_lifecycle_token)
+    if active_cache_key is _AMBIGUOUS_TERMINAL:
+        return None
+    if active_cache_key is not None:
+        cached = _ACTIVE_FALLBACK_MESSAGE_IDS.get(active_cache_key)
+        if cached is not None:
+            return cached
+
+    if preview:
+        return _preview_fallback_message_id(
+            key, conversation_id, chat_id, created_at_lifecycle_token
+        )
+    cache_key = _new_fallback_cache_key(key, created_at_lifecycle_token)
+    return _create_active_fallback_message_id(
+        key, cache_key, conversation_id, chat_id, created_at_lifecycle_token
+    )
+
+
+def _create_active_fallback_message_id(
+    key: tuple[str, str],
+    cache_key: tuple[str, str, str | None],
+    conversation_id: str,
+    chat_id: str,
+    created_at_lifecycle_token: str | None,
+) -> str:
+    lifecycle_count = _FALLBACK_LIFECYCLE_COUNTS.get(key, 0)
+    _FALLBACK_LIFECYCLE_COUNTS[key] = lifecycle_count + 1
+    lifecycle_token = f"active:{lifecycle_count}"
+    if created_at_lifecycle_token is not None:
+        lifecycle_token = f"{lifecycle_token}:created_at:{created_at_lifecycle_token}"
+    message_id = _hash_fallback_message_id(
+        conversation_id, chat_id, lifecycle_token
+    )
+    _ACTIVE_FALLBACK_MESSAGE_IDS[cache_key] = message_id
+    _CURRENT_FALLBACK_KEYS[key] = cache_key
+    return message_id
+
+
+def _preview_fallback_message_id(
+    key: tuple[str, str],
+    conversation_id: str,
+    chat_id: str,
+    created_at_lifecycle_token: str | None,
+) -> str:
+    if created_at_lifecycle_token is not None:
+        token_key = (key[0], key[1], created_at_lifecycle_token)
+        cached = _ACTIVE_FALLBACK_MESSAGE_IDS.get(token_key)
+        if cached is not None:
+            return cached
+    else:
+        current_key = _CURRENT_FALLBACK_KEYS.get(key)
+        if current_key in _ACTIVE_FALLBACK_MESSAGE_IDS:
+            return _ACTIVE_FALLBACK_MESSAGE_IDS[current_key]
+    lifecycle_count = _FALLBACK_LIFECYCLE_COUNTS.get(key, 0)
+    lifecycle_token = f"active:{lifecycle_count}"
+    if created_at_lifecycle_token is not None:
+        lifecycle_token = f"{lifecycle_token}:created_at:{created_at_lifecycle_token}"
+    return _hash_fallback_message_id(conversation_id, chat_id, lifecycle_token)
+
+
+def _new_fallback_cache_key(
+    key: tuple[str, str], created_at_lifecycle_token: str | None
+) -> tuple[str, str, str | None]:
+    if created_at_lifecycle_token is not None:
+        return (key[0], key[1], created_at_lifecycle_token)
+    lifecycle_count = _FALLBACK_LIFECYCLE_COUNTS.get(key, 0)
+    return (key[0], key[1], f"untokened:{lifecycle_count}")
+
+
+def _terminal_fallback_cache_key(
+    key: tuple[str, str],
+    created_at_lifecycle_token: str | None,
+) -> tuple[str, str, str | None] | object | None:
+    if created_at_lifecycle_token is not None:
+        token_key = (key[0], key[1], created_at_lifecycle_token)
+        if token_key in _ACTIVE_FALLBACK_MESSAGE_IDS:
+            return token_key
+        if _active_fallback_cache_keys(key):
+            return _AMBIGUOUS_TERMINAL
+        return None
+
+    active_keys = _active_fallback_cache_keys(key)
+    if len(active_keys) == 1:
+        return active_keys[0]
+    if len(active_keys) > 1:
+        return _AMBIGUOUS_TERMINAL
+    return None
+
+
+def _active_fallback_cache_key(
+    key: tuple[str, str], created_at_lifecycle_token: str | None
+) -> tuple[str, str, str | None] | object | None:
+    if created_at_lifecycle_token is not None:
+        token_key = (key[0], key[1], created_at_lifecycle_token)
+        if token_key in _ACTIVE_FALLBACK_MESSAGE_IDS:
+            return token_key
+    active_keys = _active_fallback_cache_keys(key)
+    if len(active_keys) > 1:
+        return _AMBIGUOUS_TERMINAL
+    current_key = _CURRENT_FALLBACK_KEYS.get(key)
+    if current_key in _ACTIVE_FALLBACK_MESSAGE_IDS:
+        return current_key
+    return None
+
+
+def _active_fallback_cache_keys(
+    key: tuple[str, str]
+) -> list[tuple[str, str, str | None]]:
+    return [
+        active_key
+        for active_key in _ACTIVE_FALLBACK_MESSAGE_IDS
+        if active_key[0] == key[0] and active_key[1] == key[1]
+    ]
+
+
+def _retire_current_fallback_key(key: tuple[str, str]) -> None:
+    current_key = _CURRENT_FALLBACK_KEYS.pop(key, None)
+    if current_key is not None:
+        _ACTIVE_FALLBACK_MESSAGE_IDS.pop(current_key, None)
+
+
+def _retire_all_fallback_keys(key: tuple[str, str]) -> None:
+    for active_key in _active_fallback_cache_keys(key):
+        _ACTIVE_FALLBACK_MESSAGE_IDS.pop(active_key, None)
+    _CURRENT_FALLBACK_KEYS.pop(key, None)
+
+
+def _hash_fallback_message_id(
+    conversation_id: str, chat_id: str, lifecycle_token: str
+) -> str:
+    raw = f"{conversation_id}:{chat_id}:{lifecycle_token}".encode("utf-8")
+    return "hfc_" + sha256(raw).hexdigest()[:16]
+
+
+def _next_sequence(message_id: str) -> int:
+    with _SEQUENCE_LOCK:
+        sequence = _SEQUENCES.get(message_id, -1) + 1
+        _SEQUENCES[message_id] = sequence
+        return sequence
+
+
+def _peek_next_sequence(message_id: str) -> int:
+    with _SEQUENCE_LOCK:
+        return _SEQUENCES.get(message_id, -1) + 1

@@ -1,0 +1,950 @@
+{
+  "schema_version": 1,
+  "notice": "设计方向样稿，全部为固定示例。组件来自当前 renderer；A 的中性标题为候选变更。这里不是飞书客户端，按钮不会提交。",
+  "configuration": {
+    "A": "阅读优先：中性标题保留状态文字，正文先读，成功过程默认收起，统计在底部。",
+    "B": "任务分区：状态色标题，执行过程默认展开，运行和结束后的过程都便于连续查看。",
+    "unchanged": "两种方向均保留完整正文、审批范围和选择值；不改变账号、权限或默认配置。",
+    "limits": "手机宽度、颜色和字体仅为离线近似。真机布局、输入、滚动、焦点和读屏另行验收。"
+  },
+  "scenarios": [
+    {
+      "id": "running",
+      "label": "执行过程",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_0",
+                "content": "<text_tag color='green'>已完成</text_tag> · <text_tag color='neutral'>terminal</text_tag> · #1\n执行命令：项目说明",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_1",
+                "content": "<text_tag color='neutral'>terminal</text_tag> · #2 · 3s\n执行命令：检查项目测试",
+                "text_size": "small"
+              },
+              {
+                "tag": "collapsible_panel",
+                "element_id": "auxiliary_timeline",
+                "expanded": false,
+                "header": {
+                  "title": {
+                    "tag": "plain_text",
+                    "content": "▸ 执行过程（点开查看）"
+                  },
+                  "vertical_align": "center"
+                },
+                "border": {
+                  "color": "grey",
+                  "corner_radius": "8px"
+                },
+                "padding": "8px 8px 8px 8px",
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_reasoningentry_2",
+                    "content": "**实时思考** · running\n先核对资料，再整理本次修改。",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_1",
+                    "content": "<font color=\"blue\">⠋ **terminal** · #2 · 执行中</font>\n<font color=\"grey\">　检查项目测试</font>\n<font color=\"grey\">　参数: {\"command\": \"python -m pytest tests/unit -q\"}</font>",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_0",
+                    "content": "<font color=\"green\">✓ **terminal** · #1</font>\n<font color=\"grey\">　读取项目说明</font>\n<font color=\"grey\">　参数: {\"command\": \"python -m pytest tests/unit -q\"}</font>",
+                    "text_size": "small"
+                  }
+                ]
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 执行中"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_0",
+                "content": "<text_tag color='green'>已完成</text_tag> · <text_tag color='neutral'>terminal</text_tag> · #1\n执行命令：项目说明",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_1",
+                "content": "<text_tag color='neutral'>terminal</text_tag> · #2 · 3s\n执行命令：检查项目测试",
+                "text_size": "small"
+              },
+              {
+                "tag": "collapsible_panel",
+                "element_id": "auxiliary_timeline",
+                "expanded": true,
+                "header": {
+                  "title": {
+                    "tag": "plain_text",
+                    "content": "▸ 执行过程（点开查看）"
+                  },
+                  "vertical_align": "center"
+                },
+                "border": {
+                  "color": "grey",
+                  "corner_radius": "8px"
+                },
+                "padding": "8px 8px 8px 8px",
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_reasoningentry_2",
+                    "content": "**实时思考** · running\n先核对资料，再整理本次修改。",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_1",
+                    "content": "<font color=\"blue\">⠋ **terminal** · #2 · 执行中</font>\n<font color=\"grey\">　检查项目测试</font>\n<font color=\"grey\">　参数: {\"command\": \"python -m pytest tests/unit -q\"}</font>",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_0",
+                    "content": "<font color=\"green\">✓ **terminal** · #1</font>\n<font color=\"grey\">　读取项目说明</font>\n<font color=\"grey\">　参数: {\"command\": \"python -m pytest tests/unit -q\"}</font>",
+                    "text_size": "small"
+                  }
+                ]
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "blue",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 执行中"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "waiting",
+      "label": "长时间无更新",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "最近 2 分钟未收到新事件；任务是否仍在执行尚待确认。",
+                "text_size": "small"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待新进展"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "最近 2 分钟未收到新事件；任务是否仍在执行尚待确认。",
+                "text_size": "small"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待新进展"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "approval",
+      "label": "等待审批",
+      "cards": {
+        "reading": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待审批"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "允许更新示例项目配置吗？"
+            },
+            {
+              "tag": "markdown",
+              "content": "请核对下方完整操作后，单击授权按钮一次。若手机显示“展开”，展开仅查看内容，不会提交授权。"
+            },
+            {
+              "tag": "markdown",
+              "content": "将在示例项目中更新一项阅读设置。原配置先备份，不修改模型、账号或权限。\n\n请核对完整操作范围后选择。"
+            },
+            {
+              "tag": "markdown",
+              "content": "请选择一个选项"
+            },
+            {
+              "tag": "column_set",
+              "flex_mode": "flow",
+              "horizontal_spacing": "8px",
+              "horizontal_align": "left",
+              "columns": [
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "允许本次操作"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "once",
+                        "choice_label": "允许本次操作",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                },
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "拒绝"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "deny",
+                        "choice_label": "拒绝",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "progress": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "orange",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待审批"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "允许更新示例项目配置吗？"
+            },
+            {
+              "tag": "markdown",
+              "content": "请核对下方完整操作后，单击授权按钮一次。若手机显示“展开”，展开仅查看内容，不会提交授权。"
+            },
+            {
+              "tag": "markdown",
+              "content": "将在示例项目中更新一项阅读设置。原配置先备份，不修改模型、账号或权限。\n\n请核对完整操作范围后选择。"
+            },
+            {
+              "tag": "markdown",
+              "content": "请选择一个选项"
+            },
+            {
+              "tag": "column_set",
+              "flex_mode": "flow",
+              "horizontal_spacing": "8px",
+              "horizontal_align": "left",
+              "columns": [
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "允许本次操作"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "once",
+                        "choice_label": "允许本次操作",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                },
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "拒绝"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "deny",
+                        "choice_label": "拒绝",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "clarify",
+      "label": "多选与输入",
+      "cards": {
+        "reading": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待你的选择"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "这份报告重点展示哪些内容？"
+            },
+            {
+              "tag": "markdown",
+              "content": "1. 结果与结论\n\n2. 执行过程\n\n3. 数据与限制"
+            },
+            {
+              "tag": "form",
+              "name": "hfc_clarify_form",
+              "elements": [
+                {
+                  "tag": "multi_select_static",
+                  "name": "hfc_multi",
+                  "type": "default",
+                  "required": false,
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "请选择（可多选）"
+                  },
+                  "options": [
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "1. 结果与结论"
+                      },
+                      "value": "result"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "2. 执行过程"
+                      },
+                      "value": "process"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "3. 数据与限制"
+                      },
+                      "value": "evidence"
+                    }
+                  ]
+                },
+                {
+                  "tag": "input",
+                  "name": "hfc_other",
+                  "input_type": "text",
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "或输入自定义答案…"
+                  }
+                },
+                {
+                  "tag": "button",
+                  "text": {
+                    "tag": "plain_text",
+                    "content": "✅ 确认选择"
+                  },
+                  "type": "primary",
+                  "name": "hfc_confirm_preview-only-not-a-live-token",
+                  "value": {
+                    "profile_id": "default"
+                  },
+                  "action_type": "form_submit"
+                }
+              ]
+            }
+          ]
+        },
+        "progress": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "orange",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待你的选择"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "这份报告重点展示哪些内容？"
+            },
+            {
+              "tag": "markdown",
+              "content": "1. 结果与结论\n\n2. 执行过程\n\n3. 数据与限制"
+            },
+            {
+              "tag": "form",
+              "name": "hfc_clarify_form",
+              "elements": [
+                {
+                  "tag": "multi_select_static",
+                  "name": "hfc_multi",
+                  "type": "default",
+                  "required": false,
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "请选择（可多选）"
+                  },
+                  "options": [
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "1. 结果与结论"
+                      },
+                      "value": "result"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "2. 执行过程"
+                      },
+                      "value": "process"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "3. 数据与限制"
+                      },
+                      "value": "evidence"
+                    }
+                  ]
+                },
+                {
+                  "tag": "input",
+                  "name": "hfc_other",
+                  "input_type": "text",
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "或输入自定义答案…"
+                  }
+                },
+                {
+                  "tag": "button",
+                  "text": {
+                    "tag": "plain_text",
+                    "content": "✅ 确认选择"
+                  },
+                  "type": "primary",
+                  "name": "hfc_confirm_preview-only-not-a-live-token",
+                  "value": {
+                    "profile_id": "default"
+                  },
+                  "action_type": "form_submit"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "completed",
+      "label": "结果与长内容",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "## 项目检查完成 配置与文档保持一致，可以继续下一步验证。 - 已核对阅读设置和覆盖顺序 - 已保留原始配置 - 真实客户端效果仍需单独验收 | 检查项 | 结果 | | --- | --- | | 配置解析 | 通过 | | 文档链接…"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "## 项目检查完成\n\n配置与文档保持一致，可以继续下一步验证。\n\n- 已核对阅读设置和覆盖顺序\n- 已保留原始配置\n- 真实客户端效果仍需单独验收\n\n| 检查项 | 结果 |\n| --- | --- |\n| 配置解析 | 通过 |\n| 文档链接 | 通过 |\n\n使用示例命令检查配置：\n\n语言：bash\n\n```plain_text\nhermes-feishu-card card-config --config example.yaml\n```",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "deepseek/deepseek-v4-pro · 1m24s · ↑4.2k · ↓680",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "## 项目检查完成 配置与文档保持一致，可以继续下一步验证。 - 已核对阅读设置和覆盖顺序 - 已保留原始配置 - 真实客户端效果仍需单独验收 | 检查项 | 结果 | | --- | --- | | 配置解析 | 通过 | | 文档链接…"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "## 项目检查完成\n\n配置与文档保持一致，可以继续下一步验证。\n\n- 已核对阅读设置和覆盖顺序\n- 已保留原始配置\n- 真实客户端效果仍需单独验收\n\n| 检查项 | 结果 |\n| --- | --- |\n| 配置解析 | 通过 |\n| 文档链接 | 通过 |\n\n使用示例命令检查配置：\n\n语言：bash\n\n```plain_text\nhermes-feishu-card card-config --config example.yaml\n```",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "deepseek/deepseek-v4-pro · 1m24s · ↑4.2k · ↓680",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "green",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "short",
+      "label": "简短回复",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "已收到，稍后见。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已收到，稍后见。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "已收到，稍后见。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已收到，稍后见。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "green",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "stopped",
+      "label": "失败与中断",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已保留前半部分结果。\n\n> 请求未完成，请检查连接后重新发起任务。",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "32s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已停止"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已保留前半部分结果。\n\n> 请求未完成，请检查连接后重新发起任务。",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "32s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "red",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已停止"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "restored",
+      "label": "连接恢复",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "连接已重建；执行状态尚未同步，原授权不会恢复。",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "此前已经收到的内容会继续保留。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待状态同步"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "连接已重建；执行状态尚未同步，原授权不会恢复。",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "此前已经收到的内容会继续保留。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待状态同步"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "notice",
+      "label": "独立通知",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "配置文件可以正常读取。下次启动时加载新设置。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "配置文件可以正常读取。下次启动时加载新设置。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "配置检查 · 已完成"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "配置文件可以正常读取。下次启动时加载新设置。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "配置文件可以正常读取。下次启动时加载新设置。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "green",
+            "title": {
+              "tag": "plain_text",
+              "content": "配置检查 · 已完成"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

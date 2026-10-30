@@ -1,0 +1,147 @@
+{
+  "project": "hermes-feishu-streaming-card",
+  "version": "v2.1-sidecar (in progress)",
+  "last_updated": "2026-04-17",
+  "current_model": "step-3.5-flash-2603 (StepFun)",
+  "default_model": "MiniMax-M2.7 (minimax-cn)",
+  "architecture": {
+    "mode": "sidecar (独立进程)",
+    "adapter_pattern": "factory + dual-mode support",
+    "communication": "HTTP (aiohttp)",
+    "port": 8765,
+    "status": "running"
+  },
+  "components": {
+    "sidecar_server": {
+      "status": "running",
+      "pid": 28851,
+      "port": 8765,
+      "health": "healthy",
+      "active_cards": 0,
+      "last_event_test": "2026-04-17 17:16",
+      "events_endpoint": "working (200)"
+    },
+    "gateway": {
+      "status": "running",
+      "pid": 87647,
+      "feishu_connection": "connected",
+      "config_loaded": true
+    },
+    "cardkit_client": {
+      "status": "synced",
+      "finalize_logic": "delete thinking_content, add final_content with footer_stats"
+    }
+  },
+  "recent_fixes": [
+    {
+      "date": "2026-04-17",
+      "issue": "cardkit_client.py finalize_card method corrupted (duplicate code blocks, syntax errors)",
+      "fix": "Rewrote entire method body (lines 350-469), removed duplicate code, restored correct logic",
+      "commit_ready": true
+    }
+  ],
+  "known_issues": [
+    {
+      "id": "ISSUE-002",
+      "title": "Gateway event forwarding not yet implemented",
+      "status": "open",
+      "description": "feishu.py needs minimal patch to forward events to sidecar",
+      "priority": "P0"
+    }
+  ],
+  "todo_priority": [
+    {
+      "priority": "P0",
+      "task": "Gateway event forwarding",
+      "details": "Patch feishu.py to forward events to sidecar (non-blocking, exception-isolated)"
+    },
+    {
+      "priority": "P1",
+      "task": "End-to-end test",
+      "details": "Send test message through Hermes → Gateway → Sidecar → Feishu card"
+    },
+    {
+      "priority": "P1",
+      "task": "Graceful degradation",
+      "details": "If sidecar unreachable, gateway logs warning and continues without streaming"
+    },
+    {
+      "priority": "P2",
+      "task": "Installer enhancements",
+      "details": "Add --status, --install-sidecar, --switch-to, --recover commands"
+    }
+  ],
+  "config_paths": {
+    "hermes_config": "~/.hermes/config.yaml",
+    "sidecar_config": "~/.hermes/feishu-sidecar.yaml",
+    "gateway_pid": "~/.hermes/gateway.pid",
+    "sidecar_log": "~/.hermes/logs/feishu-sidecar.log"
+  },
+  "key_files": {
+    "adapter_modules": [
+      "adapter/streaming_adapter.py (abstract base)",
+      "adapter/legacy_adapter.py (old injection wrapper)",
+      "adapter/sidecar_adapter.py (HTTP client)",
+      "adapter/factory.py (adapter factory)",
+      "adapter/dual_adapter.py (parallel mode)"
+    ],
+    "sidecar_modules": [
+      "sidecar/config.py (configuration)",
+      "sidecar/cardkit_client.py (CardKit API client)",
+      "sidecar/card_manager.py (lifecycle manager)",
+      "sidecar/server.py (aiohttp server)",
+      "sidecar/__main__.py (entry point)"
+    ],
+    "gateway_target": [
+      "~/.hermes/hermes-agent/gateway/platforms/feishu.py (needs minimal patch)"
+    ]
+  },
+  "api_endpoints": {
+    "sidecar": {
+      "base_url": "http://localhost:8765",
+      "health": "GET /health",
+      "metrics": "GET /metrics",
+      "events": "POST /events",
+      "create_card": "POST /card",
+      "update_card": "POST /card/{card_id}/update",
+      "finalize_card": "POST /card/{card_id}/finalize"
+    },
+    "cardkit": {
+      "base_url": "https://open.feishu.cn/open-apis/cardkit/v1",
+      "auth": "tenant_access_token via lark-cli"
+    }
+  },
+  "event_schema": {
+    "version": "1.0",
+    "events": [
+      "message_received (create card)",
+      "thinking (streaming update)",
+      "tool_call (tool status change)",
+      "finish (finalize)",
+      "error (show error)"
+    ],
+    "format": {
+      "event": "string (event type)",
+      "data": "object (event payload)"
+    }
+  },
+  "testing": {
+    "last_health_check": "2026-04-17 17:16",
+    "health_status": "healthy",
+    "events_endpoint": "200 OK",
+    "sidecar_log_size": "~2KB"
+  },
+  "git_status": {
+    "repo": "baileyh8/hermes-feishu-streaming-card",
+    "branch": "working directory (not committed)",
+    "untracked": [
+      "adapter/",
+      "sidecar/",
+      "sidecar_cli.py"
+    ],
+    "modified": [
+      "README.md (appended sidecar section)"
+    ],
+    "needs_commit": true
+  }
+}

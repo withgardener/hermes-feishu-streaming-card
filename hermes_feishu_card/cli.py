@@ -1,0 +1,5901 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+from ipaddress import ip_address
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
+from pathlib import Path
+from typing import Any, Callable
+
+import yaml
+
+from hermes_feishu_card.install import posix_transaction
+from hermes_feishu_card.install.file_transaction import (
+    _RestoreIdentity, _RestoreEvidenceSnapshot,
+    _snapshot_restore_evidence,
+    _restore_text_sha256,
+    _read_restore_text,
+    _assert_restore_evidence_set_unchanged,
+    _write_targets_portably,
+)
+
+from hermes_feishu_card import __version__ as PACKAGE_VERSION
+from hermes_feishu_card.cli_reports import (
+    format_route_chain as _format_route_chain,
+    exact_delivery_contract_status as _exact_delivery_contract_status,
+    doctor_exit_code as _doctor_exit_code,
+    format_doctor_explanation as _format_doctor_explanation,
+    format_hermes_detection as _format_hermes_detection,
+)
+from hermes_feishu_card.config import load_config
+from hermes_feishu_card.instance_binding import configured_hermes_home, setup_hermes_home
+from hermes_feishu_card.delivery_policy import normalize_native_chats
+from hermes_feishu_card.bots import BotRegistry, RoutingContext
+from hermes_feishu_card.diagnostics import (
+    DiagnosticReport,
+    build_diagnostic_report,
+    build_route_diagnostics,
+    format_diagnostic_text,
+    safe_event_endpoint_for_output,
+)
+from hermes_feishu_card.events import SidecarEvent
+from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
+from hermes_feishu_card.install.detect import (
+    HermesDetection,
+    detect_fixed_tag_integration,
+    detect_hermes,
+)
+from hermes_feishu_card.install.envfile import (
+    read_hfc_env,
+    render_hfc_env,
+    update_hfc_env,
+)
+from hermes_feishu_card.install.manifest import (
+    BASE_INSTALL_MANIFEST_FIELDS,
+    CRON_INSTALL_MANIFEST_FIELDS,
+    CURRENT_INSTALL_MANIFEST_VERSION,
+    file_sha256,
+    validate_install_manifest,
+)
+from hermes_feishu_card.install.runtime_python import (
+    PMRuntimeRefused,
+    pm_managed_runtime_python as _pm_managed_runtime_python,
+)
+from hermes_feishu_card.install.plugin import (
+    RuntimeBindingRefused,
+    probe_plugin_entrypoint,
+    resolve_runtime_binding,
+)
+from hermes_feishu_card.install.v3 import (
+    FixedTagInstallRefused,
+    execute_fixed_tag_hybrid_install,
+    inspect_fixed_tag_hybrid_install,
+    is_fixed_tag_checkout,
+    restore_fixed_tag_hybrid_install,
+)
+from hermes_feishu_card.install.integrity import (
+    IntegrityRepairRefused,
+    build_integrity_provenance,
+    integrity_acknowledgement_eligible,
+    plan_integrity_repair,
+    render_integrity_manifest_migration,
+)
+from hermes_feishu_card.install.recovery import (
+    RecoveryFinding,
+    RecoveryPlan,
+    RecoveryRefused,
+    _first_refusal,
+    execute_recovery,
+    plan_recovery,
+)
+from hermes_feishu_card.install.patcher import (
+    apply_base_patch,
+    apply_patch,
+    apply_cron_patch,
+    remove_base_patch,
+    remove_patch,
+    remove_cron_patch,
+    remove_patch_lenient,
+)
+from hermes_feishu_card.integrity import (
+    build_runtime_integrity_fence_binding,
+    sanitize_integrity_snapshot,
+)
+from hermes_feishu_card.maintenance_process import (
+    inspect_runtime,
+    launch_job,
+    provision_runtime,
+)
+from hermes_feishu_card.maintenance_store import (
+    MaintenanceRefused,
+    load_job,
+    load_verified_artifact,
+    maintenance_paths,
+    sanitize_job_environment,
+    stage_job_credentials,
+    stage_wheel_artifact,
+)
+from hermes_feishu_card.runtime_control import (
+    acknowledge_runtime_integrity_review,
+    inspect_runtime_integrity_review,
+)
+from hermes_feishu_card.process import (
+    PIDFILE_NAME,
+    fetch_health,
+    start_sidecar,
+    status_sidecar,
+    stop_sidecar,
+)
+from hermes_feishu_card.persistent_service import (
+    disable_persistent_sidecar,
+    enable_persistent_sidecar,
+    persistent_sidecar_active,
+    persistent_sidecar_matches,
+    persistent_sidecar_setup_blocker,
+)
+from hermes_feishu_card.render import render_card
+from hermes_feishu_card.runtime_ownership import python_executable_identity
+from hermes_feishu_card.session import CardSession
+
+
+BACKUP_SUFFIX = ".hermes_feishu_card.bak"
+MANIFEST_NAME = ".hermes_feishu_card_manifest"
+# Legacy single-target installs retain the V2 writer until the verified
+# aggregate V3 transaction below owns all seven fixed-tag targets.
+INSTALL_MANIFEST_VERSION = 2
+_BASE_MANIFEST_FIELDS = BASE_INSTALL_MANIFEST_FIELDS
+_CRON_MANIFEST_FIELDS = CRON_INSTALL_MANIFEST_FIELDS
+DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
+PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+COMPOSE_HOST_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
+FEISHU_SDK_INSTALL_SPEC = "lark-oapi==1.6.8"
+FEISHU_SDK_REQUIRED_PARAMETER = "extra_ua_tags"
+RUNTIME_PROBE_TIMEOUT_SECONDS = 30
+OFFICIAL_INSTALLER_COMMAND = (
+    "bash <(curl -fsSL "
+    "https://raw.githubusercontent.com/baileyh8/"
+    "hermes-feishu-streaming-card/main/install.sh)"
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "doctor":
+        return _run_doctor(args)
+    if args.command == "card-config":
+        return _run_card_config(args)
+    if args.command == "setup":
+        return _run_setup(args)
+    if args.command == "start":
+        return _run_start(args)
+    if args.command == "stop":
+        return _run_stop(args)
+    if args.command == "status":
+        return _run_status(args)
+    if args.command == "enable":
+        return _run_enable(args)
+    if args.command == "disable":
+        return _run_disable(args)
+    if args.command == "smoke-feishu-card":
+        return _run_smoke_feishu_card(args)
+    if args.command == "bots":
+        return _run_bots(args)
+    if args.command == "integrity":
+        return _run_integrity(args)
+    if args.command == "chats":
+        return _run_chats(args)
+    if args.command == "maintenance":
+        return _run_maintenance(args)
+    if args.command == "install":
+        return _run_install(args)
+    if args.command == "repair":
+        return _run_repair(args)
+    if args.command == "restore":
+        return _run_restore(args)
+    if args.command == "uninstall":
+        return _run_uninstall(args)
+
+    parser.print_help()
+    if argv == []:
+        return 0
+    return 2
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="hermes-feishu-card")
+    subparsers = parser.add_subparsers(dest="command")
+
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--config", required=True)
+    doctor.add_argument("--hermes-dir")
+    doctor.add_argument("--hermes-home")
+    doctor.add_argument("--env-file")
+    doctor.add_argument("--skip-hermes", action="store_true")
+    doctor.add_argument("--profile-id")
+    doctor_output = doctor.add_mutually_exclusive_group()
+    doctor_output.add_argument("--json", action="store_true", dest="json_output")
+    doctor_output.add_argument("--explain", action="store_true")
+    doctor_output.add_argument("--support-report", action="store_true", help="preview a bounded report with private values removed; no upload")
+    doctor_output.add_argument("--export-report", metavar="NEW_FILE", help="preview and explicitly save a private support report to a new file; no upload")
+
+    card_config = subparsers.add_parser(
+        "card-config", help="explain effective reading options without changing configuration",
+    )
+    card_config.add_argument("--config", required=True)
+    card_config.add_argument("--profile-id")
+    card_config.add_argument("--bot-id")
+    card_config_output = card_config.add_mutually_exclusive_group()
+    card_config_output.add_argument("--json", action="store_true", dest="json_output")
+    card_config_output.add_argument("--minimal-yaml", action="store_true", help="print minimal reading settings for the selected scope; no file changes")
+    card_config.add_argument("--running", action="store_true", help="compare next-load values with the matching sidecar's loaded defaults; no restart")
+    card_config.add_argument("--preview-dir", help="write offline sample cards and an HTML comparison to a new directory")
+
+    setup = subparsers.add_parser(
+        "setup",
+        help="run the guided all-in-one installer for ordinary users",
+    )
+    setup.add_argument("--hermes-dir", required=True, help="Hermes Agent root directory")
+    setup.add_argument("--hermes-home")
+    setup.add_argument(
+        "--config",
+        default=str(Path.home() / ".hermes_feishu_card" / "config.yaml"),
+        help="sidecar config path to create or reuse",
+    )
+    setup.add_argument("--env-file")
+    setup.add_argument("--profile-id")
+    setup.add_argument("--event-url")
+    setup.add_argument(
+        "--skip-start",
+        action="store_true",
+        help="install the Hermes hook but do not start the sidecar",
+    )
+    setup.add_argument(
+        "--transient",
+        action="store_true",
+        help=(
+            "explicitly use the non-persistent sidecar instead of enabling the "
+            "owned systemd user service when available"
+        ),
+    )
+    setup.add_argument(
+        "--repair",
+        action="store_true",
+        help="repair known-safe Hermes hook install state before installing",
+    )
+    setup.add_argument(
+        "--no-repair",
+        action="store_true",
+        help="do not automatically repair known-safe Hermes hook install state",
+    )
+    setup.add_argument(
+        "--accept-hermes-upgrade",
+        action="store_true",
+        help=(
+            "accept a supported unpatched Hermes source replacement and clear "
+            "only verified stale HFC install state"
+        ),
+    )
+    setup.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm local Hermes hook installation",
+    )
+
+    for command in ("start", "stop", "status"):
+        process_parser = subparsers.add_parser(command)
+        process_parser.add_argument("--config", default="config.yaml.example")
+        process_parser.add_argument("--env-file")
+        if command in {"start", "status"}:
+            process_parser.add_argument("--hermes-dir")
+            process_parser.add_argument("--hermes-home")
+
+    enable = subparsers.add_parser(
+        "enable",
+        help="install and enable a persistent systemd user sidecar service",
+    )
+    enable.add_argument("--config", default="config.yaml.example")
+    enable.add_argument("--env-file")
+    enable.add_argument("--hermes-dir", required=True)
+    enable.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm persistent user-service installation",
+    )
+    subparsers.add_parser(
+        "disable",
+        help="disable and remove the owned persistent systemd user service",
+    )
+
+    smoke = subparsers.add_parser("smoke-feishu-card")
+    smoke.add_argument("--config", default="config.yaml.example")
+    smoke.add_argument("--chat-id", required=True)
+    smoke.add_argument("--profile-id")
+
+    bots = subparsers.add_parser("bots")
+    bot_subparsers = bots.add_subparsers(dest="bot_command")
+
+    bots_list = bot_subparsers.add_parser("list")
+    bots_list.add_argument("--config", required=True)
+
+    bots_add = bot_subparsers.add_parser("add")
+    bots_add.add_argument("bot_id")
+    bots_add.add_argument("--config", required=True)
+
+    bots_bind_chat = bot_subparsers.add_parser("bind-chat")
+    bots_bind_chat.add_argument("chat_id")
+    bots_bind_chat.add_argument("bot_id")
+    bots_bind_chat.add_argument("--config", required=True)
+
+    bots_unbind_chat = bot_subparsers.add_parser("unbind-chat")
+    bots_unbind_chat.add_argument("chat_id")
+    bots_unbind_chat.add_argument("--config", required=True)
+
+    bots_test = bot_subparsers.add_parser("test")
+    bots_test.add_argument("bot_id")
+    bots_test.add_argument("--chat-id", required=True)
+    bots_test.add_argument("--config", required=True)
+    bots_test.add_argument("--profile-id")
+
+    integrity = subparsers.add_parser(
+        "integrity",
+        help="inspect or explicitly migrate runtime integrity controls",
+    )
+    integrity_subparsers = integrity.add_subparsers(dest="integrity_command")
+    integrity_rebind = integrity_subparsers.add_parser("rebind-legacy")
+    integrity_rebind.add_argument("--hermes-dir", required=True)
+    integrity_rebind.add_argument("--hermes-home", required=True)
+    integrity_rebind.add_argument("--yes", action="store_true")
+    integrity_migrate = integrity_subparsers.add_parser("migrate-safe")
+    integrity_migrate.add_argument("--config", required=True)
+    integrity_migrate.add_argument("--hermes-dir", required=True)
+    integrity_migrate.add_argument("--env-file")
+    integrity_migrate.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm provenance migration and safe-mode activation",
+    )
+    integrity_acknowledge = integrity_subparsers.add_parser("acknowledge-review")
+    integrity_acknowledge.add_argument("--config", required=True)
+    integrity_acknowledge.add_argument("--hermes-dir", required=True)
+    integrity_acknowledge.add_argument(
+        "--env-file",
+        help=(
+            "configuration loading only; the state directory must be provided "
+            "with --state-dir"
+        ),
+    )
+    integrity_acknowledge.add_argument(
+        "--state-dir",
+        required=True,
+        help=(
+            "explicit sidecar state directory; this is never inferred from "
+            "--env-file"
+        ),
+    )
+    integrity_acknowledge.add_argument(
+        "--rebind-target",
+        metavar="OLD_TARGET_SHA256",
+        help="explicitly bind an orphaned fence to this verified installation; requires the exact old target_identity",
+    )
+    integrity_acknowledge.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm clearing only the verified manual-review fence",
+    )
+
+    chats = subparsers.add_parser("chats")
+    chat_subparsers = chats.add_subparsers(dest="chat_command")
+    for chat_command in ("use-native", "use-card"):
+        command_parser = chat_subparsers.add_parser(chat_command)
+        command_parser.add_argument("chat_id")
+        command_parser.add_argument("--config", required=True)
+        command_parser.add_argument("--profile-id")
+    chats_list = chat_subparsers.add_parser("list")
+    chats_list.add_argument("--config", required=True)
+
+    maintenance = subparsers.add_parser(
+        "maintenance",
+        help="provision or inspect the independent Hermes update runtime",
+    )
+    maintenance_subparsers = maintenance.add_subparsers(dest="maintenance_command")
+    maintenance_provision = maintenance_subparsers.add_parser("provision")
+    maintenance_provision.add_argument("--hermes-dir", required=True)
+    maintenance_provision.add_argument("--hermes-home")
+    maintenance_provision.add_argument("--wheel", required=True)
+    maintenance_provision.add_argument("--root")
+    maintenance_status = maintenance_subparsers.add_parser("status")
+    maintenance_status.add_argument(
+        "--hermes-dir",
+        default=str(Path.home() / ".hermes" / "hermes-agent"),
+    )
+    maintenance_status.add_argument("--root")
+    maintenance_status.add_argument("--hermes-home")
+    for command in ("run", "resume"):
+        maintenance_run = maintenance_subparsers.add_parser(command)
+        maintenance_run.add_argument("--job", required=True)
+    chats_list.add_argument("--profile-id")
+
+    for command in ("install", "repair", "restore", "uninstall"):
+        command_parser = subparsers.add_parser(command)
+        command_parser.add_argument("--hermes-dir", required=True)
+        command_parser.add_argument("--hermes-home")
+        command_parser.add_argument("--yes", action="store_true", required=True)
+        if command == "install":
+            command_parser.add_argument("--no-repair", action="store_true")
+        if command in {"install", "repair"}:
+            command_parser.add_argument(
+                "--accept-hermes-upgrade",
+                action="store_true",
+                help=(
+                    "accept a supported unpatched Hermes source replacement "
+                    "and clear only verified stale HFC install state"
+                ),
+            )
+    return parser
+
+
+def _run_setup(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser()
+    try:
+        route_settings = _resolve_route_settings(args, config_path)
+        created = _ensure_setup_config(config_path)
+        selected_env_path = route_settings["env_path"]
+        config = (
+            load_config(config_path, env_file=selected_env_path)
+            if selected_env_path != config_path.parent / ".env"
+            else load_config(config_path)
+        )
+        setup_home = setup_hermes_home(
+            Path(args.hermes_dir), config, getattr(args, "hermes_home", None),
+        )
+        if setup_home is not None:
+            config.setdefault("service", {})["hermes_home"] = str(setup_home)
+        profiles = config.get("profiles")
+        if (profiles and getattr(args, "profile_id", None) is None
+                and route_settings["profile_id"] == "default" and "default" not in profiles):
+            # This selection validates setup only; events retain their own identity.
+            route_settings["profile_id"] = next(iter(profiles))
+            route_settings["profile_source"] = "config"
+        update_hfc_env(
+            route_settings["env_path"],
+            {
+                "HERMES_FEISHU_CARD_PROFILE_ID": (
+                    "" if profiles and route_settings["profile_source"] in {"config", "fallback_default"}
+                    else route_settings["profile_id"]
+                ),
+                "HERMES_FEISHU_CARD_EVENT_URL": route_settings["event_url"],
+                "HERMES_DIR": str(Path(args.hermes_dir).expanduser()),
+                **({"HERMES_FEISHU_CARD_HERMES_HOME": str(setup_home)} if setup_home is not None else {}),
+            },
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"config: {'created' if created else 'existing'} {config_path}")
+    if profiles:
+        print("routing: shared sidecar; runtime profile comes from each Hermes event")
+    detection = detect_hermes(args.hermes_dir)
+    diagnostic_args = argparse.Namespace(
+        hermes_dir=args.hermes_dir,
+        skip_hermes=False,
+        _profile_id=route_settings["profile_id"],
+        _profile_source=route_settings["profile_source"],
+        _event_url=route_settings["event_url"],
+    )
+    report = _build_doctor_report(config_path, config, diagnostic_args)
+    if isinstance(report, DiagnosticReport):
+        print(_format_route_chain(report))
+
+    profile_id = route_settings["profile_id"]
+    if not _profile_exists(config, profile_id):
+        print(
+            "error: profile_unknown: selected profile is not present in config",
+            file=sys.stderr,
+        )
+        return 1
+    if not _has_feishu_credentials(config, profile_id):
+        print(
+            (
+                "error: profile_credentials_missing: Feishu credentials are required before setup installs "
+                "the Hermes hook. Set FEISHU_APP_ID and FEISHU_APP_SECRET, or "
+                f"fill feishu.app_id and feishu.app_secret in {config_path}."
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+    try:
+        verified_hermes_root = _verified_explicit_hermes_root(
+            args.hermes_dir,
+            detection=detection,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("doctor: ok")
+    print(_format_hermes_detection(detection))
+    _print_hermes_streaming_guidance(Path(args.hermes_dir), **({"hermes_home": setup_home} if setup_home is not None else {}))
+
+    if args.repair and not args.no_repair and not getattr(detection, "decomposed", False):
+        repair_code = _run_repair(
+            argparse.Namespace(
+                hermes_dir=args.hermes_dir,
+                hermes_home=setup_home,
+                yes=True,
+                accept_hermes_upgrade=args.accept_hermes_upgrade,
+            )
+        )
+        if repair_code != 0:
+            return repair_code
+
+    install_code = _run_install(
+        argparse.Namespace(
+            hermes_dir=args.hermes_dir,
+            hermes_home=setup_home,
+            yes=True,
+            no_repair=args.no_repair,
+            accept_hermes_upgrade=args.accept_hermes_upgrade,
+        )
+    )
+    if install_code != 0:
+        return install_code
+
+    if setup_home is not None and setup_home != verified_hermes_root.resolve().parent:
+        print("maintenance: split HOME requires coordinated terminal updates")
+    else:
+        _provision_setup_maintenance(Path(args.hermes_dir).expanduser())
+
+    try:
+        runtime_python, runtime_identity = _resolve_sidecar_runtime_identity(
+            verified_hermes_root, config
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.skip_start:
+        print("start: skipped")
+        print("setup ok")
+        return 0
+
+    default_env_path = config_path.parent / ".env"
+    start_kwargs: dict[str, Any] = {
+        "hermes_dir": verified_hermes_root,
+        "python_executable": runtime_python,
+        "expected_package_version": PACKAGE_VERSION,
+        "expected_python_identity": runtime_identity,
+    }
+    persistent_kwargs: dict[str, Any] = {
+        "config_path": config_path,
+        "config": config,
+        "env_file": None,
+        **start_kwargs,
+    }
+    if route_settings["env_path"] != default_env_path:
+        start_kwargs["env_file"] = route_settings["env_path"]
+        persistent_kwargs["env_file"] = route_settings["env_path"]
+
+    explicit_transient = bool(getattr(args, "transient", False))
+    persistence_blocker = (
+        "explicit transient mode requested"
+        if explicit_transient
+        else persistent_sidecar_setup_blocker(config)
+    )
+    if not persistence_blocker:
+        try:
+            if persistent_sidecar_matches(**persistent_kwargs):
+                enable_result = "already enabled"
+            else:
+                stop_result = stop_sidecar(config)
+                if stop_result.startswith("failed:"):
+                    print(
+                        "error: existing sidecar could not be stopped safely before "
+                        f"persistent enable: {stop_result}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                enable_result = enable_persistent_sidecar(**persistent_kwargs)
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if enable_result.startswith("failed:"):
+            print(f"error: {enable_result}", file=sys.stderr)
+            return 1
+        if enable_result == "already enabled":
+            print("enable: already enabled")
+        else:
+            print("enable ok")
+        print("persistence: enabled")
+    else:
+        if not explicit_transient:
+            enable_command = [
+                "hermes-feishu-card",
+                "enable",
+                "--config",
+                str(config_path),
+                "--hermes-dir",
+                str(verified_hermes_root),
+                "--yes",
+            ]
+            if route_settings["env_path"] != default_env_path:
+                enable_command.extend(
+                    ["--env-file", str(route_settings["env_path"])]
+                )
+            print(
+                "warning: persistent sidecar unavailable: " + persistence_blocker,
+                file=sys.stderr,
+            )
+            print(
+                "warning: using a transient sidecar; it will not survive a host "
+                "reboot",
+                file=sys.stderr,
+            )
+            if sys.platform == "darwin":
+                print(
+                    "note: on macOS this project does not manage autostart; "
+                    "for startup at user login, use your own launchd LaunchAgent "
+                    "with RunAtLoad=true to run `hermes-feishu-card start` once "
+                    "with the same config/env paths; do not set KeepAlive=true "
+                    "because start detaches the sidecar and exits "
+                    "(see docs/installer-safety.md)",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "next: satisfy the persistence requirement, then run "
+                    + shlex.join(enable_command),
+                    file=sys.stderr,
+                )
+        try:
+            start_result = start_sidecar(config_path, config, **start_kwargs)
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if start_result.startswith("failed:"):
+            _print_sidecar_start_failure(start_result)
+            return 1
+        if start_result == "already running":
+            print("start: already running")
+        else:
+            print("start ok")
+        print(
+            "persistence: transient (explicit)"
+            if explicit_transient
+            else "persistence: transient"
+        )
+
+    status = status_sidecar(config)
+    if not status["running"]:
+        print("error: sidecar did not report healthy status", file=sys.stderr)
+        return 1
+    print("status: running")
+    print(f"pid: {status['pid'] or 'unknown'}")
+    print(f"manager: {status.get('manager', 'unknown')}")
+    print("setup ok")
+    return 0
+
+
+def _run_maintenance(args: argparse.Namespace) -> int:
+    command = str(getattr(args, "maintenance_command", "") or "")
+    try:
+        if command == "provision":
+            paths = maintenance_paths(
+                Path(args.root).expanduser() if args.root else None
+            )
+            artifact = stage_wheel_artifact(
+                paths,
+                Path(args.wheel).expanduser(),
+                expected_version=PACKAGE_VERSION,
+                source_kind="cli_provision",
+            )
+            status = provision_runtime(
+                paths,
+                artifact,
+                hermes_root=Path(args.hermes_dir).expanduser(),
+            )
+            print(
+                "maintenance: "
+                + ("ready" if status.available else status.reason_code)
+            )
+            if status.available:
+                print(f"version: {status.package_version}")
+                print(f"python: {status.python_path}")
+                return 0
+            return 1
+        if command == "status":
+            paths = maintenance_paths(
+                Path(args.root).expanduser() if args.root else None
+            )
+            artifact = load_verified_artifact(
+                paths, expected_version=PACKAGE_VERSION
+            )
+            status = inspect_runtime(
+                paths,
+                artifact,
+                hermes_root=Path(args.hermes_dir).expanduser(),
+            )
+            print(
+                "maintenance: "
+                + ("ready" if status.available else status.reason_code)
+            )
+            print(f"version: {status.package_version or 'unavailable'}")
+            print(f"python: {status.python_path}")
+            return 0 if status.available else 1
+        if command in {"run", "resume"}:
+            job = load_job(Path(args.job).expanduser())
+            paths = maintenance_paths(job.path.parent.parent)
+            artifact = load_verified_artifact(
+                paths,
+                expected_version=job.artifact_version,
+            )
+            status = inspect_runtime(
+                paths,
+                artifact,
+                hermes_root=job.hermes_root,
+            )
+            if not status.available:
+                print(f"maintenance: unavailable ({status.reason_code})")
+                return 1
+            environment = sanitize_job_environment(os.environ)
+            if environment:
+                stage_job_credentials(
+                    paths,
+                    job_id=job.job_id,
+                    environment=environment,
+                )
+            launched = launch_job(status, job)
+            print(
+                "maintenance: "
+                + ("started" if launched.started else launched.reason_code)
+            )
+            print(f"manager: {launched.manager}")
+            return 0 if launched.started else 1
+    except (MaintenanceRefused, OSError, ValueError) as exc:
+        print(f"maintenance: unavailable ({exc})", file=sys.stderr)
+        return 1
+    print("maintenance command is required", file=sys.stderr)
+    return 2
+
+
+def _provision_setup_maintenance(hermes_root: Path) -> bool:
+    spec = _runtime_install_spec()
+    if not spec:
+        print("maintenance: unavailable (exact install spec missing)")
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="hfc-maintenance-wheel-") as temp:
+            destination = Path(temp)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    "--wheel-dir",
+                    str(destination),
+                    spec,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            wheels = sorted(destination.glob("*.whl"))
+            if completed.returncode != 0 or len(wheels) != 1:
+                print("maintenance: unavailable (wheel preparation failed)")
+                return False
+            paths = maintenance_paths()
+            artifact = stage_wheel_artifact(
+                paths,
+                wheels[0],
+                expected_version=PACKAGE_VERSION,
+                source_kind="setup_install_spec",
+            )
+            status = provision_runtime(
+                paths,
+                artifact,
+                hermes_root=hermes_root,
+            )
+            if not status.available:
+                print(f"maintenance: unavailable ({status.reason_code})")
+                return False
+            print("maintenance: ready")
+            return True
+    except (MaintenanceRefused, OSError, subprocess.SubprocessError, ValueError):
+        print("maintenance: unavailable (provisioning failed)")
+        return False
+
+
+def _has_feishu_credentials(
+    config: dict[str, Any], profile_id: str = ""
+) -> bool:
+    selected = _profile_config(config, profile_id)
+    feishu = selected.get("feishu", {})
+    if not isinstance(feishu, dict):
+        return False
+    app_id = feishu.get("app_id", "")
+    app_secret = feishu.get("app_secret", "")
+    return bool(str(app_id).strip() and str(app_secret).strip())
+
+
+def _ensure_setup_config(config_path: Path) -> bool:
+    if config_path.exists():
+        return False
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    posix_transaction._atomic_write_text(config_path, _default_setup_config_text())
+    return True
+
+
+def _default_setup_config_text() -> str:
+    return """# Hermes Feishu Streaming Card V3.2 configuration
+# Prefer FEISHU_APP_ID and FEISHU_APP_SECRET environment variables in real deployments.
+
+server:
+  host: 127.0.0.1
+  port: 8765
+
+# New installations verify that the patched Hermes runtime stays active.
+# Existing configs without this section remain notification-only after upgrade.
+integrity:
+  mode: safe
+
+service:
+  manager: auto
+
+feishu:
+  app_id: ""
+  app_secret: ""
+  base_url: https://open.feishu.cn/open-apis
+  timeout_seconds: 30
+
+# V3.2 Multi-bot configuration.
+# For single-bot setups, leave `bots.items` empty and use `feishu.app_id`/`feishu.app_secret`.
+# For multi-bot, define each bot under `bots.items` and map chat IDs in `bindings.chats`.
+bots:
+  default: default
+  items: {}
+
+bindings:
+  fallback_bot: default
+  chats: {}
+  group_rules:
+    enabled: false  # V3.2 does not filter group triggers
+
+card:
+  title: Hermes Agent
+  max_wait_ms: 800
+  max_chars: 240
+  # Optional roles: body, reasoning, tool, notice, footer.
+  # card width/height are controlled by the Feishu/Lark client.
+  # text_sizes:
+  #   body: normal
+  #   footer:
+  #     default: x-small
+  #     pc: x-small
+  #     mobile: notation
+  footer_fields:
+    - duration
+    - model
+    - input_tokens
+    - output_tokens
+    - context
+"""
+
+
+def _run_card_config(args: argparse.Namespace) -> int:
+    from .reading import explain_reading_config
+
+    if getattr(args, "minimal_yaml", False) and getattr(args, "running", False):
+        print("Use --running separately; --minimal-yaml describes the selected YAML scope.", file=sys.stderr)
+        return 2
+    try:
+        path = Path(args.config).expanduser()
+        # Validate using the runtime loader; read raw scopes to distinguish
+        # explicit YAML values from the defaults injected by that loader.
+        config = load_config(path)
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, yaml.YAMLError):
+        print("Unable to read valid card configuration.", file=sys.stderr)
+        return 2
+    try:
+        report = explain_reading_config(
+            raw, profile_id=args.profile_id, bot_id=args.bot_id, include_scope=True,
+        )
+    except ValueError as exc:
+        # Selection errors contain fixed messages, never YAML values.
+        print(str(exc), file=sys.stderr)
+        return 2
+    scope = report.pop("_selected_scope")
+    if getattr(args, "running", False):
+        from .config_snapshot import compare_reading_values
+        from .process import fetch_loaded_card_config
+
+        running = fetch_loaded_card_config(path, config, **scope)
+        report["running_config"] = running["status"]
+        report["running"] = running
+        if running["status"] == "verified":
+            report["differences"] = compare_reading_values(report["values"], running["values"])
+            report["note"] = "Read-only. Running values are verified loaded defaults for new turns. Existing cards and per-event overrides are excluded. Restart the sidecar to apply YAML changes."
+        else:
+            report["note"] = "Read-only. The running configuration could not be verified; only next-load values are shown. No restart or configuration change was performed."
+    if args.preview_dir:
+        from .preview import write_preview
+        try:
+            write_preview(Path(args.preview_dir).expanduser(), report)
+        except FileExistsError:
+            print("Preview files already exist; choose a new preview directory.", file=sys.stderr)
+            return 2
+        except (OSError, ValueError):
+            print("Unable to create a safe offline preview.", file=sys.stderr)
+            return 2
+        report["preview"] = {"files": ["index.html", "cards.json"], "mode": "offline_samples", "sends_messages": False}
+    if getattr(args, "minimal_yaml", False):
+        from .config_snapshot import minimal_reading_config
+        try:
+            scope_kind, snippet = minimal_reading_config(
+                raw, profile_id=args.profile_id, bot_id=args.bot_id,
+            )
+        except (KeyError, TypeError, ValueError):
+            print("Unable to create a safe reading configuration snippet.", file=sys.stderr)
+            return 2
+        print(f"# Replace reading fields in the selected {scope_kind} card block.")
+        print("# Keep other fields and parent scopes unchanged. No files were edited.")
+        print(yaml.safe_dump(snippet, allow_unicode=True, sort_keys=False).rstrip())
+    elif args.json_output:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        for key, value in report["values"].items():
+            print(f"{key}: {json.dumps(value, ensure_ascii=False)}  [{report['sources'][key]}]")
+        print(report["note"])
+        if "running" in report:
+            print(f"running_config: {report['running_config']}")
+            if report["running_config"] == "verified":
+                for change in report["differences"]:
+                    print(f"{change['field']}: loaded={json.dumps(change['loaded'], ensure_ascii=False)} next_load={json.dumps(change['next_load'], ensure_ascii=False)}")
+                if not report["differences"]:
+                    print("No differences in the selected reading options.")
+            else:
+                print(f"reason: {report['running']['reason']}")
+        if args.preview_dir:
+            print("Preview created: index.html and cards.json. Sample data only; no messages sent.")
+    return 0
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser()
+    support_report = bool(getattr(args, "support_report", False) or getattr(args, "export_report", None))
+    try:
+        route_settings = _resolve_route_settings(args, config_path)
+        args._profile_id = route_settings["profile_id"]
+        args._profile_source = route_settings["profile_source"]
+        args._event_url = route_settings["event_url"]
+        config = load_config(config_path, env_file=route_settings["env_path"])
+        if args.hermes_dir and args.hermes_home is not None:
+            selected_home = setup_hermes_home(Path(args.hermes_dir), config, args.hermes_home)
+            config.setdefault("service", {})["hermes_home"] = str(selected_home)
+    except Exception as exc:
+        if support_report:
+            return _output_support_report(_doctor_error_report(config_path, exc), args)
+        if args.json_output:
+            print(
+                json.dumps(
+                    _doctor_json_output_payload(_doctor_error_report(config_path, exc)),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        if args.explain:
+            print(_format_doctor_explanation(_doctor_error_report(config_path, exc)))
+            return 1
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if support_report:
+        report = _build_doctor_report(config_path, config, args)
+        payload = report.to_dict() if isinstance(report, DiagnosticReport) else report
+        return _output_support_report(payload, args)
+
+    if args.json_output or args.explain:
+        report = _build_doctor_report(config_path, config, args)
+        payload = report.to_dict() if isinstance(report, DiagnosticReport) else report
+        if args.json_output:
+            print(
+                json.dumps(
+                    _doctor_json_output_payload(payload),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            if isinstance(report, DiagnosticReport):
+                print(
+                    f"{format_diagnostic_text(report, explain=True)}\n\n"
+                    f"{_format_route_chain(report)}"
+                )
+            else:
+                explanation = _format_doctor_explanation(report)
+                if isinstance(report.get("routing"), dict):
+                    explanation = f"{explanation}\n\n{_format_route_chain(report)}"
+                print(explanation)
+        return _doctor_exit_code(payload)
+
+    host = config["server"]["host"]
+    port = config["server"]["port"]
+    print("doctor: ok")
+    print(f"sidecar: {host}:{port}")
+    if args.skip_hermes:
+        print("hermes: skipped")
+        return 0
+    if args.hermes_dir:
+        detection = detect_hermes(args.hermes_dir)
+        print(_format_hermes_detection(detection))
+        if detection.supported:
+            home_options = {}
+            try:
+                if (config.get("service") or {}).get("hermes_home") is not None:
+                    home_options["hermes_home"] = configured_hermes_home(detection.root, config)
+                    print("maintenance binding: explicit HOME; verify authenticated readiness after restart")
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            runtime_import = _doctor_runtime_import_report(detection, **home_options)
+            print(
+                "runtime_import: "
+                f"{runtime_import['status']} - {runtime_import.get('message', '')}"
+            )
+            feishu_sdk = _doctor_feishu_sdk_report(detection, **home_options)
+            print(
+                "feishu_sdk: "
+                f"{feishu_sdk['status']} - {feishu_sdk.get('message', '')}"
+            )
+            _print_hermes_streaming_guidance(Path(args.hermes_dir), **home_options)
+        return 0 if detection.supported else 1
+    print("hermes: not checked")
+    return 0
+
+
+def _output_support_report(payload: dict[str, Any], args: argparse.Namespace) -> int:
+    from .support_report import build_support_report, serialize_support_report, write_support_report
+
+    try:
+        print(serialize_support_report(build_support_report(payload)), end="", flush=True)
+        destination = getattr(args, "export_report", None)
+        if destination:
+            write_support_report(Path(destination).expanduser(), payload)
+            print("Support report saved locally. Nothing was uploaded.", file=sys.stderr)
+    except FileExistsError:
+        print("Report file already exists; choose a new file.", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
+        print("Unable to create a bounded support report; no existing file was replaced.", file=sys.stderr)
+        return 2
+    return _doctor_exit_code(payload)
+
+
+def _doctor_json_output_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    output = _redact_doctor_json_paths(payload)
+    routing = output.get("routing")
+    if not isinstance(routing, dict):
+        return output
+    output_routing = dict(routing)
+    endpoint = output_routing.get("event_endpoint")
+    if isinstance(endpoint, str):
+        output_routing["event_endpoint"] = safe_event_endpoint_for_output(endpoint)
+    output["routing"] = output_routing
+    return output
+
+
+_DOCTOR_JSON_PATH_KEYS = frozenset(
+    {
+        "backup_path",
+        "config_path",
+        "cron_backup_path",
+        "cron_py",
+        "base_backup_path",
+        "base_py",
+        "manifest_path",
+        "path",
+        "python",
+        "root",
+        "run_py",
+        "suggested_root",
+    }
+)
+
+
+def _redact_doctor_json_paths(value: Any, key: str = "") -> Any:
+    if key in _DOCTOR_JSON_PATH_KEYS and isinstance(value, str):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {
+            child_key: _redact_doctor_json_paths(child_value, str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_doctor_json_paths(item) for item in value]
+    if isinstance(value, str):
+        return _redact_absolute_paths_in_text(value)
+    return value
+
+
+_DOCTOR_JSON_ABSOLUTE_PATH_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:"
+    r"/[^\s\"'<>/\\]+/"
+    r"|[A-Za-z]:\\"
+    r"|\\\\[^\s\"'<>/\\]+\\[^\s\"'<>/\\]+"
+    r")"
+)
+
+
+def _redact_absolute_paths_in_text(value: str) -> str:
+    if not _DOCTOR_JSON_ABSOLUTE_PATH_PREFIX_RE.search(value):
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"[redacted-path-text:{digest}]"
+
+
+def _doctor_error_report(config_path: Path, exc: Exception) -> dict[str, Any]:
+    return {
+        "schema_version": "1",
+        "status": "error",
+        "config": {
+            "path": str(config_path),
+            "loaded": False,
+            "error": str(exc),
+        },
+        "sidecar": {"address": None},
+        "hermes": {"checked": False, "status": "not_checked"},
+        "streaming": {
+            "status": "not_checked",
+            "message": "Hermes streaming was not checked because config loading failed.",
+        },
+        "install_state": {
+            "checked": False,
+            "status": "skipped",
+            "message": "Install state was not checked because config loading failed.",
+        },
+        "runtime_import": {
+            "checked": False,
+            "status": "skipped",
+            "message": "Hermes runtime import was not checked because config loading failed.",
+        },
+        "feishu_sdk": {
+            "checked": False,
+            "status": "skipped",
+            "message": "Hermes Feishu SDK was not checked because config loading failed.",
+        },
+        "recommendations": [
+            {
+                "severity": "error",
+                "code": "config_load_failed",
+                "message": f"Config could not be loaded: {exc}",
+                "next_step": "Fix the sidecar config file and rerun doctor.",
+            }
+        ],
+    }
+
+
+def _build_doctor_report(
+    config_path: Path,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any] | DiagnosticReport:
+    server = config["server"]
+    host = str(server["host"])
+    port = int(server["port"])
+    recommendations: list[dict[str, str]] = []
+    report: dict[str, Any] = {
+        "schema_version": "1",
+        "status": "ok",
+        "config": {
+            "path": str(config_path),
+            "loaded": True,
+            "server": {"host": host, "port": port},
+            "feishu_credentials": (
+                "configured"
+                if _has_feishu_credentials(config, getattr(args, "_profile_id", ""))
+                else "missing"
+            ),
+            "profiles_enabled": _doctor_profile_count(config) > 0,
+            "profile_count": _doctor_profile_count(config),
+        },
+        "sidecar": {"address": f"{host}:{port}"},
+        "hermes": {"checked": False, "status": "not_checked"},
+        "streaming": {
+            "status": "not_checked",
+            "message": "Hermes streaming config was not checked.",
+        },
+        "install_state": {
+            "checked": False,
+            "status": "skipped",
+            "message": "Install state was not checked.",
+        },
+        "runtime_import": {
+            "checked": False,
+            "status": "not_checked",
+            "message": "Hermes runtime import was not checked.",
+        },
+        "feishu_sdk": {
+            "checked": False,
+            "status": "not_checked",
+            "message": "Hermes Feishu SDK was not checked.",
+        },
+        "recommendations": recommendations,
+    }
+
+    if args.skip_hermes:
+        report["hermes"] = {"checked": False, "status": "skipped"}
+        report["streaming"] = {
+            "status": "skipped",
+            "message": "Hermes streaming config was skipped by request.",
+        }
+        report["install_state"] = {
+            "checked": False,
+            "status": "skipped",
+            "message": "Install state was skipped by request.",
+        }
+        report["runtime_import"] = {
+            "checked": False,
+            "status": "skipped",
+            "message": "Hermes runtime import was skipped by request.",
+        }
+        report["feishu_sdk"] = {
+            "checked": False,
+            "status": "skipped",
+            "message": "Hermes Feishu SDK was skipped by request.",
+        }
+        recommendations.append(
+            {
+                "severity": "info",
+                "code": "hermes_check_skipped",
+                "message": "Hermes detection was skipped.",
+                "next_step": "Run doctor with --hermes-dir to check hook compatibility.",
+            }
+        )
+        return _finalize_doctor_report(_attach_route_diagnostics(report, config, args))
+
+    if not args.hermes_dir:
+        recommendations.append(
+            {
+                "severity": "info",
+                "code": "hermes_not_checked",
+                "message": "Hermes detection was not checked.",
+                "next_step": "Run doctor with --hermes-dir PATH to check hook compatibility.",
+            }
+        )
+        return _finalize_doctor_report(_attach_route_diagnostics(report, config, args))
+
+    detection = detect_hermes(args.hermes_dir)
+    report["hermes"] = _doctor_hermes_report(detection)
+    if not detection.supported:
+        next_step = "Use a supported Hermes install before running install or setup."
+        if detection.suggested_root is not None:
+            next_step = (
+                f"Use --hermes-dir {detection.suggested_root} "
+                "and rerun doctor or install."
+            )
+        report["streaming"] = {
+            "status": "skipped",
+            "message": "Hermes streaming config was skipped because Hermes is unsupported.",
+        }
+        report["install_state"] = {
+            "checked": False,
+            "status": "skipped",
+            "message": "Install state was skipped because Hermes is unsupported.",
+        }
+        report["runtime_import"] = {
+            "checked": False,
+            "status": "skipped",
+            "message": "Hermes runtime import was skipped because Hermes is unsupported.",
+        }
+        report["feishu_sdk"] = {
+            "checked": False,
+            "status": "skipped",
+            "message": "Hermes Feishu SDK was skipped because Hermes is unsupported.",
+        }
+        recommendations.append(
+            {
+                "severity": "error",
+                "code": "hermes_unsupported",
+                "message": f"Hermes is unsupported: {detection.reason}",
+                "next_step": next_step,
+            }
+        )
+        return _finalize_doctor_report(report)
+
+    if detection.compatibility != "full":
+        status_callback_missing = detection.capabilities.get("status_callback") is False
+        recommendations.append(
+            {
+                "severity": "warning",
+                "code": "hermes_compatibility_partial",
+                "message": (
+                    "Hermes is supported, but optional compatibility anchors are missing."
+                ),
+                "next_step": (
+                    "Review anchors.status_callback before relying on "
+                    "context-compaction visibility."
+                    if status_callback_missing
+                    else "Review the anchors section if streaming, cron, reply, or "
+                    "attachment features do not behave as expected."
+                ),
+            }
+        )
+
+    home_options = {}
+    try:
+        if (config.get("service") or {}).get("hermes_home") is not None:
+            home_options["hermes_home"] = configured_hermes_home(detection.root, config)
+    except (ValueError, OSError):
+        report["maintenance_binding"] = {"status": "invalid", "runtime_verified": False}
+        recommendations.append({"severity": "error", "code": "hermes_home_binding_invalid",
+            "message": "The configured Hermes HOME cannot be verified.",
+            "next_step": "Set service.hermes_home to the absolute process HOME containing config.yaml."})
+        return _finalize_doctor_report(report)
+
+    runtime_import = _doctor_runtime_import_report(detection, **home_options)
+    report["runtime_import"] = runtime_import
+    _append_runtime_import_recommendation(recommendations, runtime_import)
+    feishu_sdk = _doctor_feishu_sdk_report(detection, **home_options)
+    report["feishu_sdk"] = feishu_sdk
+
+    streaming = _doctor_streaming_report(Path(args.hermes_dir), **home_options)
+    report["streaming"] = streaming
+    if streaming["status"] == "disabled":
+        recommendations.append(
+            {
+                "severity": "warning",
+                "code": "streaming_disabled",
+                "message": streaming["message"],
+                "next_step": (
+                    "Set streaming.enabled: true with streaming.transport: edit, "
+                    "or set display.platforms.feishu.streaming: true."
+                ),
+            }
+        )
+    elif streaming["status"] == "not_detected":
+        recommendations.append(
+            {
+                "severity": "warning",
+                "code": "streaming_not_detected",
+                "message": streaming["message"],
+                "next_step": (
+                    "If cards miss answer.delta updates, add Hermes streaming "
+                    "config and rerun doctor."
+                ),
+            }
+        )
+
+    if _manifest_version_candidate(_manifest_path(detection.root)) == 3:
+        install_state, recovery_plan = _diagnose_v3_install_state(detection, args, **home_options)
+        integrity_plan = None
+    else:
+        install_state = _diagnose_install_state(detection)
+        recovery_plan = plan_recovery(detection)
+        try:
+            integrity_plan = plan_integrity_repair(detection)
+        except (IntegrityRepairRefused, OSError, RuntimeError, ValueError):
+            integrity_plan = None
+    from .install.legacy_observer import observer_status
+    install_state["legacy_observer"] = observer_status(detection.root)
+    profile_id = str(getattr(args, "_profile_id", "") or "")
+    route = _diagnostic_route(config, profile_id)
+    try:
+        sidecar_status = status_sidecar(config)
+    except (OSError, RuntimeError, ValueError):
+        sidecar_status = {}
+    live_health = sidecar_status.get("health")
+    health: dict[str, object] = (
+        dict(live_health) if isinstance(live_health, dict) else {}
+    )
+    health.update({
+        "streaming": streaming,
+        "runtime_import": runtime_import,
+        "feishu_sdk": feishu_sdk,
+        "install_state": install_state,
+    })
+    if route is not None:
+        health["routing"] = {"last_route": route}
+    return build_diagnostic_report(
+        config_path,
+        config,
+        detection,
+        recovery_plan,
+        integrity_plan=integrity_plan,
+        health=health,
+        profile_id=profile_id,
+        profile_source=str(getattr(args, "_profile_source", "") or ""),
+        event_url=str(getattr(args, "_event_url", "") or ""),
+    )
+
+
+def _resolve_route_settings(
+    args: argparse.Namespace, config_path: Path
+) -> dict[str, Any]:
+    explicit_env_path = getattr(args, "env_file", None)
+    raw_env_path = explicit_env_path or os.environ.get("HFC_ENV_FILE")
+    env_path = (
+        Path(raw_env_path).expanduser()
+        if raw_env_path
+        else config_path.parent / ".env"
+    )
+    env_values = read_hfc_env(env_path)
+    profile_id, profile_source = _resolve_route_value(
+        getattr(args, "profile_id", None),
+        "HERMES_FEISHU_CARD_PROFILE_ID",
+        env_values,
+        "default",
+        "fallback_default",
+    )
+    event_url, event_source = _resolve_route_value(
+        getattr(args, "event_url", None),
+        "HERMES_FEISHU_CARD_EVENT_URL",
+        env_values,
+        DEFAULT_EVENT_URL,
+        "default",
+    )
+    profile_id = _validate_profile_id(profile_id)
+    event_url = _validate_event_url(event_url)
+    return {
+        "env_path": env_path,
+        "profile_id": profile_id,
+        "profile_source": profile_source,
+        "event_url": event_url,
+        "event_source": event_source,
+    }
+
+
+def _resolve_route_value(
+    explicit: str | None,
+    env_key: str,
+    env_values: dict[str, str],
+    default: str,
+    default_source: str,
+) -> tuple[str, str]:
+    if explicit is not None:
+        return str(explicit), "argument"
+    process_value = os.environ.get(env_key)
+    if process_value is not None and process_value.strip():
+        return process_value, "env"
+    file_value = env_values.get(env_key)
+    if file_value is not None and file_value.strip():
+        return file_value, "env_file"
+    return default, default_source
+
+
+def _validate_profile_id(value: str) -> str:
+    profile_id = str(value).strip()
+    if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+        raise ValueError("invalid profile id; use 1-64 letters, digits, '.', '_', or '-'")
+    return profile_id
+
+
+def _validate_event_url(value: str) -> str:
+    text = str(value).strip()
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid event URL") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.endswith("/events")
+        or not _allowed_event_host(parsed.hostname)
+    ):
+        raise ValueError("invalid event URL")
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme.lower(), netloc, parsed.path, "", ""))
+
+
+def _allowed_event_host(hostname: str) -> bool:
+    host = hostname.strip().lower()
+    if host in {"localhost", "host.docker.internal"}:
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return bool(COMPOSE_HOST_PATTERN.fullmatch(host))
+
+
+def _profile_exists(config: dict[str, Any], profile_id: str) -> bool:
+    profiles = config.get("profiles")
+    if isinstance(profiles, dict) and profiles:
+        return profile_id in profiles
+    return profile_id == "default"
+
+
+def _profile_config(config: dict[str, Any], profile_id: str) -> dict[str, Any]:
+    profiles = config.get("profiles")
+    if isinstance(profiles, dict) and profiles:
+        profile = profiles.get(profile_id)
+        if not isinstance(profile, dict):
+            return {}
+        selected = dict(config)
+        selected.update(profile)
+        selected["profiles"] = {}
+        return selected
+    return config
+
+
+def _diagnostic_route(
+    config: dict[str, Any], profile_id: str
+) -> dict[str, object] | None:
+    if not _profile_exists(config, profile_id):
+        return None
+    try:
+        registry = BotRegistry.from_config(_profile_config(config, profile_id))
+        route = registry.resolve(RoutingContext(chat_id="", profile_id=profile_id))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"bot_id": route.bot_id, "reason": route.reason}
+
+
+def _attach_route_diagnostics(
+    report: dict[str, Any], config: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    if getattr(args, "profile_id", None) is None:
+        return report
+    profile_id = str(getattr(args, "_profile_id", "") or "")
+    routing, findings = build_route_diagnostics(
+        config,
+        profile_id=profile_id,
+        profile_source=str(getattr(args, "_profile_source", "") or ""),
+        event_url=str(getattr(args, "_event_url", "") or ""),
+        route=_diagnostic_route(config, profile_id),
+    )
+    report["routing"] = routing
+    recommendations = report.setdefault("recommendations", [])
+    recommendations.extend(
+        {
+            "severity": finding.severity,
+            "code": finding.code,
+            "message": finding.message,
+            "next_step": finding.actions[0] if finding.actions else "",
+        }
+        for finding in findings
+    )
+    return report
+
+
+def _doctor_profile_count(config: dict[str, Any]) -> int:
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict):
+        return 0
+    return len([key for key in profiles if str(key).strip()])
+
+
+def _doctor_hermes_report(detection: HermesDetection) -> dict[str, Any]:
+    return {
+        "checked": True,
+        "status": "supported" if detection.supported else "unsupported",
+        "root": str(detection.root),
+        "run_py": str(detection.run_py),
+        "run_py_exists": detection.run_py_exists,
+        "cron_py": str(detection.cron_py) if detection.cron_py is not None else None,
+        "cron_py_exists": detection.cron_py_exists,
+        "base_py": str(detection.base_py) if detection.base_py is not None else None,
+        "base_py_exists": detection.base_py_exists,
+        "base_required": detection.base_required,
+        "base_hook_strategy": detection.base_hook_strategy,
+        "exact_delivery_contract": _exact_delivery_contract_status(detection),
+        "version_source": detection.version_source,
+        "version": detection.version,
+        "minimum_supported_version": detection.minimum_version,
+        "hook_strategy": detection.hook_strategy,
+        "cron_hook_strategy": detection.cron_hook_strategy,
+        "compatibility": detection.compatibility,
+        "anchors": dict(detection.capabilities),
+        "anchor_locations": dict(detection.capability_locations),
+        "reason": detection.reason,
+        "suggested_root": (
+            str(detection.suggested_root)
+            if detection.suggested_root is not None
+            else ""
+        ),
+        "suggestion_reason": detection.suggestion_reason,
+    }
+
+
+def _doctor_streaming_report(hermes_root: Path, *, hermes_home: Path | None = None) -> dict[str, str]:
+    config = _load_hermes_user_config(hermes_root, hermes_home=hermes_home)
+    status = _detect_hermes_streaming_status(config)
+    if status == "enabled":
+        message = "Hermes Gateway streaming config appears enabled for Feishu."
+    elif status == "disabled":
+        message = (
+            "Hermes Gateway streaming appears disabled for Feishu."
+        )
+    else:
+        message = (
+            "Hermes Gateway streaming config was not detected."
+        )
+    return {"status": status, "message": message}
+
+
+def _doctor_runtime_import_report(detection: HermesDetection, *, hermes_home: Path | None = None) -> dict[str, Any]:
+    try:
+        runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+    except PMRuntimeRefused as exc:
+        return {"checked": True, "status": "failed", "message": str(exc)}
+    if runtime_python is None:
+        return {
+            "checked": False,
+            "status": "skipped",
+            "python": None,
+            "message": "Hermes runtime venv Python was not found.",
+        }
+    return _check_runtime_hook_import(runtime_python)
+
+
+def _doctor_feishu_sdk_report(detection: HermesDetection, *, hermes_home: Path | None = None) -> dict[str, Any]:
+    if not _hermes_requires_feishu_sdk_capability(detection.root):
+        return {
+            "checked": False,
+            "status": "not_required",
+            "version": None,
+            "supports_extra_ua_tags": None,
+            "message": (
+                "Hermes Feishu adapter does not require the extra_ua_tags SDK capability."
+            ),
+        }
+    try:
+        runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+    except PMRuntimeRefused as exc:
+        return {"checked": True, "status": "failed", "message": str(exc)}
+    if runtime_python is None:
+        return {
+            "checked": False,
+            "status": "skipped",
+            "version": None,
+            "supports_extra_ua_tags": None,
+            "message": "Hermes runtime venv Python was not found.",
+        }
+    return _check_runtime_feishu_sdk(runtime_python)
+
+
+def _hermes_requires_feishu_sdk_capability(hermes_root: Path | str) -> bool:
+    adapter = (
+        Path(hermes_root).expanduser()
+        / "plugins"
+        / "platforms"
+        / "feishu"
+        / "adapter.py"
+    )
+    try:
+        return FEISHU_SDK_REQUIRED_PARAMETER in adapter.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return False
+
+
+def _check_runtime_feishu_sdk(runtime_python: Path) -> dict[str, Any]:
+    code = (
+        "import inspect, json; "
+        "from importlib.metadata import version; "
+        "from lark_oapi.ws import Client; "
+        "print(json.dumps({"
+        "'version': version('lark-oapi'), "
+        "'supports_extra_ua_tags': "
+        "'extra_ua_tags' in inspect.signature(Client.__init__).parameters"
+        "}))"
+    )
+    cwd = _hermes_runtime_cwd(runtime_python)
+    try:
+        result = subprocess.run(
+            [str(runtime_python), "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=RUNTIME_PROBE_TIMEOUT_SECONDS,
+            cwd=str(cwd) if cwd is not None else None,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "checked": True,
+            "status": "failed",
+            "python": str(runtime_python),
+            "version": None,
+            "supports_extra_ua_tags": False,
+            "message": "Hermes Feishu SDK compatibility check timed out.",
+        }
+    except OSError as exc:
+        return {
+            "checked": True,
+            "status": "failed",
+            "python": str(runtime_python),
+            "version": None,
+            "supports_extra_ua_tags": False,
+            "message": (
+                "Hermes Feishu SDK compatibility check could not start: "
+                f"{exc.__class__.__name__}"
+            ),
+        }
+    if result.returncode != 0:
+        return {
+            "checked": True,
+            "status": "failed",
+            "python": str(runtime_python),
+            "version": None,
+            "supports_extra_ua_tags": False,
+            "message": (
+                "Hermes runtime cannot load a compatible lark-oapi SDK: "
+                f"{_summarize_process_output(result)}"
+            ),
+        }
+    try:
+        metadata = json.loads(result.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return {
+            "checked": True,
+            "status": "failed",
+            "python": str(runtime_python),
+            "version": None,
+            "supports_extra_ua_tags": False,
+            "message": "Hermes runtime returned invalid Feishu SDK metadata.",
+        }
+    version = str(metadata.get("version") or "").strip() or None
+    supported = metadata.get("supports_extra_ua_tags") is True
+    if supported:
+        return {
+            "checked": True,
+            "status": "ok",
+            "python": str(runtime_python),
+            "version": version,
+            "supports_extra_ua_tags": True,
+            "message": (
+                f"lark-oapi {version or 'unknown'} supports extra_ua_tags."
+            ),
+        }
+    return {
+        "checked": True,
+        "status": "failed",
+        "python": str(runtime_python),
+        "version": version,
+        "supports_extra_ua_tags": False,
+        "message": (
+            f"lark-oapi {version or 'unknown'} does not support extra_ua_tags."
+        ),
+    }
+
+
+def _append_runtime_import_recommendation(
+    recommendations: list[dict[str, str]],
+    runtime_import: dict[str, Any],
+) -> None:
+    if runtime_import.get("status") != "failed":
+        return
+    recommendations.append(
+        {
+            "severity": "warning",
+            "code": "runtime_import_failed",
+            "message": runtime_import.get("message", "Hermes runtime import failed."),
+            "next_step": (
+                "Run setup/install again so hermes-feishu-streaming-card is "
+                "installed into the Hermes Gateway venv Python."
+            ),
+        }
+    )
+
+
+def _detect_hermes_runtime_python(hermes_root: Path | str, *, hermes_home: Path | None = None) -> Path | None:
+    root = Path(hermes_root).expanduser()
+    pm_managed = (_pm_managed_runtime_python(root, hermes_home=hermes_home)
+                  if hermes_home is not None else _pm_managed_runtime_python(root))
+    if pm_managed is not None:
+        return pm_managed
+    candidates = (
+        root / "venv" / "bin" / "python",
+        root / "venv" / "bin" / "python3",
+        root / ".venv" / "bin" / "python",
+        root / ".venv" / "bin" / "python3",
+        root / "venv" / "Scripts" / "python.exe",
+        root / ".venv" / "Scripts" / "python.exe",
+        root / "gateway" / "venv" / "bin" / "python",
+        root / "gateway" / "venv" / "bin" / "python3",
+        root / "gateway" / ".venv" / "bin" / "python",
+        root / "gateway" / ".venv" / "bin" / "python3",
+        root / "gateway" / "venv" / "Scripts" / "python.exe",
+        root / "gateway" / ".venv" / "Scripts" / "python.exe",
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            try:
+                return candidate.parent.resolve(strict=True) / candidate.name
+            except (OSError, RuntimeError):
+                continue
+    return None
+
+
+def _resolve_start_runtime_identity(
+    hermes_root: Path | str | None = None,
+    *, hermes_home: Path | None = None,
+) -> tuple[Path, str]:
+    if hermes_root is None:
+        candidate = Path(sys.executable).expanduser()
+        try:
+            runtime_python = (
+                candidate.parent.resolve(strict=True) / candidate.name
+                if candidate.is_file()
+                else None
+            )
+        except (OSError, RuntimeError):
+            runtime_python = None
+    else:
+        runtime_python = _detect_hermes_runtime_python(hermes_root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+    if runtime_python is None:
+        raise ValueError(
+            "Sidecar runtime Python could not be verified. Rerun the official "
+            f"installer: {OFFICIAL_INSTALLER_COMMAND}"
+        )
+    report = _check_runtime_hook_import(runtime_python)
+    if report.get("status") != "ok" or report.get("version") != PACKAGE_VERSION:
+        raise ValueError(
+            "Sidecar runtime package does not match this CLI release. Rerun the "
+            f"official installer: {OFFICIAL_INSTALLER_COMMAND}"
+        )
+    if hermes_root is not None and not _runtime_report_uses_installed_package(
+        report, runtime_python
+    ):
+        raise ValueError(
+            "Hermes runtime package is not an isolated site-packages install. "
+            f"Rerun the official installer: {OFFICIAL_INSTALLER_COMMAND}"
+        )
+    return runtime_python, python_executable_identity(runtime_python)
+
+
+def _resolve_sidecar_runtime_identity(
+    hermes_root: Path | str | None, config: dict[str, Any],
+) -> tuple[Path, str]:
+    # Hooks still have to load in the selected Hermes environment. A separate
+    # delivery process must never turn into an escape from that installation gate.
+    home_options = {}
+    if hermes_root is not None and (config.get("service") or {}).get("hermes_home") is not None:
+        home_options["hermes_home"] = configured_hermes_home(Path(hermes_root), config)
+    default = _resolve_start_runtime_identity(hermes_root, **home_options)
+    selected = (config.get("service") or {}).get("python_executable")
+    if selected is None:
+        return default
+    if not isinstance(selected, str) or not selected.strip():
+        raise ValueError("service.python_executable must be an absolute Python path")
+    path = Path(selected).expanduser()
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError("Sidecar configured Python is missing or not absolute")
+    # Resolve the directory, not the executable symlink: different venvs can
+    # share the same base interpreter but must retain different identities.
+    path = path.parent.resolve(strict=True) / path.name
+    report = _check_runtime_hook_import(path)
+    if (report.get("status") != "ok"
+            or report.get("version") != PACKAGE_VERSION
+            or not _runtime_report_uses_installed_package(report, path)):
+        raise ValueError(
+            "Sidecar configured Python must contain this HFC release as an "
+            "ordinary site-packages install; repair that environment before start"
+        )
+    return path, python_executable_identity(path)
+
+
+def _verified_explicit_hermes_root(
+    hermes_root: Path | str,
+    *,
+    detection: HermesDetection | None = None,
+) -> Path:
+    verified = detection if detection is not None else detect_hermes(hermes_root)
+    if not verified.supported:
+        raise ValueError("Explicit Hermes root could not be verified")
+    try:
+        return Path(verified.root).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Explicit Hermes root could not be canonicalized") from exc
+
+
+def _runtime_report_uses_installed_package(
+    report: dict[str, Any], runtime_python: Path
+) -> bool:
+    raw_location = str(report.get("location") or "").strip()
+    raw_prefix = str(report.get("prefix") or "").strip()
+    raw_roots = {
+        str(report.get(name) or "").strip()
+        for name in ("purelib", "platlib")
+    }
+    if not raw_location or not raw_prefix:
+        return False
+    try:
+        location = Path(raw_location).resolve(strict=True)
+        prefix = Path(raw_prefix).resolve(strict=True)
+        expected_prefix = runtime_python.parent.parent.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if prefix != expected_prefix:
+        return False
+    for raw_root in raw_roots:
+        if not raw_root:
+            continue
+        try:
+            root = Path(raw_root).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        root_belongs_to_runtime = root == prefix or prefix in root.parents
+        if root_belongs_to_runtime and (location == root or root in location.parents):
+            return True
+    return False
+
+
+def _check_runtime_hook_import(runtime_python: Path) -> dict[str, Any]:
+    code = (
+        "import json, sys, sysconfig; "
+        "import hermes_feishu_card as package; "
+        "import hermes_feishu_card.hook_runtime; "
+        "print(json.dumps({"
+        "'version': getattr(package, '__version__', ''), "
+        "'location': getattr(package, '__file__', ''), "
+        "'prefix': sys.prefix, "
+        "'purelib': sysconfig.get_path('purelib') or '', "
+        "'platlib': sysconfig.get_path('platlib') or ''"
+        "}))"
+    )
+    cwd = _hermes_runtime_cwd(runtime_python)
+    try:
+        result = subprocess.run(
+            [str(runtime_python), "-I", "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=RUNTIME_PROBE_TIMEOUT_SECONDS,
+            cwd=str(cwd) if cwd is not None else None,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "checked": True,
+            "status": "failed",
+            "python": str(runtime_python),
+            "message": "Hermes runtime hook_runtime import timed out.",
+        }
+    except OSError as exc:
+        return {
+            "checked": True,
+            "status": "failed",
+            "python": str(runtime_python),
+            "message": (
+                "Hermes runtime hook_runtime import could not start: "
+                f"{exc.__class__.__name__}"
+            ),
+        }
+    if result.returncode == 0:
+        try:
+            metadata = json.loads(result.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            return {
+                "checked": True,
+                "status": "failed",
+                "python": str(runtime_python),
+                "message": "Hermes runtime returned invalid package metadata.",
+            }
+        version = str(metadata.get("version", "")).strip()
+        location = str(metadata.get("location", "")).strip()
+        prefix = str(metadata.get("prefix", "")).strip()
+        purelib = str(metadata.get("purelib", "")).strip()
+        platlib = str(metadata.get("platlib", "")).strip()
+        suffix = f" from {location}" if location else ""
+        return {
+            "checked": True,
+            "status": "ok",
+            "python": str(runtime_python),
+            "version": version,
+            "location": location,
+            "prefix": prefix,
+            "purelib": purelib,
+            "platlib": platlib,
+            "message": f"Hermes runtime can import hook_runtime{suffix}.",
+        }
+    detail = _summarize_process_output(result)
+    return {
+        "checked": True,
+        "status": "failed",
+        "python": str(runtime_python),
+        "message": f"Hermes runtime cannot import hook_runtime: {detail}",
+    }
+
+
+def _hermes_runtime_cwd(runtime_python: Path) -> Path | None:
+    try:
+        root = runtime_python.resolve().parents[2]
+    except (OSError, IndexError):
+        return None
+    return root if root.exists() else None
+
+
+def _ensure_hermes_runtime_package(
+    detection: HermesDetection,
+    *,
+    hermes_home: Path | None = None,
+    registrations=None,
+    observer_state=None,
+):
+    runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+    if runtime_python is None:
+        print("runtime package: skipped (Hermes venv Python not found)")
+        return
+    from .install import pm_dependency
+    if pm_dependency.available(detection.root):
+        registration = pm_dependency.ensure(detection.root, runtime_python, home=hermes_home,
+                                            spec=_runtime_install_spec(), version=PACKAGE_VERSION)
+        managed_here = registrations is None
+        if registration is not None and registrations is not None:
+            registrations.append(registration)
+            if observer_state is not None:
+                observer_state["pm_registration_seen"] = True
+        # Admission publishes a new generation; the old interpreter is stale.
+        try:
+            selected = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+            if selected is None:
+                raise ValueError("PM dependency admission did not select a runtime")
+            report = _check_runtime_hook_import(selected)
+            if (report["status"] != "ok" or report.get("version") != PACKAGE_VERSION
+                    or not _runtime_report_uses_installed_package(report, selected)):
+                raise ValueError("PM selected runtime did not import the expected ordinary HFC wheel")
+            if registration is not None and getattr(registration, 'source_family', None) is not None:
+                probe = pm_dependency._verified_call(detection.root, selected, hermes_home,
+                    {"operation": "probe"}, registration.source_family)
+            else:
+                probe = pm_dependency._call(detection.root, selected, hermes_home, {"operation": "probe"})
+            if not pm_dependency.verify_installed(Path(probe['home']) / 'plugins' / pm_dependency.NAME, selected):
+                raise ValueError("PM installed package does not match the cached exact HFC wheel")
+            if registration is not None:
+                # Keep the opening interpreter for PM rollback. The observer
+                # handoff verifies the selected generation separately.
+                registration.post_python = selected
+        except (OSError, ValueError):
+            if registration is not None and managed_here:
+                registration.rollback()
+            raise
+        print(f"runtime package: {PACKAGE_VERSION} registered with Hermes PM ({selected})")
+        return registration
+    report = _check_runtime_hook_import(runtime_python)
+    if report["status"] == "ok" and report.get("version") == PACKAGE_VERSION:
+        print(f"runtime package: {PACKAGE_VERSION} import ok ({runtime_python})")
+        return
+
+    previous_version = report.get("version") if report["status"] == "ok" else None
+
+    spec = _runtime_install_spec()
+    if not spec:
+        raise ValueError(
+            "Hermes runtime Python cannot import hermes_feishu_card.hook_runtime, "
+            "and no install spec is available. Run the one-line installer or set "
+            "HFC_INSTALL_SPEC before install/setup."
+        )
+
+    pip_version = _run_runtime_pip(runtime_python, ["--version"], timeout=20)
+    if pip_version.returncode != 0:
+        raise ValueError(
+            "Hermes runtime Python pip is unavailable: "
+            f"{_summarize_process_output(pip_version)}"
+        )
+    install = _run_runtime_pip(
+        runtime_python,
+        ["install", "--upgrade", spec],
+        timeout=180,
+    )
+    if install.returncode != 0:
+        raise ValueError(
+            "failed to install hermes-feishu-streaming-card into Hermes runtime "
+            f"Python {runtime_python}: {_summarize_process_output(install)}"
+        )
+    report = _check_runtime_hook_import(runtime_python)
+    if report["status"] != "ok":
+        raise ValueError(report["message"])
+    if report.get("version") != PACKAGE_VERSION:
+        actual = report.get("version") or "unknown"
+        raise ValueError(
+            "Hermes runtime package version mismatch after install: "
+            f"expected {PACKAGE_VERSION}, got {actual} from "
+            f"{report.get('location') or runtime_python}."
+        )
+    if previous_version:
+        print(
+            f"runtime package: upgraded {previous_version} -> {PACKAGE_VERSION} "
+            f"in {runtime_python}"
+        )
+    else:
+        print(f"runtime package: installed into {runtime_python}")
+
+
+def _ensure_hermes_feishu_sdk(detection: HermesDetection, *, hermes_home: Path | None = None) -> None:
+    if not _hermes_requires_feishu_sdk_capability(detection.root):
+        return
+    runtime_python = _detect_hermes_runtime_python(detection.root, **({"hermes_home": hermes_home} if hermes_home is not None else {}))
+    if runtime_python is None:
+        print("feishu sdk: skipped (Hermes venv Python not found)")
+        return
+    report = _check_runtime_feishu_sdk(runtime_python)
+    if report["status"] == "ok":
+        print(
+            "feishu sdk: "
+            f"lark-oapi {report.get('version') or 'unknown'} capability ok "
+            f"({runtime_python})"
+        )
+        return
+
+    previous_version = report.get("version")
+    pip_version = _run_runtime_pip(runtime_python, ["--version"], timeout=20)
+    if pip_version.returncode != 0:
+        raise ValueError(
+            "Hermes runtime Python pip is unavailable: "
+            f"{_summarize_process_output(pip_version)}"
+        )
+    install = _run_runtime_pip(
+        runtime_python,
+        ["install", "--upgrade", FEISHU_SDK_INSTALL_SPEC],
+        timeout=180,
+    )
+    if install.returncode != 0:
+        raise ValueError(
+            "failed to install a compatible Hermes Feishu SDK into runtime "
+            f"Python {runtime_python}: {_summarize_process_output(install)}"
+        )
+    report = _check_runtime_feishu_sdk(runtime_python)
+    if report["status"] != "ok":
+        raise ValueError(report["message"])
+    installed_version = report.get("version") or "unknown"
+    if previous_version:
+        print(f"feishu sdk: upgraded {previous_version} -> {installed_version}")
+    else:
+        print(f"feishu sdk: installed lark-oapi {installed_version}")
+
+
+def _run_runtime_pip(
+    runtime_python: Path,
+    args: list[str],
+    *,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            [str(runtime_python), "-m", "pip", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"Hermes runtime pip command timed out for {runtime_python}: {' '.join(args)}"
+        ) from exc
+    except OSError as exc:
+        raise ValueError(
+            f"Hermes runtime pip command could not start for {runtime_python}: "
+            f"{exc.__class__.__name__}"
+        ) from exc
+    if args == ["--version"] and result.returncode != 0:
+        _run_runtime_ensurepip(runtime_python)
+        result = subprocess.run(
+            [str(runtime_python), "-m", "pip", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    return result
+
+
+def _run_runtime_ensurepip(runtime_python: Path) -> None:
+    try:
+        result = subprocess.run(
+            [str(runtime_python), "-m", "ensurepip", "--upgrade"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"Hermes runtime ensurepip timed out for {runtime_python}"
+        ) from exc
+    except OSError as exc:
+        raise ValueError(
+            f"Hermes runtime ensurepip could not start for {runtime_python}: "
+            f"{exc.__class__.__name__}"
+        ) from exc
+    if result.returncode != 0:
+        raise ValueError(
+            "failed to bootstrap pip in Hermes runtime Python "
+            f"{runtime_python}: {_summarize_process_output(result)}"
+        )
+
+
+def _runtime_install_spec() -> str | None:
+    spec = os.environ.get("HFC_INSTALL_SPEC", "").strip()
+    if spec:
+        return spec
+    root = Path(__file__).resolve().parents[1]
+    if (root / "pyproject.toml").exists() and (root / "hermes_feishu_card").is_dir():
+        return str(root)
+    return None
+
+
+def _summarize_process_output(result: subprocess.CompletedProcess[str]) -> str:
+    combined = "\n".join(
+        part.strip()
+        for part in (result.stderr, result.stdout)
+        if part and part.strip()
+    )
+    if not combined:
+        combined = f"exit {result.returncode}"
+    return combined[-800:]
+
+
+def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
+    from .install import legacy_observer
+    try:
+        legacy_observer.inspect(detection.root)
+    except (OSError, UnicodeError, ValueError):
+        return {"checked": True, "status": "refused", "manual_action_required": True,
+                "automatic_repair_available": False,
+                "message": "Legacy observer config ownership requires review"}
+    from .install import decomposed_ownership
+    from .install import recovery as recovery_owner
+    if detection.decomposed or decomposed_ownership.is_managed(detection.root):
+        plan = recovery_owner._plan_decomposed_recovery(detection)
+        report = {"checked": True, "status": plan.state,
+                "manifest_exists": (detection.root / MANIFEST_NAME).exists(),
+                "manual_action_required": plan.state in {"refused", *decomposed_ownership.EXPLICIT_UPGRADE_STATES},
+                "automatic_repair_available": plan.executable,
+                "message": "Decomposed ownership: " + plan.state}
+        if plan.state in decomposed_ownership.EXPLICIT_UPGRADE_STATES:
+            accepted = recovery_owner._plan_decomposed_recovery(detection, accept_hermes_upgrade=True)
+            if accepted.executable:
+                report["message"] = (
+                    "Hermes source changed and HFC hooks need reinstalling; an updater/autostash "
+                    "may have removed or reapplied them. Review the upgrade, run the explicit repair command, "
+                    "then restart Gateway.")
+                report["repair_command"] = shlex.join([
+                    "hermes-feishu-card", "install", "--hermes-dir", str(detection.root),
+                    "--accept-hermes-upgrade", "--yes"])
+                report["restart_command"] = "hermes gateway start"
+        return report
+    run_py = detection.run_py
+    backup_path = _backup_path(run_py)
+    manifest_path = _manifest_path(detection.root)
+    cron_py = detection.cron_py
+    cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
+    base_py = detection.base_py if detection.base_required else None
+    base_backup_path = _backup_path(base_py) if base_py is not None else None
+    backup_exists = backup_path.exists()
+    manifest_exists = manifest_path.exists()
+    cron_backup_exists = (
+        cron_backup_path.exists() if cron_backup_path is not None else False
+    )
+    base_backup_exists = (
+        base_backup_path.exists() if base_backup_path is not None else False
+    )
+    base: dict[str, Any] = {
+        "checked": True,
+        "manifest_path": str(manifest_path),
+        "manifest_exists": manifest_exists,
+        "backup_path": str(backup_path),
+        "backup_exists": backup_exists,
+        "cron_backup_path": (
+            str(cron_backup_path) if cron_backup_path is not None else None
+        ),
+        "cron_backup_exists": cron_backup_exists,
+        "base_backup_path": (
+            str(base_backup_path) if base_backup_path is not None else None
+        ),
+        "base_backup_exists": base_backup_exists,
+        "automatic_repair_available": False,
+    }
+
+    try:
+        _validate_existing_install_state(
+            run_py,
+            backup_path,
+            manifest_path,
+            cron_py=cron_py,
+            cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
+            require_base_manifest=detection.base_required,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status = _install_state_status_from_error(message)
+        automatic_repair_available = _automatic_repair_available(detection)
+        return {
+            **base,
+            "status": status,
+            "message": message,
+            "manual_action_required": True,
+            "automatic_repair_available": automatic_repair_available,
+        }
+    except (OSError, UnicodeError) as exc:
+        return {
+            **base,
+            "status": "error",
+            "message": f"install state could not be read: {exc.__class__.__name__}",
+            "manual_action_required": True,
+        }
+
+    if backup_exists or manifest_exists or cron_backup_exists or base_backup_exists:
+        return {
+            **base,
+            "status": "installed",
+            "message": "Hermes Feishu hook install state is complete and consistent.",
+            "manual_action_required": False,
+        }
+    return {
+        **base,
+        "status": "clean",
+        "message": "No Hermes Feishu hook install state was found.",
+        "manual_action_required": False,
+    }
+
+
+def _diagnose_v3_install_state(
+    detection: HermesDetection,
+    args: argparse.Namespace,
+    *, hermes_home: Path | None = None,
+) -> tuple[dict[str, Any], RecoveryPlan]:
+    manifest_path = _manifest_path(detection.root)
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=detection.root,
+            hermes_home=hermes_home if hermes_home is not None else getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        entrypoint = probe_plugin_entrypoint(
+            binding,
+            expected_version=PACKAGE_VERSION,
+        )
+        inspected = inspect_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            package_version=PACKAGE_VERSION,
+        )
+    except (
+        FixedTagInstallRefused,
+        RuntimeBindingRefused,
+        OSError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        code = _v3_install_finding_code(exc)
+        message = _v3_install_finding_message(code)
+        fingerprint = _v3_doctor_fingerprint(manifest_path, code)
+        return (
+            {
+                "checked": True,
+                "contract": "v3",
+                "status": "incomplete",
+                "message": message,
+                "manifest_exists": manifest_path.exists() or manifest_path.is_symlink(),
+                "manual_action_required": True,
+                "automatic_repair_available": False,
+            },
+            RecoveryPlan(
+                root=detection.root,
+                state="refused",
+                executable=False,
+                fingerprint=fingerprint,
+                actions=(),
+                findings=(RecoveryFinding(code, "error", message),),
+            ),
+        )
+    manifest_path = inspected.manifest_path
+    fingerprint = hashlib.sha256(
+        b"hfc-doctor-v3-installed\0" + manifest_path.read_bytes()
+    ).hexdigest()
+    return (
+        {
+            "checked": True,
+            "contract": "v3",
+            "status": "installed",
+            "message": "Hermes fixed-tag V3 Hybrid install is complete and consistent.",
+            "manifest_exists": True,
+            "manual_action_required": False,
+            "automatic_repair_available": False,
+        },
+        RecoveryPlan(
+            root=detection.root,
+            state="installed",
+            executable=False,
+            fingerprint=fingerprint,
+            actions=(),
+            findings=(),
+        ),
+    )
+
+
+def _v3_install_finding_code(exc: Exception) -> str:
+    if isinstance(exc, RuntimeBindingRefused):
+        return "v3_runtime_binding_changed"
+    message = str(exc).lower()
+    if "requires recovery" in message:
+        return "v3_manifest_recovery_required"
+    if "plugin config changed" in message or "config is missing" in message:
+        return "v3_config_changed"
+    if "target hash changed" in message or "target is missing" in message:
+        return "v3_target_changed"
+    if "backup hash changed" in message or "backup is missing" in message:
+        return "v3_backup_changed"
+    if "binding or mode changed" in message or "entry point" in message:
+        return "v3_runtime_binding_changed"
+    if "manifest" in message:
+        return "v3_manifest_invalid"
+    if "patch" in message or "ownership" in message:
+        return "v3_patch_invalid"
+    return "v3_inspection_failed"
+
+
+def _v3_install_finding_message(code: str) -> str:
+    messages = {
+        "v3_manifest_recovery_required": "The V3 install transaction is not in the installed phase.",
+        "v3_config_changed": "The V3-owned Hermes plugin configuration changed since install.",
+        "v3_target_changed": "A V3-owned Hermes target changed since install.",
+        "v3_backup_changed": "A V3-owned Hermes backup changed since install.",
+        "v3_runtime_binding_changed": "The V3 runtime or plugin binding changed since install.",
+        "v3_manifest_invalid": "The V3 install manifest is missing or invalid.",
+        "v3_patch_invalid": "The V3 Hybrid patch ownership is inconsistent.",
+        "v3_inspection_failed": "The V3 install could not be verified safely.",
+    }
+    return messages.get(code, messages["v3_inspection_failed"])
+
+
+def _v3_doctor_fingerprint(manifest_path: Path, code: str) -> str:
+    evidence = b""
+    try:
+        metadata = manifest_path.lstat()
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
+            evidence = manifest_path.read_bytes()
+        else:
+            evidence = b"unsafe-manifest"
+    except OSError:
+        evidence = b"unavailable-manifest"
+    return hashlib.sha256(
+        b"hfc-doctor-v3-refused\0"
+        + code.encode("ascii", errors="strict")
+        + b"\0"
+        + evidence
+    ).hexdigest()
+
+
+def _install_state_status_from_error(message: str) -> str:
+    lowered = message.lower()
+    if "changed since install" in lowered or "backup changed" in lowered:
+        return "changed"
+    if "incomplete" in lowered or "manifest" in lowered or "backup missing" in lowered:
+        return "incomplete"
+    return "error"
+
+
+def _append_install_state_recommendation(
+    recommendations: list[dict[str, str]],
+    install_state: dict[str, Any],
+) -> None:
+    status = install_state["status"]
+    if status == "clean":
+        recommendations.append(
+            {
+                "severity": "info",
+                "code": "install_state_clean",
+                "message": "No existing Hermes Feishu hook install state was found.",
+                "next_step": "Run install --hermes-dir PATH --yes when ready to patch Hermes.",
+            }
+        )
+        return
+    if status == "installed":
+        recommendations.append(
+            {
+                "severity": "info",
+                "code": "install_state_installed",
+                "message": "Existing hook install state is complete and consistent.",
+                "next_step": "No install-state action is required.",
+            }
+        )
+        return
+    code = "install_state_changed" if status == "changed" else "install_state_incomplete"
+    if install_state.get("repair_command"):
+        next_step = (
+            f"Run {install_state['repair_command']}, then "
+            f"{install_state.get('restart_command', 'hermes gateway start')}."
+        )
+    elif install_state.get("automatic_repair_available"):
+        next_step = (
+            "Run repair --hermes-dir PATH --yes to rebuild known-safe "
+            "backup/manifest state, then rerun doctor."
+        )
+    else:
+        next_step = (
+            "Back up the Hermes directory, inspect gateway/run.py and the "
+            "manifest, then restore or reinstall only after confirming the "
+            "local edits are intentional."
+        )
+    recommendations.append(
+        {
+            "severity": "warning",
+            "code": code,
+            "message": install_state["message"],
+            "next_step": next_step,
+        }
+    )
+
+
+def _finalize_doctor_report(report: dict[str, Any]) -> dict[str, Any]:
+    severities = {
+        item.get("severity")
+        for item in report.get("recommendations", [])
+        if isinstance(item, dict)
+    }
+    if "error" in severities:
+        report["status"] = "error"
+    elif "warning" in severities:
+        report["status"] = "warning"
+    else:
+        report["status"] = "ok"
+    return report
+
+
+def _print_hermes_streaming_guidance(hermes_root: Path, *, hermes_home: Path | None = None) -> None:
+    config = _load_hermes_user_config(hermes_root, hermes_home=hermes_home)
+    status = _detect_hermes_streaming_status(config)
+    if status == "disabled":
+        print(
+            (
+                "warning: Hermes Gateway streaming appears disabled for Feishu. "
+                "Set streaming.enabled: true with streaming.transport: edit, "
+                "or set display.platforms.feishu.streaming: true, so "
+                "thinking.delta and answer.delta updates can reach the card."
+            )
+        )
+    elif status == "not_detected":
+        print(
+            (
+                "note: Hermes Gateway streaming config was not detected. If "
+                "cards do not show answer.delta updates, set "
+                "streaming.enabled: true and streaming.transport: edit in the "
+                "Hermes config.yaml."
+            )
+        )
+
+
+def _load_hermes_user_config(hermes_root: Path, *, hermes_home: Path | None = None) -> dict[str, object]:
+    paths = ((hermes_home / "config.yaml",) if hermes_home is not None
+             else _candidate_hermes_config_paths(hermes_root))
+    for config_path in paths:
+        if not config_path.exists() or not config_path.is_file():
+            continue
+        try:
+            with config_path.open("r", encoding="utf-8") as file:
+                loaded = yaml.safe_load(file) or {}
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+    return {}
+
+
+def _detect_hermes_streaming_status(config: dict[str, object]) -> str:
+    feishu_streaming = _nested_get(
+        config, ("display", "platforms", "feishu", "streaming")
+    )
+    if feishu_streaming is not None:
+        return "enabled" if _truthy(feishu_streaming) else "disabled"
+
+    streaming = config.get("streaming")
+    if not isinstance(streaming, dict):
+        return "not_detected"
+    if _truthy(streaming.get("enabled")) and str(
+        streaming.get("transport", "edit")
+    ).strip().lower() != "off":
+        return "enabled"
+    return "disabled"
+
+
+def _candidate_hermes_config_paths(hermes_root: Path) -> tuple[Path, ...]:
+    return (
+        hermes_root / "config.yaml",
+        hermes_root / "config.yml",
+        hermes_root / "configs" / "config.yaml",
+        hermes_root / "configs" / "config.yml",
+        hermes_root.parent / "config.yaml",
+        hermes_root.parent / "config.yml",
+        Path.home() / ".hermes" / "config.yaml",
+        Path.home() / ".hermes" / "config.yml",
+    )
+
+
+def _nested_get(config: dict[str, object], path: tuple[str, ...]) -> object:
+    current: object = config
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _configured_lifecycle_hermes_root(args: argparse.Namespace) -> Path | None:
+    explicit = getattr(args, "hermes_dir", None)
+    if explicit:
+        return Path(explicit).expanduser()
+
+    raw_env_path = getattr(args, "env_file", None) or os.environ.get("HFC_ENV_FILE")
+    env_paths = []
+    if raw_env_path:
+        env_paths.append(Path(raw_env_path).expanduser())
+    env_paths.append(Path(args.config).expanduser().parent / ".env")
+    for env_path in env_paths:
+        value = read_hfc_env(env_path).get("HERMES_DIR", "").strip()
+        if value:
+            return Path(value).expanduser()
+
+    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return Path(value).expanduser()
+    return None
+
+
+def _lifecycle_hook_check(args: argparse.Namespace) -> dict[str, object] | None:
+    hermes_root = _configured_lifecycle_hermes_root(args)
+    if hermes_root is None:
+        return None
+
+    detection = detect_hermes(hermes_root)
+    if not detection.supported:
+        return {
+            "status": "manual_review_required",
+            "blocking": True,
+            "root": hermes_root,
+        }
+    try:
+        verified_root = _verified_explicit_hermes_root(
+            hermes_root,
+            detection=detection,
+        )
+    except ValueError:
+        return {
+            "status": "manual_review_required",
+            "blocking": True,
+            "root": hermes_root,
+        }
+
+    manifest_path = verified_root / MANIFEST_NAME
+    if _manifest_version_candidate(manifest_path) == 3:
+        try:
+            lifecycle_config = load_config(
+                args.config, env_file=getattr(args, "env_file", None) or os.environ.get("HFC_ENV_FILE"),
+            )
+            selected_home = getattr(args, "hermes_home", None)
+            if (lifecycle_config.get("service") or {}).get("hermes_home") is not None:
+                selected_home = setup_hermes_home(verified_root, lifecycle_config, selected_home)
+            binding = resolve_runtime_binding(
+                checkout_root=verified_root,
+                hermes_home=selected_home,
+                profile_id=getattr(args, "profile_id", None),
+            )
+            entrypoint = probe_plugin_entrypoint(
+                binding,
+                expected_version=PACKAGE_VERSION,
+            )
+            inspect_fixed_tag_hybrid_install(
+                binding=binding,
+                entrypoint=entrypoint,
+                package_version=PACKAGE_VERSION,
+            )
+        except (
+            FixedTagInstallRefused,
+            RuntimeBindingRefused,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ):
+            return {
+                "status": "manual_review_required",
+                "blocking": True,
+                "root": verified_root,
+            }
+        return {
+            "status": "installed",
+            "blocking": False,
+            "root": verified_root,
+        }
+
+    plan = plan_recovery(detection)
+    if plan.state == "installed" and not plan.actions:
+        return {"status": "installed", "blocking": False, "root": verified_root}
+    if plan.state == "clean":
+        return {"status": "not_installed", "blocking": False, "root": verified_root}
+    if plan.state in {"stale_unpatched", "stale_reapplied"}:
+        accepted = plan_recovery(detection, accept_hermes_upgrade=True)
+        if accepted.executable:
+            return {
+                "status": "upgrade_repair_required",
+                "blocking": True,
+                "root": verified_root,
+            }
+    return {
+        "status": "manual_review_required",
+        "blocking": True,
+        "root": verified_root,
+    }
+
+
+def _print_lifecycle_hook_check(
+    check: dict[str, object], *, file: Any = None
+) -> None:
+    output = sys.stdout if file is None else file
+    status = str(check["status"])
+    hermes_root = Path(check["root"])
+    print(f"hook.status: {status}", file=output)
+    if status == "upgrade_repair_required":
+        repair_command = shlex.join(
+            [
+                "hermes-feishu-card",
+                "install",
+                "--hermes-dir",
+                str(hermes_root),
+                "--accept-hermes-upgrade",
+                "--yes",
+            ]
+        )
+        print(f"hook.next: {repair_command}", file=output)
+        print("hook.restart: hermes gateway start", file=output)
+    elif status == "manual_review_required":
+        doctor_command = shlex.join(
+            [
+                "hermes-feishu-card",
+                "doctor",
+                "--config",
+                str(Path(check.get("config", "config.yaml.example"))),
+                "--hermes-dir",
+                str(hermes_root),
+                "--explain",
+            ]
+        )
+        print(f"hook.next: {doctor_command}", file=output)
+
+
+def _print_sidecar_start_failure(result: str) -> None:
+    lowered = result.lower()
+    pidfileless = (
+        "no verified pidfile" in lowered
+        or "has no pidfile" in lowered
+        or "pidfile-less" in lowered
+    )
+    if pidfileless:
+        print(
+            "error: a running sidecar cannot be managed safely without a "
+            "verified pidfile",
+            file=sys.stderr,
+        )
+        if sys.platform == "darwin":
+            print(
+                "next: confirm who owns the existing sidecar before stopping it. "
+                "If your own launchd LaunchAgent directly runs the sidecar runner, "
+                "confirm its label and stop that job with "
+                "`launchctl bootout gui/$(id -u)/<label>` "
+                "(or `launchctl unload /path/to/confirmed.plist`). "
+                "Otherwise identify and stop the old sidecar service manually; "
+                "a missing pidfile does not prove launchd ownership. "
+                "Then rerun the official installer: "
+                f"{OFFICIAL_INSTALLER_COMMAND}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "next: stop the old sidecar service manually, then rerun the "
+                f"official installer: {OFFICIAL_INSTALLER_COMMAND}",
+                file=sys.stderr,
+            )
+        return
+    print(f"error: {result}", file=sys.stderr)
+
+
+def _run_enable(args: argparse.Namespace) -> int:
+    try:
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    hook_check = _lifecycle_hook_check(args)
+    if hook_check is None or bool(hook_check["blocking"]):
+        if hook_check is not None:
+            hook_check["config"] = args.config
+            _print_lifecycle_hook_check(hook_check, file=sys.stderr)
+        else:
+            print("error: an explicit verified Hermes root is required", file=sys.stderr)
+        return 1
+    if hook_check.get("status") != "installed":
+        print(
+            "error: install the Hermes integration before enabling the persistent "
+            "sidecar service",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        hermes_root = Path(hook_check["root"]).expanduser().resolve(strict=True)
+        runtime_python, runtime_identity = _resolve_sidecar_runtime_identity(
+            hermes_root, config
+        )
+        if persistent_sidecar_matches(
+            config_path=args.config,
+            config=config,
+            env_file=args.env_file,
+            hermes_dir=hermes_root,
+            python_executable=runtime_python,
+            expected_package_version=PACKAGE_VERSION,
+            expected_python_identity=runtime_identity,
+        ):
+            print("enable: already enabled")
+            return 0
+        stop_result = stop_sidecar(config)
+        if stop_result.startswith("failed:"):
+            print(
+                "error: existing sidecar could not be stopped safely before enable: "
+                f"{stop_result}",
+                file=sys.stderr,
+            )
+            return 1
+        result = enable_persistent_sidecar(
+            config_path=args.config,
+            config=config,
+            env_file=args.env_file,
+            hermes_dir=hermes_root,
+            python_executable=runtime_python,
+            expected_package_version=PACKAGE_VERSION,
+            expected_python_identity=runtime_identity,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "already enabled":
+        print("enable: already enabled")
+        return 0
+    print("enable ok")
+    return 0
+
+
+def _run_disable(args: argparse.Namespace) -> int:
+    del args
+    try:
+        result = disable_persistent_sidecar()
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "not enabled":
+        print("disable: not enabled")
+        return 0
+    print("disable ok")
+    return 0
+
+
+def _run_start(args: argparse.Namespace) -> int:
+    try:
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    hook_check = _lifecycle_hook_check(args)
+    if hook_check is not None and bool(hook_check["blocking"]):
+        hook_check["config"] = args.config
+        _print_lifecycle_hook_check(hook_check, file=sys.stderr)
+        return 1
+
+    start_kwargs: dict[str, Any] = {}
+    if args.env_file is not None:
+        start_kwargs["env_file"] = args.env_file
+    verified_hermes_root: Path | None = None
+    if hook_check is not None:
+        try:
+            verified_hermes_root = Path(hook_check["root"]).expanduser().resolve(
+                strict=True
+            )
+        except (OSError, RuntimeError, ValueError):
+            print(
+                "error: Explicit Hermes root could not be verified. Rerun the "
+                f"official installer: {OFFICIAL_INSTALLER_COMMAND}",
+                file=sys.stderr,
+            )
+            return 1
+    elif args.hermes_dir is not None:
+        try:
+            verified_hermes_root = _verified_explicit_hermes_root(args.hermes_dir)
+        except (OSError, RuntimeError, ValueError):
+            print(
+                "error: Explicit Hermes root could not be verified. Rerun the "
+                f"official installer: {OFFICIAL_INSTALLER_COMMAND}",
+                file=sys.stderr,
+            )
+            return 1
+    try:
+        runtime_python, runtime_identity = _resolve_sidecar_runtime_identity(
+            verified_hermes_root, config
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    start_kwargs.update(
+        {
+            "python_executable": runtime_python,
+            "expected_package_version": PACKAGE_VERSION,
+            "expected_python_identity": runtime_identity,
+        }
+    )
+    if verified_hermes_root is not None:
+        start_kwargs["hermes_dir"] = verified_hermes_root
+
+    if verified_hermes_root is not None and persistent_sidecar_matches(
+        config_path=args.config,
+        config=config,
+        env_file=args.env_file,
+        hermes_dir=verified_hermes_root,
+        python_executable=runtime_python,
+        expected_package_version=PACKAGE_VERSION,
+        expected_python_identity=runtime_identity,
+    ):
+        print("start: already running")
+        return 0
+
+    try:
+        result = start_sidecar(args.config, config, **start_kwargs)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        _print_sidecar_start_failure(result)
+        return 1
+    if result == "already running":
+        print("start: already running")
+        return 0
+    print("start ok")
+    return 0
+
+
+def _run_stop(args: argparse.Namespace) -> int:
+    try:
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if persistent_sidecar_active():
+        print(
+            "error: persistent sidecar service is enabled; use "
+            "hermes-feishu-card disable",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        result = stop_sidecar(config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "not running":
+        print("stop: not running")
+        return 0
+    print("stop ok")
+    return 0
+
+
+def _run_integrity(args: argparse.Namespace) -> int:
+    if getattr(args, "integrity_command", None) == "rebind-legacy":
+        from .install.legacy_rebind import rebind
+        try:
+            binding = resolve_runtime_binding(checkout_root=args.hermes_dir,
+                hermes_home=args.hermes_home, profile_id=None)
+            result = rebind(binding, apply=args.yes)
+        except (OSError, UnicodeError, ValueError) as exc:
+            from .install.legacy_rebind import RebindRefused
+            reason = str(exc) if isinstance(exc, RebindRefused) else "legacy_rebind_evidence_unverified"
+            print("legacy observer rebind: refused (" + reason + "); preserve evidence and review diagnosis", file=sys.stderr)
+            return 1
+        print("legacy observer rebind: " + result["status"] + " (" + result["reason"] + ")")
+        if not args.yes:
+            print("rerun with --yes to update verified ownership; current config is preserved")
+        return 0
+    if getattr(args, "integrity_command", None) == "acknowledge-review":
+        return _run_integrity_acknowledge_review(args)
+    if getattr(args, "integrity_command", None) != "migrate-safe":
+        print("error: an integrity subcommand is required", file=sys.stderr)
+        return 2
+    detection = detect_hermes(args.hermes_dir)
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+    config_path = Path(args.config).expanduser()
+    env_path = (
+        Path(args.env_file).expanduser()
+        if args.env_file is not None
+        else config_path.parent / ".env"
+    )
+    manifest_path = detection.root / MANIFEST_NAME
+    bindings: list[posix_transaction._CliTargetBinding] = []
+    try:
+        if not posix_transaction._cli_dirfd_binding_supported():
+            raise ValueError(
+                "secure integrity migration requires directory-relative "
+                "filesystem operations on this platform"
+            )
+        manifest_binding = posix_transaction._bind_cli_target(manifest_path)
+        bindings.append(manifest_binding)
+        if manifest_binding.initial_snapshot is None:
+            raise ValueError("integrity migration requires a manifest")
+        env_binding = posix_transaction._bind_cli_target(env_path)
+        bindings.append(env_binding)
+        manifest_text = (manifest_binding.initial_bytes or b"").decode("utf-8")
+        _provenance, manifest_contents = render_integrity_manifest_migration(
+            detection,
+            manifest_text,
+        )
+        env_text = (env_binding.initial_bytes or b"").decode("utf-8")
+        env_contents = render_hfc_env(
+            env_text,
+            {"HERMES_FEISHU_CARD_INTEGRITY_MODE": "safe"},
+        )
+        def validate_migration_snapshot():
+            if render_integrity_manifest_migration(detection, manifest_text) != (_provenance, manifest_contents):
+                raise ValueError("integrity evidence changed; rerun diagnosis")
+
+        def validate_migration_commit():
+            if render_integrity_manifest_migration(detection, manifest_contents) != (_provenance, manifest_contents):
+                raise ValueError("integrity evidence changed; rerun diagnosis")
+
+        posix_transaction._write_targets_transactionally(
+            [
+                (manifest_path, manifest_contents),
+                (env_path, env_contents),
+            ],
+            expected_identities={
+                manifest_path: manifest_binding.initial_snapshot,
+                env_path: env_binding.initial_snapshot,
+            },
+            expected_directories={
+                manifest_path.parent: manifest_binding.parent_identity,
+                env_path.parent: env_binding.parent_identity,
+            },
+            pre_commit_validate=validate_migration_snapshot,
+            validate=validate_migration_commit,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        for binding in bindings:
+            try:
+                binding.close()
+            except OSError:
+                pass
+    print("integrity migration: verified")
+    print("integrity mode: safe")
+    print("sidecar.restart_required: true")
+    print("gateway.restart_required: false")
+    return 0
+
+
+def _integrity_ack_refused(category: str, hint: str | None = None) -> int:
+    """Print a fixed, redacted acknowledgement refusal and its next action."""
+    print(
+        "error: manual review fence could not be acknowledged safely "
+        f"(category={category})",
+        file=sys.stderr,
+    )
+    if hint:
+        print(f"next: {hint}", file=sys.stderr)
+    return 1
+
+
+def _integrity_ack_sidecar_running() -> int:
+    print(
+        "error: stop the sidecar before acknowledging manual review "
+        "(category=integrity_ack_sidecar_running)",
+        file=sys.stderr,
+    )
+    print(
+        "next: stop the actual service manager or auto-updater and confirm both "
+        "health is unreachable and the sidecar PID file is absent; a KeepAlive "
+        "restart keeps this gate closed",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _run_integrity_acknowledge_review(args: argparse.Namespace) -> int:
+    try:
+        first_binding = _verified_integrity_acknowledgement_binding(
+            args.hermes_dir
+        )
+    except Exception:
+        return _integrity_ack_refused(
+            "integrity_ack_plan_unverified",
+            "verify the installed Hermes plan and rerun doctor; keep the marker, "
+            "manifest, preimage and journal",
+        )
+    try:
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+    except Exception:
+        return _integrity_ack_refused(
+            "integrity_ack_config_unverified",
+            "verify the config path and its private environment without printing "
+            "tokens or raw paths",
+        )
+    try:
+        target_state = _integrity_state_directory(args)
+        review = inspect_runtime_integrity_review(target_state)
+    except Exception:
+        return _integrity_ack_refused(
+            "integrity_ack_fence_unreadable",
+            "preserve the private state directory and inspect the fence with the "
+            "supported diagnosis path",
+        )
+    try:
+        stopped = _integrity_acknowledgement_process_stopped(target_state, config)
+    except Exception:
+        return _integrity_ack_sidecar_running()
+    if not stopped:
+        return _integrity_ack_sidecar_running()
+    try:
+        second_binding = _verified_integrity_acknowledgement_binding(
+            args.hermes_dir
+        )
+    except Exception:
+        return _integrity_ack_refused(
+            "integrity_ack_plan_unverified",
+            "verify the installed Hermes plan and rerun doctor; keep the marker, "
+            "manifest, preimage and journal",
+        )
+    if second_binding != first_binding:
+        return _integrity_ack_refused(
+            "integrity_ack_binding_changed",
+            "the Hermes plan changed during the check; stop, rerun doctor and "
+            "preserve the current fence",
+        )
+    try:
+        stopped = _integrity_acknowledgement_process_stopped(target_state, config)
+    except Exception:
+        return _integrity_ack_sidecar_running()
+    if not stopped:
+        return _integrity_ack_sidecar_running()
+    acknowledgement_options = {
+        "expected_state_token": review.state_token,
+        "expected_binding": first_binding,
+        "allow_legacy_unbound_empty_restart": bool(
+            args.yes is True and review.legacy_unbound_empty_restart
+        ),
+    }
+    if (
+        args.yes is True
+        and review.binding is not None
+        and review.binding != first_binding
+        and review.binding.target_identity == first_binding.target_identity
+    ):
+        acknowledgement_options["allow_same_target_plan_transition"] = True
+    rebind_target = getattr(args, "rebind_target", None)
+    if rebind_target is not None:
+        if (args.yes is not True or review.binding is None
+                or rebind_target != review.binding.target_identity
+                or not review.manual_review_required):
+            return _integrity_ack_refused(
+                "integrity_ack_rebind_target_mismatch",
+                "use the exact old 64-character target identity recorded by the "
+                "pending fence; this command does not clear an unverified fence",
+            )
+        acknowledgement_options["rebind_from_target_identity"] = rebind_target
+    elif (
+        review.manual_review_required
+        and review.binding is not None
+        and review.binding != first_binding
+        and review.binding.target_identity != first_binding.target_identity
+    ):
+        return _integrity_ack_refused(
+            "integrity_ack_rebind_target_required",
+            "the pending fence belongs to a different Hermes target; read its "
+            "exact old target identity and rerun with --rebind-target "
+            "<old-target-identity> --yes; do not edit or delete the fence",
+        )
+    try:
+        changed = acknowledge_runtime_integrity_review(
+            target_state,
+            **acknowledgement_options,
+        )
+    except Exception:
+        try:
+            after = inspect_runtime_integrity_review(target_state)
+        except Exception:
+            return _integrity_ack_refused(
+                "integrity_ack_fence_unreadable",
+                "preserve the private state directory and inspect the fence with "
+                "the supported diagnosis path",
+            )
+        if after.state_token != review.state_token:
+            return _integrity_ack_refused(
+                "integrity_ack_fence_changed",
+                "the fence changed during acknowledgement; preserve it and rerun "
+                "doctor before another attempt",
+            )
+        return _integrity_ack_refused(
+            "integrity_ack_refused",
+            "preserve the fence and evidence; do not hand-edit the fence",
+        )
+    print(
+        "integrity manual review: acknowledged"
+        if changed
+        else "integrity manual review: no pending fence"
+    )
+    print("next: restart sidecar and Hermes Gateway")
+    return 0
+
+
+def _verified_integrity_acknowledgement_binding(
+    hermes_dir: str | Path,
+):
+    detection = detect_hermes(hermes_dir)
+    if not detection.supported:
+        raise ValueError("Hermes install could not be verified")
+    recovery_plan = plan_recovery(detection)
+    if recovery_plan.state != "installed" or recovery_plan.actions:
+        raise ValueError("Hermes installed plan could not be verified")
+    integrity_plan = plan_integrity_repair(detection)
+    if not integrity_acknowledgement_eligible(
+        detection,
+        recovery_plan,
+        integrity_plan,
+    ):
+        raise ValueError("Hermes integrity plan could not be verified")
+    return build_runtime_integrity_fence_binding(
+        detection.root,
+        integrity_plan.fingerprint,
+    )
+
+
+def _integrity_acknowledgement_process_stopped(target_state: Path, config) -> bool:
+    return bool(
+        _integrity_pidfile_absent(target_state)
+        and fetch_health(config) is None
+    )
+
+
+def _integrity_state_directory(args: argparse.Namespace) -> Path:
+    return Path(args.state_dir).expanduser()
+
+
+def _integrity_pidfile_absent(target_state: Path) -> bool:
+    try:
+        os.lstat(target_state / PIDFILE_NAME)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    try:
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    status = status_sidecar(config)
+    status_error = status.get("error")
+    if isinstance(status_error, str) and status_error:
+        print(f"error: {status_error}", file=sys.stderr)
+        return 1
+    readiness_degraded = False
+    native_handoff_manual_review = False
+    if (
+        status.get("running") is True
+        and status.get("manager") == "unknown"
+        and persistent_sidecar_active()
+    ):
+        status["manager"] = "systemd-user-persistent"
+    if status["running"]:
+        print("status: running")
+        print(f"pid: {status['pid'] or 'unknown'}")
+        print(f"manager: {status.get('manager', 'unknown')}")
+        health_status = status["health"].get("status")
+        if health_status == "degraded":
+            print("health: degraded")
+        delivery = status["health"].get("delivery")
+        if isinstance(delivery, dict) and delivery.get("mode") == "noop":
+            print("delivery.mode: noop")
+        readiness = status["health"].get("readiness")
+        if isinstance(readiness, dict):
+            readiness_status = str(readiness.get("status") or "unknown")
+            if readiness_status not in {"ready", "starting", "degraded", "disabled"}:
+                readiness_status = "unknown"
+            readiness_reason = str(readiness.get("reason") or "unknown")
+            if readiness_reason not in {
+                "runtime_ready",
+                "runtime_owner_conflict", "runtime_owner_unverified", "runtime_owner_capacity_exceeded",
+                "runtime_heartbeat_waiting",
+                "runtime_heartbeat_missing",
+                "runtime_heartbeat_stale",
+                "gateway_restart_required",
+                "manual_review_required",
+                "control_auth_unavailable",
+                "integrity_disabled",
+            }:
+                readiness_reason = "unknown"
+            integrity_mode = str(readiness.get("integrity_mode") or "unknown")
+            if integrity_mode not in {"safe", "notify", "off"}:
+                integrity_mode = "unknown"
+            restart_required = readiness.get("restart_required") is True
+            print(f"readiness: {readiness_status}")
+            print(f"readiness.reason: {readiness_reason}")
+            print(f"integrity.mode: {integrity_mode}")
+            print(
+                "gateway.restart_required: "
+                f"{'true' if restart_required else 'false'}"
+            )
+            for name in ("observer_count", "observer_active_sessions", "observer_unknown_count"):
+                value = readiness.get(name)
+                if type(value) is int and value >= 0:
+                    print(f"runtime.{name}: {value}")
+            for name in ("owner_conflict", "owner_capacity_exceeded"):
+                value = readiness.get(name)
+                if type(value) is bool:
+                    print(f"runtime.{name}: {str(value).lower()}")
+            readiness_degraded = readiness_status == "degraded"
+        integrity = status["health"].get("integrity")
+        if isinstance(integrity, dict):
+            _print_status_integrity(integrity, args=args)
+        print(f"active_sessions: {status['health'].get('active_sessions', 0)}")
+        metrics = status["health"].get("metrics", {})
+        if isinstance(metrics, dict):
+            for name in (
+                "events_received",
+                "events_applied",
+                "events_ignored",
+                "events_rejected",
+                "event_auth_rejections",
+                "feishu_send_attempts",
+                "feishu_noop_attempts",
+                "feishu_send_successes",
+                "feishu_send_failures",
+                "feishu_update_attempts",
+                "feishu_update_successes",
+                "feishu_update_failures",
+                "feishu_update_retries",
+                "cron_cards_sent",
+                "cron_fallbacks",
+            ):
+                value = metrics.get(name)
+                if isinstance(value, int):
+                    print(f"{name}: {value}")
+        native_handoff_manual_review = _print_status_native_handoffs(
+            status["health"]
+        )
+        _print_status_routing(status["health"])
+    else:
+        print("status: stopped")
+        if status["pid"] is not None:
+            print(f"pid: {status['pid']} stale")
+    hook_check = _lifecycle_hook_check(args)
+    if hook_check is None:
+        return 1 if readiness_degraded or native_handoff_manual_review else 0
+    hook_check["config"] = args.config
+    _print_lifecycle_hook_check(hook_check)
+    return (
+        1
+        if readiness_degraded
+        or native_handoff_manual_review
+        or bool(hook_check["blocking"])
+        else 0
+    )
+
+
+def _print_status_native_handoffs(health: dict[str, Any]) -> bool:
+    snapshot = health.get("native_handoffs")
+    if not isinstance(snapshot, dict):
+        return False
+    delivery_states = snapshot.get("delivery_states")
+    if not isinstance(delivery_states, dict):
+        delivery_states = {}
+
+    def safe_count(value: Any) -> int:
+        return value if type(value) is int and value >= 0 else 0
+
+    records = safe_count(snapshot.get("records"))
+    pending = safe_count(delivery_states.get("pending"))
+    acked = safe_count(delivery_states.get("acked"))
+    uncertain = safe_count(delivery_states.get("uncertain"))
+    manual_review_required = (
+        snapshot.get("manual_review_required") is True or uncertain > 0
+    )
+    if not (records or pending or uncertain or manual_review_required):
+        return False
+
+    print(f"native_handoff.records: {records}")
+    print(f"native_handoff.pending: {pending}")
+    print(f"native_handoff.acked: {acked}")
+    print(f"native_handoff.uncertain: {uncertain}")
+    if manual_review_required:
+        print("native_handoff.manual_review_required: true")
+        print(
+            "native_handoff.next_action: verify native conversation delivery "
+            "and the Hermes delivery ledger before manually retrying; do not "
+            "delete handoff state or retry automatically"
+        )
+    return manual_review_required
+
+
+def _print_status_integrity(snapshot: dict[str, Any], *, args: argparse.Namespace | None = None) -> None:
+    integrity = sanitize_integrity_snapshot(snapshot)
+    print(f"integrity.status: {integrity['last_status']}")
+    print(f"integrity.reason: {integrity['last_reason']}")
+    for name in ("repair_attempts", "repair_successes", "repair_refusals"):
+        print(f"integrity.{name}: {integrity[name]}")
+    action = {
+        "repair_available": (
+            "review doctor evidence; run integrity migrate-safe with explicit "
+            "config and Hermes paths; then restart sidecar"
+        ),
+        "manual_review_required": (
+            "run doctor --explain and review evidence; do not force repair"
+        ),
+        "restart_required": (
+            "restart Hermes Gateway manually when idle, then recheck"
+        ),
+        "repaired": "restart Hermes Gateway manually when idle, then recheck",
+    }.get(str(integrity["last_status"]))
+    if action:
+        print(f"integrity.next_action: {action}")
+        if args is not None and integrity["last_status"] in {"repair_available", "manual_review_required"}:
+            command = ["hermes-feishu-card", "doctor", "--config", str(args.config)]
+            if getattr(args, "env_file", None):
+                command.extend(["--env-file", str(args.env_file)])
+            root = _configured_lifecycle_hermes_root(args)
+            if root is not None:
+                command.extend(["--hermes-dir", str(root)])
+            command.append("--explain")
+            print(f"integrity.next_command: {shlex.join(command)}")
+
+
+def _print_status_routing(health: dict[str, Any]) -> None:
+    routing = health.get("routing")
+    if isinstance(routing, dict):
+        bot_count = routing.get("bot_count")
+        chat_binding_count = routing.get("chat_binding_count")
+        if isinstance(bot_count, int):
+            print(f"routing.bot_count: {bot_count}")
+        if isinstance(chat_binding_count, int):
+            print(f"routing.chat_binding_count: {chat_binding_count}")
+        route = routing.get("last_route")
+        if isinstance(route, dict) and route:
+            profile_id = str(route.get("profile_id") or "").strip()
+            bot_id = str(route.get("bot_id") or "").strip()
+            reason = str(route.get("reason") or "").strip()
+            profile_part = f"profile={profile_id} " if profile_id else ""
+            print(f"routing.last_route: {profile_part}bot={bot_id} reason={reason}")
+        last_route_error = routing.get("last_route_error")
+        if isinstance(last_route_error, str) and last_route_error:
+            print(f"routing.last_route_error: {last_route_error}")
+    profiles = health.get("profile_diagnostics")
+    if isinstance(profiles, dict):
+        for profile_id in sorted(profiles):
+            item = profiles[profile_id]
+            if not isinstance(item, dict):
+                continue
+            events = item.get("events")
+            if isinstance(events, int):
+                print(f"profile.{profile_id}.events: {events}")
+            source = item.get("last_profile_source")
+            if isinstance(source, str) and source:
+                print(f"profile.{profile_id}.last_profile_source: {source}")
+
+
+def _run_smoke_feishu_card(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+        config = _select_profile_config(config, args.profile_id)
+        message_id = asyncio.run(_smoke_feishu_card(config, args.chat_id))
+    except Exception as exc:
+        print(f"error: {_sanitize_error(exc, config if 'config' in locals() else None)}", file=sys.stderr)
+        return 1
+
+    print("smoke ok")
+    print(f"message_id: {_masked_message_id(message_id)}")
+    return 0
+
+
+def _run_chats(args: argparse.Namespace) -> int:
+    if getattr(args, "chat_command", None) not in {
+        "list",
+        "use-native",
+        "use-card",
+    }:
+        print("error: chats command is required", file=sys.stderr)
+        return 2
+    try:
+        config = load_config(args.config)
+        data = _read_local_yaml(args.config)
+        bindings = _native_chat_bindings_scope(
+            config,
+            data,
+            profile_id=args.profile_id,
+        )
+        native_chats = normalize_native_chats(bindings.get("native_chats", []))
+        if args.chat_command == "list":
+            for chat_id in native_chats:
+                print(_masked_chat_id(chat_id))
+            return 0
+        chat_id = normalize_native_chats([args.chat_id])[0]
+        if args.chat_command == "use-native":
+            if chat_id not in native_chats:
+                native_chats.append(chat_id)
+            disposition = "native"
+        else:
+            native_chats = [item for item in native_chats if item != chat_id]
+            disposition = "card"
+        bindings["native_chats"] = native_chats
+        _write_local_yaml(args.config, data)
+        print(
+            f"{disposition}: {_masked_chat_id(chat_id)} "
+            "(applies to the next new message)"
+        )
+        return 0
+    except Exception as exc:
+        print(
+            f"error: {_sanitize_error(exc, locals().get('config'))}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _native_chat_bindings_scope(
+    config: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    profile_id: str | None,
+) -> dict[str, Any]:
+    profiles = config.get("profiles")
+    if isinstance(profiles, dict) and profiles:
+        if not profile_id:
+            raise ValueError("--profile-id is required in multi-profile mode")
+        if profile_id not in profiles:
+            raise KeyError("unknown profile")
+        raw_profiles = _ensure_mapping_path(data, "profiles")
+        raw_profile = raw_profiles.get(profile_id)
+        if raw_profile is None:
+            raw_profile = {}
+            raw_profiles[profile_id] = raw_profile
+        if not isinstance(raw_profile, dict):
+            raise ValueError("profile must be a mapping")
+        return _ensure_mapping_path(raw_profile, "bindings")
+    if profile_id:
+        raise KeyError("unknown profile")
+    return _ensure_mapping_path(data, "bindings")
+
+
+def _masked_chat_id(chat_id: str) -> str:
+    digest = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:10]
+    return f"chat#{digest}"
+
+
+def _masked_message_id(message_id: str) -> str:
+    digest = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:10]
+    return f"message#{digest}"
+
+
+def _run_bots(args: argparse.Namespace) -> int:
+    try:
+        if args.bot_command == "list":
+            config = load_config(args.config)
+            registry = BotRegistry.from_config(config)
+            for bot in registry.list_bots():
+                print(f"{bot.bot_id}\t{bot.name}\t{bot.app_id}")
+            return 0
+
+        if args.bot_command == "add":
+            data = _read_local_yaml(args.config)
+            items = _ensure_mapping_path(data, "bots", "items")
+            if args.bot_id in items:
+                raise ValueError(f"bot {args.bot_id!r} already exists")
+            config = load_config(args.config)
+            if args.bot_id == "default" and _has_feishu_credentials(config):
+                raise ValueError("bot 'default' already exists")
+            items[args.bot_id] = {
+                "name": args.bot_id,
+                "app_id": "",
+                "app_secret": "",
+                "base_url": FeishuClientConfig.base_url,
+                "timeout_seconds": FeishuClientConfig.timeout_seconds,
+            }
+            _write_local_yaml(args.config, data)
+            print(f"bot added: {args.bot_id}")
+            return 0
+
+        if args.bot_command == "bind-chat":
+            config = load_config(args.config)
+            if not _config_has_bot(config, args.bot_id):
+                raise KeyError(f"unknown bot: {args.bot_id}")
+            data = _read_local_yaml(args.config)
+            chats = _ensure_mapping_path(data, "bindings", "chats")
+            chats[args.chat_id] = args.bot_id
+            _write_local_yaml(args.config, data)
+            print(f"bound: {_masked_chat_id(args.chat_id)} -> {args.bot_id}")
+            return 0
+
+        if args.bot_command == "unbind-chat":
+            data = _read_local_yaml(args.config)
+            chats = _ensure_mapping_path(data, "bindings", "chats")
+            chats.pop(args.chat_id, None)
+            _write_local_yaml(args.config, data)
+            print(f"unbound: {_masked_chat_id(args.chat_id)}")
+            return 0
+
+        if args.bot_command == "test":
+            config = load_config(args.config)
+            config = _select_profile_config(config, args.profile_id)
+            message_id = asyncio.run(
+                _smoke_feishu_card_with_bot(config, args.bot_id, args.chat_id)
+            )
+            print("bot smoke ok")
+            print(f"message_id: {_masked_message_id(message_id)}")
+            return 0
+    except Exception as exc:
+        print(f"error: {_sanitize_error(exc, locals().get('config'))}", file=sys.stderr)
+        return 1
+
+    print("error: bots command is required", file=sys.stderr)
+    return 2
+
+
+def _select_profile_config(config: dict[str, Any], profile_id: str | None) -> dict[str, Any]:
+    if not profile_id:
+        return config
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict) or profile_id not in profiles:
+        raise KeyError(f"unknown profile: {profile_id}")
+    profile_config = profiles[profile_id]
+    if not isinstance(profile_config, dict):
+        raise ValueError(f"profile {profile_id!r} must be a mapping")
+    selected = dict(config)
+    selected.update(profile_config)
+    selected["profiles"] = {}
+    return selected
+
+
+def _read_local_yaml(path: str | Path) -> dict:
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError("Config top-level YAML value must be a mapping")
+    return loaded
+
+
+def _write_local_yaml(path: str | Path, data: dict) -> None:
+    config_path = Path(path).expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    posix_transaction._atomic_write_text(
+        config_path,
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+    )
+
+
+def _ensure_mapping_path(data: dict, *path: str) -> dict:
+    current = data
+    for key in path:
+        value = current.get(key)
+        if value is None:
+            value = {}
+            current[key] = value
+        if not isinstance(value, dict):
+            raise ValueError(f"Config section {'.'.join(path)} must be a mapping")
+        current = value
+    return current
+
+
+def _config_has_bot(config: dict, bot_id: str) -> bool:
+    bots = config.get("bots")
+    if isinstance(bots, dict):
+        items = bots.get("items")
+        if isinstance(items, dict) and bot_id in items:
+            return True
+    return bot_id == "default" and _has_feishu_credentials(config)
+
+
+async def _smoke_feishu_card_with_bot(config: dict, bot_id: str, chat_id: str) -> str:
+    registry = BotRegistry.from_config(config)
+    bot = registry.get(bot_id)
+    bot_config = dict(config)
+    bot_config["feishu"] = {
+        "app_id": bot.app_id,
+        "app_secret": bot.app_secret,
+        "base_url": bot.base_url,
+        "timeout_seconds": bot.timeout_seconds,
+    }
+    return await _smoke_feishu_card(bot_config, chat_id)
+
+
+async def _smoke_feishu_card(config: dict, chat_id: str) -> str:
+    feishu = config.get("feishu", {})
+    app_id = feishu.get("app_id", "")
+    app_secret = feishu.get("app_secret", "")
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise ValueError("chat_id is required")
+    if not app_id or not app_secret:
+        raise ValueError("FEISHU_APP_ID and FEISHU_APP_SECRET are required")
+
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id=app_id,
+            app_secret=app_secret,
+            base_url=feishu.get("base_url", FeishuClientConfig.base_url),
+            timeout_seconds=feishu.get(
+                "timeout_seconds",
+                FeishuClientConfig.timeout_seconds,
+            ),
+        )
+    )
+    session = CardSession(
+        conversation_id="smoke",
+        message_id=f"smoke-{uuid4().hex}",
+        chat_id=chat_id,
+        thinking_text="飞书卡片 smoke test 正在运行。",
+    )
+    card_config = config.get("card", {})
+    title = card_config.get("title", "Hermes Agent")
+    footer_fields = card_config.get("footer_fields")
+    if not isinstance(footer_fields, list):
+        footer_fields = None
+    text_sizes = card_config.get("text_sizes")
+    if not isinstance(text_sizes, dict):
+        text_sizes = None
+    message_id = await client.send_card(
+        chat_id,
+        render_card(
+            session,
+            footer_fields=footer_fields,
+            title=title,
+            text_sizes=text_sizes,
+            width_mode=card_config.get("width_mode", "default"),
+        ),
+    )
+
+    completed = SidecarEvent(
+        schema_version="1",
+        event="message.completed",
+        conversation_id=session.conversation_id,
+        message_id=session.message_id,
+        chat_id=session.chat_id,
+        platform="feishu",
+        sequence=0,
+        created_at=time.time(),
+        data={
+            "answer": "飞书卡片 smoke test 已完成。",
+            "duration": 0.1,
+            "tokens": {"input_tokens": 0, "output_tokens": 0},
+        },
+    )
+    session.apply(completed)
+    await client.update_card_message(
+        message_id,
+        render_card(
+            session,
+            footer_fields=footer_fields,
+            title=title,
+            text_sizes=text_sizes,
+            width_mode=card_config.get("width_mode", "default"),
+        ),
+    )
+    return message_id
+
+
+def _sanitize_error(exc: Exception, config: dict | None) -> str:
+    message = str(exc)
+    for secret in _secret_values(config):
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    message = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "[redacted-auth]", message)
+    message = re.sub(r"tenant-token-[A-Za-z0-9._~+/=-]+", "tenant-token-[redacted]", message)
+    if isinstance(exc, FeishuAPIError):
+        return message
+    return message or exc.__class__.__name__
+
+
+def _secret_values(config: dict | None) -> list[str]:
+    if not isinstance(config, dict):
+        return []
+    secrets: list[str] = []
+    feishu = config.get("feishu")
+    if isinstance(feishu, dict) and isinstance(feishu.get("app_secret"), str):
+        secrets.append(feishu["app_secret"])
+    bots = config.get("bots")
+    if isinstance(bots, dict):
+        items = bots.get("items")
+        if isinstance(items, dict):
+            for value in items.values():
+                if isinstance(value, dict) and isinstance(value.get("app_secret"), str):
+                    secrets.append(value["app_secret"])
+    return secrets
+
+
+def _rollback_registrations(
+    registrations, *, catch_base: bool, observer_state=None
+) -> bool:
+    rollback_failed = False
+    for registration in reversed(registrations):
+        try:
+            rollback_with_evidence = getattr(
+                registration, "rollback_with_evidence", None
+            )
+            if callable(rollback_with_evidence):
+                before, after = rollback_with_evidence()
+                if observer_state is not None:
+                    observer_state["pm_rollback_before"] = before
+                    observer_state["pm_rollback_after"] = after
+            else:
+                registration.rollback()
+                snapshot = getattr(registration, "rollback_snapshot", None)
+                if observer_state is not None:
+                    if snapshot is not None:
+                        observer_state["marker_snapshot"] = snapshot
+                    elif hasattr(registration, "marker_before"):
+                        observer_state["marker_snapshot_missing"] = True
+        except BaseException as exc:
+            if observer_state is not None and hasattr(registration, "marker_before"):
+                observer_state["observer_rollback_error"] = exc
+                print(
+                    f"error: observer rollback did not complete: {exc}",
+                    file=sys.stderr,
+                )
+            if not catch_base and not isinstance(exc, (OSError, ValueError)):
+                raise
+            rollback_failed = True
+    return rollback_failed
+
+
+def _reconcile_observer_after_rollback(observer_state) -> bool:
+    if not observer_state or not observer_state.get("pm_registration_seen"):
+        return True
+    if observer_state.get("observer_rollback_error") is not None:
+        return False
+    if observer_state.get("marker_snapshot_missing"):
+        print(
+            "error: observer rollback reconciliation failed: marker snapshot unavailable",
+            file=sys.stderr,
+        )
+        return False
+    precondition = observer_state.get("observer_precondition")
+    if precondition is None:
+        return True
+    from .install import legacy_handoff
+
+    try:
+        outcome = legacy_handoff.reconcile_after_rollback(
+            precondition,
+            marker_snapshot=observer_state.get("marker_snapshot"),
+            pm_rollback_before=observer_state.get("pm_rollback_before"),
+            pm_rollback_after=observer_state.get("pm_rollback_after"),
+        )
+    except Exception as exc:
+        print(
+            f"error: observer rollback reconciliation failed: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    if outcome == "rebound":
+        print("observer: rebound to verified rollback runtime")
+    return True
+
+
+def _run_install(args: argparse.Namespace) -> int:
+    registrations = []
+    observer_state = {}
+    try:
+        result = _run_install_core(args, registrations, observer_state)
+    except BaseException:
+        rollback_failed = _rollback_registrations(
+            registrations, catch_base=True, observer_state=observer_state
+        )
+        if rollback_failed:
+            print(
+                "error: install rollback did not complete; evidence retained",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                _reconcile_observer_after_rollback(observer_state)
+            except BaseException as exc:
+                print(
+                    f"error: observer rollback reconciliation failed: {exc}",
+                    file=sys.stderr,
+                )
+        raise
+    if result == 0:
+        try:
+            for registration in registrations:
+                registration.finish()
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    rollback_failed = _rollback_registrations(
+        registrations, catch_base=False, observer_state=observer_state
+    )
+    if rollback_failed:
+        print(
+            "error: install rollback did not complete; evidence retained",
+            file=sys.stderr,
+        )
+        return 1
+    _reconcile_observer_after_rollback(observer_state)
+    return result
+
+
+def _run_install_core(args: argparse.Namespace, registrations, observer_state=None) -> int:
+    detection = detect_hermes(args.hermes_dir)
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+
+    try:
+        _read_manifest(_manifest_path(detection.root))
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    profile_id = getattr(args, "profile_id", None)
+    try:
+        from .install import legacy_handoff
+        observer_precondition = legacy_handoff.prepare(
+            detection,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=profile_id,
+        )
+        if observer_state is not None:
+            observer_state["observer_precondition"] = observer_precondition
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        home_options = {}
+        if getattr(args, "hermes_home", None) is not None:
+            home_options["hermes_home"] = configured_hermes_home(
+                detection.root, {"service": {"hermes_home": str(args.hermes_home)}},
+            )
+        registration = _ensure_hermes_runtime_package(
+            detection,
+            registrations=registrations,
+            observer_state=observer_state,
+            **home_options,
+        )
+        if registration is not None and all(
+            existing is not registration for existing in registrations
+        ):
+            registrations.append(registration)
+        if registration is not None and observer_state is not None:
+            observer_state["pm_registration_seen"] = True
+        if registration is not None and getattr(registration, 'adoption', None) is not None:
+            # Schema 3 owns the upstream-locked SDK in the PM generation. Never
+            # run the older pip fallback, which would replace it with 1.6.8.
+            if (_hermes_requires_feishu_sdk_capability(detection.root)
+                    and _check_runtime_feishu_sdk(registration.python)["status"] != "ok"):
+                raise ValueError("PM selected Feishu SDK is not verified")
+        else:
+            _ensure_hermes_feishu_sdk(detection, **home_options)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    fixed_tag_result = _run_fixed_tag_v3_install(args, detection)
+    if fixed_tag_result is not None:
+        return fixed_tag_result
+
+    from .install import legacy_observer
+    observer_registration = None
+    try:
+        if legacy_observer.available(detection.root):
+            binding = resolve_runtime_binding(
+                checkout_root=detection.root,
+                hermes_home=getattr(args, "hermes_home", None),
+                profile_id=profile_id,
+            )
+            adoption = registration if registration is not None and getattr(registration, 'adoption', None) is not None else None
+            if (observer_precondition is not None
+                    and binding.python_identity != observer_precondition.binding.python_identity
+                    and registration is not None
+                    and adoption is None):
+                handoff = legacy_handoff.apply(
+                    observer_precondition,
+                    binding,
+                    registration,
+                )
+                registrations.append(handoff)
+                observer_registration = None
+            else:
+                observer_registration = (legacy_observer.prepare(binding, adoption=adoption)
+                                         if adoption is not None else legacy_observer.prepare(binding))
+            if observer_registration is not None:
+                registrations.append(observer_registration)
+    except (OSError, UnicodeError, ValueError) as exc:
+        if observer_state is not None:
+            rollback_error = getattr(exc, "rollback_error", None)
+            if rollback_error is not None:
+                observer_state["observer_rollback_error"] = rollback_error
+                print(
+                    f"error: observer rollback did not complete: {rollback_error}",
+                    file=sys.stderr,
+                )
+            rollback_snapshot = getattr(exc, "rollback_snapshot", None)
+            if rollback_snapshot is not None:
+                observer_state["marker_snapshot"] = rollback_snapshot
+            elif getattr(exc, "marker_written", False):
+                observer_state["marker_snapshot_missing"] = True
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if detection.decomposed:
+        from .install.recovery import install_decomposed
+        try:
+            changed = install_decomposed(
+                detection, no_repair=bool(getattr(args, "no_repair", False)),
+                accept_hermes_upgrade=bool(getattr(args, "accept_hermes_upgrade", False)))
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print("install ok" if changed else "install ok (already installed)")
+        if changed or observer_registration is not None:
+            print("gateway.restart_required: hermes gateway start")
+        return 0
+
+    accept_hermes_upgrade = bool(
+        getattr(args, "accept_hermes_upgrade", False)
+    )
+    no_repair = bool(getattr(args, "no_repair", False))
+    run_py = detection.run_py
+    backup_path = _backup_path(run_py)
+    cron_evidence_py = detection.cron_py
+    cron_evidence_backup_path = (
+        _backup_path(cron_evidence_py) if cron_evidence_py is not None else None
+    )
+    cron_py = detection.cron_py if detection.cron_py_exists else None
+    cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
+    base_evidence_py = detection.base_py
+    base_evidence_backup_path = (
+        _backup_path(base_evidence_py) if base_evidence_py is not None else None
+    )
+    base_py = detection.base_py if detection.base_required else None
+    base_backup_path = _backup_path(base_py) if base_py is not None else None
+    manifest_path = _manifest_path(detection.root)
+    manifestless_owned_upgrade = False
+    if backup_path.exists() and not manifest_path.exists() and not no_repair:
+        try:
+            _validate_existing_install_state(
+                run_py,
+                backup_path,
+                manifest_path,
+                cron_py=cron_evidence_py,
+                cron_backup_path=cron_evidence_backup_path,
+                base_py=base_evidence_py,
+                base_backup_path=base_evidence_backup_path,
+                allow_manifestless_owned_upgrade=True,
+            )
+            if (
+                not detection.base_required
+                and base_evidence_py is not None
+                and base_evidence_backup_path is not None
+                and _managed_restore_evidence_exists(
+                    base_evidence_py,
+                    base_evidence_backup_path,
+                    remove_owned_patch=remove_base_patch,
+                )
+            ):
+                raise ValueError(
+                    "install state incomplete; unexpected exact Base ownership "
+                    "evidence without manifest"
+                )
+        except (OSError, UnicodeError, ValueError):
+            pass
+        else:
+            manifestless_owned_upgrade = True
+
+    recovery_plan = plan_recovery(
+        detection,
+        accept_hermes_upgrade=accept_hermes_upgrade,
+    )
+    if recovery_plan.actions and not manifestless_owned_upgrade:
+        if not recovery_plan.executable:
+            print(
+                "error: "
+                + _recovery_refusal_message(
+                    recovery_plan,
+                    accept_hermes_upgrade=accept_hermes_upgrade,
+                    hermes_root=detection.root,
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        if not no_repair:
+            try:
+                recovery_result = execute_recovery(
+                    detection,
+                    expected_fingerprint=recovery_plan.fingerprint,
+                    accept_hermes_upgrade=accept_hermes_upgrade,
+                )
+            except (OSError, UnicodeError, RecoveryRefused) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            for action in recovery_result.actions:
+                print(action)
+
+    original: str | None = None
+    cron_original: str | None = None
+    base_original: str | None = None
+    manifest_existed = False
+    backup_existed = False
+    cron_backup_existed = False
+    base_backup_existed = False
+    gateway_restart_required = False
+    transactional_install = posix_transaction._cli_dirfd_binding_supported()
+
+    try:
+        install_paths = {
+            "run.py": run_py,
+            "run.py backup": backup_path,
+            "install manifest": manifest_path,
+        }
+        if cron_py is not None and cron_backup_path is not None:
+            install_paths["cron scheduler"] = cron_py
+            install_paths["cron backup"] = cron_backup_path
+        elif (
+            cron_evidence_py is not None
+            and cron_evidence_backup_path is not None
+        ):
+            install_paths["cron scheduler"] = cron_evidence_py
+            install_paths["cron backup"] = cron_evidence_backup_path
+        if base_py is not None and base_backup_path is not None:
+            install_paths["exact Base"] = base_py
+            install_paths["exact Base backup"] = base_backup_path
+        elif (
+            base_evidence_py is not None
+            and base_evidence_backup_path is not None
+        ):
+            install_paths["exact Base"] = base_evidence_py
+            install_paths["exact Base backup"] = base_evidence_backup_path
+        install_identities, install_directory_identities = _snapshot_restore_evidence(
+            detection.root, install_paths
+        )
+        original = _read_restore_text(run_py, install_identities.get(run_py))
+        cron_original = (
+            _read_restore_text(cron_py, install_identities.get(cron_py))
+            if cron_py is not None
+            else None
+        )
+        base_original = (
+            _read_restore_text(base_py, install_identities.get(base_py))
+            if base_py is not None
+            else None
+        )
+        manifest_existed = install_identities.get(manifest_path) is not None
+        backup_existed = install_identities.get(backup_path) is not None
+        cron_backup_existed = bool(
+            cron_backup_path is not None
+            and install_identities.get(cron_backup_path) is not None
+        )
+        base_backup_existed = bool(
+            base_backup_path is not None
+            and install_identities.get(base_backup_path) is not None
+        )
+        _validate_existing_install_state(
+            run_py,
+            backup_path,
+            manifest_path,
+            cron_py=cron_evidence_py,
+            cron_backup_path=cron_evidence_backup_path,
+            base_py=base_evidence_py,
+            base_backup_path=base_evidence_backup_path,
+            allow_manifestless_owned_upgrade=manifestless_owned_upgrade,
+        )
+        run_backup_source = (
+            _read_restore_text(
+                backup_path, install_identities.get(backup_path)
+            )
+            if backup_existed
+            else original
+        )
+        cron_backup_source = (
+            _read_restore_text(
+                cron_backup_path, install_identities.get(cron_backup_path)
+            )
+            if cron_backup_path is not None and cron_backup_existed
+            else cron_original
+        )
+        base_backup_source = (
+            _read_restore_text(
+                base_backup_path, install_identities.get(base_backup_path)
+            )
+            if base_backup_path is not None and base_backup_existed
+            else base_original
+        )
+        patched = apply_patch(
+            original, strategy=detection.hook_strategy or "legacy_gateway_run"
+        )
+        cron_patched = (
+            apply_cron_patch(cron_original)
+            if cron_py is not None and cron_original is not None
+            else None
+        )
+        base_patched = (
+            apply_base_patch(base_original)
+            if base_py is not None and base_original is not None
+            else None
+        )
+        gateway_restart_required = bool(
+            observer_registration is not None or patched != original
+            or (
+                cron_patched is not None
+                and cron_original is not None
+                and cron_patched != cron_original
+            )
+            or (
+                base_patched is not None
+                and base_original is not None
+                and base_patched != base_original
+            )
+        )
+        manifest_contents = _render_install_manifest(
+            manifest_path,
+            run_py=run_py,
+            run_contents=patched,
+            backup_path=backup_path,
+            run_source=run_backup_source,
+            cron_py=cron_py,
+            cron_contents=cron_patched,
+            cron_backup_path=cron_backup_path,
+            cron_source=cron_backup_source,
+            base_py=base_py,
+            base_contents=base_patched,
+            base_backup_path=base_backup_path,
+            base_source=base_backup_source,
+        )
+        changes: list[tuple[Path, str]] = []
+        if (
+            base_py is not None
+            and base_backup_path is not None
+            and not base_backup_existed
+        ):
+            changes.append((base_backup_path, base_backup_source or ""))
+        if not backup_existed:
+            changes.append((backup_path, run_backup_source))
+        if (
+            cron_py is not None
+            and cron_backup_path is not None
+            and not cron_backup_existed
+        ):
+            changes.append((cron_backup_path, cron_backup_source or ""))
+        # The Base contract must exist before run.py can stage exact completion.
+        if (
+            base_py is not None
+            and base_patched is not None
+            and base_original is not None
+            and base_patched != base_original
+        ):
+            changes.append((base_py, base_patched))
+        if patched != original:
+            changes.append((run_py, patched))
+        if (
+            cron_py is not None
+            and cron_patched is not None
+            and cron_original is not None
+            and cron_patched != cron_original
+        ):
+            changes.append((cron_py, cron_patched))
+        changes.append((manifest_path, manifest_contents))
+        if transactional_install:
+            posix_transaction._write_targets_transactionally(
+                changes,
+                expected_identities=install_identities,
+                expected_directories=install_directory_identities,
+                preserve_earlier_writes_on_rollback_failure=True,
+            )
+        else:
+            _write_targets_portably(
+                changes,
+                expected_identities=install_identities,
+                expected_directories=install_directory_identities,
+                preserve_earlier_writes_on_rollback_failure=True,
+            )
+    except (OSError, UnicodeError, ValueError) as exc:
+        message = str(exc)
+        if message.startswith("restore transaction rollback failed"):
+            message = message.replace(
+                "restore transaction rollback failed",
+                "install rollback failed",
+                1,
+            )
+        print(f"error: {message}", file=sys.stderr)
+        return 1
+
+    if manifestless_owned_upgrade:
+        print("manifest: rebuilt")
+    print("install ok")
+    if gateway_restart_required:
+        print("gateway.restart_required: hermes gateway start")
+    return 0
+
+
+def _run_fixed_tag_v3_install(
+    args: argparse.Namespace,
+    detection: HermesDetection,
+) -> int | None:
+    if not is_fixed_tag_checkout(detection.root):
+        return None
+    manifest_path = detection.root / MANIFEST_NAME
+    manifest_version = _manifest_version_candidate(manifest_path)
+    if manifest_version in {1, 2}:
+        try:
+            # Legacy ownership is restored before V3 binding requirements;
+            # the verified original snapshot is then re-probed and rendered.
+            _restore(detection.root)
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"error: legacy migration restore failed: {exc}", file=sys.stderr)
+            return 1
+        print("manifest: restored verified Legacy source for V3 migration")
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=detection.root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        entrypoint = probe_plugin_entrypoint(
+            binding,
+            expected_version=PACKAGE_VERSION,
+        )
+        if entrypoint.status != "verified":
+            raise FixedTagInstallRefused(
+                "plugin entry point verification failed: " + entrypoint.reason
+            )
+        if _is_v3_manifest_candidate(manifest_path):
+            result = inspect_fixed_tag_hybrid_install(
+                binding=binding,
+                entrypoint=entrypoint,
+                package_version=PACKAGE_VERSION,
+            )
+            print("integration.mode: hybrid")
+            print("install ok")
+            return 0
+        integration = detect_fixed_tag_integration(
+            detection.root,
+            runtime_python=binding.runtime_python,
+        )
+        if not integration.decision.supported:
+            raise FixedTagInstallRefused(integration.decision.reason)
+        result = execute_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            decision=integration.decision,
+            source_commit=integration.native_probe.source_commit,
+            plugin_evidence_sha256=(
+                integration.native_probe.plugin_evidence_sha256
+            ),
+            package_version=PACKAGE_VERSION,
+        )
+    except (OSError, UnicodeError, RuntimeBindingRefused, FixedTagInstallRefused) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("integration.mode: hybrid")
+    print("install ok")
+    if result.gateway_restart_required:
+        print("gateway.restart_required: hermes gateway start")
+    return 0
+
+
+def _is_v3_manifest_candidate(path: Path) -> bool:
+    return _manifest_version_candidate(path) == 3
+
+
+def _manifest_version_candidate(path: Path) -> int | None:
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if type(value) is not dict:
+        return None
+    if "manifest_version" not in value:
+        return 1
+    version = value.get("manifest_version")
+    return version if type(version) is int and not isinstance(version, bool) else None
+
+
+def _run_repair(args: argparse.Namespace) -> int:
+    fixed_tag_result = _run_fixed_tag_v3_repair(args)
+    if fixed_tag_result is not None:
+        return fixed_tag_result
+    detection = detect_hermes(args.hermes_dir)
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+    try:
+        _read_manifest(_manifest_path(detection.root))
+        actions = _repair_install_state(
+            detection,
+            accept_hermes_upgrade=bool(
+                getattr(args, "accept_hermes_upgrade", False)
+            ),
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if actions:
+        for action in actions:
+            print(action)
+    else:
+        print("repair: no changes")
+    print("repair ok")
+    return 0
+
+
+def _run_fixed_tag_v3_repair(args: argparse.Namespace) -> int | None:
+    root = Path(args.hermes_dir).expanduser()
+    manifest_path = root / MANIFEST_NAME
+    if not _is_v3_manifest_candidate(manifest_path):
+        return None
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("phase") == "installed":
+            entrypoint = probe_plugin_entrypoint(
+                binding, expected_version=PACKAGE_VERSION
+            )
+            inspect_fixed_tag_hybrid_install(
+                binding=binding,
+                entrypoint=entrypoint,
+                package_version=PACKAGE_VERSION,
+            )
+            print("repair: no changes")
+        else:
+            restore_fixed_tag_hybrid_install(binding=binding)
+            print("install state: recovered incomplete V3 transaction")
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RuntimeBindingRefused,
+        FixedTagInstallRefused,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("repair ok")
+    return 0
+
+
+def _run_restore(args: argparse.Namespace) -> int:
+    fixed_tag_result = _run_fixed_tag_v3_restore(args, command="restore")
+    if fixed_tag_result is not None:
+        return fixed_tag_result
+    try:
+        result = _restore(Path(args.hermes_dir), retain_adoption=True, **(
+            {"hermes_home": Path(args.hermes_home)} if getattr(args, "hermes_home", None) else {}
+        ))
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if result in {"adoption-restored", "adoption-clean"}:
+        print("shared checkout source restored; PM dependency, SDK, config and observer receipt retained")
+        print("gateway.restart_required: restart Hermes Gateway through its service owner")
+    else:
+        print("restore ok")
+    return 0
+
+
+def _run_uninstall(args: argparse.Namespace) -> int:
+    root = Path(args.hermes_dir).expanduser()
+    try:
+        from .install import legacy_observer
+        raw = legacy_observer._read(root / legacy_observer.MARKER)
+        if raw is not None and legacy_observer._decode(raw)["protocol"] == legacy_observer.ADOPTION_PROTOCOL:
+            from .install import legacy_9b904_uninstall
+            if getattr(args, "profile_id", None):
+                raise ValueError("legacy uninstall requires the bound HOME; pass --hermes-home")
+            home = getattr(args, "hermes_home", None)
+            legacy_9b904_uninstall.uninstall(root, home=Path(home) if home else None)
+            print("uninstall ok: this Hermes HOME is disabled; shared source, dependency and receipt retained")
+            print("gateway.restart_required: restart Hermes Gateway through its service owner")
+            return 0
+        _refuse_orphaned_uninstall(root, getattr(args, "hermes_home", None))
+        _refuse_adoption_removal(root)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    fixed_tag_result = _run_fixed_tag_v3_restore(args, command="uninstall")
+    if fixed_tag_result is not None:
+        return fixed_tag_result
+    try:
+        _restore(Path(args.hermes_dir), refuse_adoption=True, **(
+            {"hermes_home": Path(args.hermes_home)} if getattr(args, "hermes_home", None) else {}
+        ))
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    from .install import pm_dependency
+    try:
+        if pm_dependency.available(root):
+            home = getattr(args, "hermes_home", None)
+            python = _detect_hermes_runtime_python(root, **({"hermes_home": Path(home)} if home else {}))
+            if python is None:
+                raise ValueError("PM runtime unavailable; owned dependency retained")
+            pm_dependency.remove(root, python, home=Path(home) if home else None)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("uninstall ok")
+    return 0
+
+
+def _refuse_orphaned_uninstall(root: Path, explicit_home: str | Path | None) -> None:
+    """Do not restore shared source while an owned HOME ticket lacks its marker."""
+    from .install import legacy_home_revocation
+    candidates = [Path(explicit_home).expanduser().absolute()] if explicit_home else []
+    if explicit_home is None:
+        if os.environ.get("HERMES_HOME"):
+            candidates.append(Path(os.environ["HERMES_HOME"]).expanduser().absolute())
+        candidates.append(root.absolute().parent)
+    for home in candidates:
+        path = legacy_home_revocation.ticket_path(root, home)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        raise ValueError("legacy uninstall evidence exists without its observer receipt; manual review required")
+
+
+def _refuse_adoption_removal(root: Path) -> None:
+    from .install import legacy_observer
+    raw = legacy_observer._read(root / legacy_observer.MARKER)
+    if raw is not None and legacy_observer._decode(raw)["protocol"] == legacy_observer.ADOPTION_PROTOCOL:
+        raise ValueError("legacy adoption restore or uninstall needs a coordinated PM transaction")
+
+
+def _run_fixed_tag_v3_restore(
+    args: argparse.Namespace,
+    *,
+    command: str,
+) -> int | None:
+    root = Path(args.hermes_dir).expanduser()
+    if not _is_v3_manifest_candidate(root / MANIFEST_NAME):
+        return None
+    try:
+        _refuse_adoption_removal(root)
+        binding = resolve_runtime_binding(
+            checkout_root=root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        result = restore_fixed_tag_hybrid_install(binding=binding)
+    except (OSError, UnicodeError, ValueError, RuntimeBindingRefused, FixedTagInstallRefused) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"{command} ok")
+    if result.gateway_restart_required:
+        print("gateway.restart_required: hermes gateway start")
+    return 0
+
+
+def _automatic_repair_available(detection: HermesDetection) -> bool:
+    plan = plan_recovery(detection)
+    return bool(plan.actions and plan.executable)
+
+
+def _repair_install_state(
+    detection: HermesDetection,
+    *,
+    dry_run: bool = False,
+    accept_hermes_upgrade: bool = False,
+) -> list[str]:
+    from .install import legacy_observer
+    legacy_observer.inspect(detection.root)
+    plan = plan_recovery(
+        detection,
+        accept_hermes_upgrade=accept_hermes_upgrade,
+    )
+    if not plan.actions:
+        healthy_noop = bool(
+            plan.state in {"clean", "installed"}
+            and not any(finding.severity == "error" for finding in plan.findings)
+        )
+        if healthy_noop:
+            return []
+        raise RecoveryRefused(
+            _recovery_refusal_message(
+                plan,
+                accept_hermes_upgrade=accept_hermes_upgrade,
+                hermes_root=detection.root,
+            )
+        )
+    if not plan.executable:
+        raise RecoveryRefused(
+            _recovery_refusal_message(
+                plan,
+                accept_hermes_upgrade=accept_hermes_upgrade,
+                hermes_root=detection.root,
+            )
+        )
+    if dry_run:
+        return [_repair_action_message(action) for action in plan.actions]
+    return list(
+        execute_recovery(
+            detection,
+            expected_fingerprint=plan.fingerprint,
+            accept_hermes_upgrade=accept_hermes_upgrade,
+        ).actions
+    )
+
+
+def _recovery_refusal_message(
+    plan,
+    *,
+    accept_hermes_upgrade: bool,
+    hermes_root: Path | None = None,
+) -> str:
+    message = _first_refusal(plan)
+    if plan.state in {"stale_unpatched", "stale_reapplied"} and not accept_hermes_upgrade:
+        if hermes_root is None:
+            command = "--accept-hermes-upgrade --yes"
+        else:
+            command = (
+                "python -m hermes_feishu_card.cli install --hermes-dir "
+                f"{shlex.quote(str(hermes_root))} "
+                "--accept-hermes-upgrade --yes"
+            )
+        message += f" If Hermes was intentionally upgraded, rerun: {command}."
+    return message
+
+
+def _repair_action_message(action: str) -> str:
+    messages = {
+        "restore_verified_backup": "run.py: restored verified backup",
+        "reapply_current_hook": "run.py: reapplied current hook",
+        "rebuild_backup": "backup: recreated",
+        "rebuild_manifest": "manifest: rebuilt",
+        "restore_verified_cron_backup": "cron scheduler: restored verified backup",
+        "reapply_current_cron_hook": "cron scheduler: reapplied current hook",
+        "rebuild_cron_backup": "cron backup: recreated",
+        "restore_verified_base_backup": "exact Base: restored verified backup",
+        "reapply_current_base_hook": "exact Base: reapplied current hook",
+        "rebuild_base_backup": "exact Base backup: recreated",
+        "clear_stale_install_state": "install state: cleared stale unpatched state",
+    }
+    return messages[action]
+
+
+def _restore(hermes_root: Path, *, hermes_home: Path | None = None, refuse_adoption: bool = False,
+             retain_adoption: bool = False) -> str | None:
+    from .install import legacy_observer, posix_transaction as io
+    # Validate config ownership before touching source. Restore the config first:
+    # if the source transaction then fails, its still-owned marker is retained
+    # and a retry can finish safely without enabling a second event producer.
+    evidence = legacy_observer.inspect(hermes_root, home=hermes_home)
+    marker_snapshot = None
+    if evidence is not None:
+        record, raw, preimage, ownership, config = evidence
+        if record["protocol"] == legacy_observer.ADOPTION_PROTOCOL and (refuse_adoption or not retain_adoption):
+            raise ValueError("legacy adoption restore or uninstall needs a coordinated PM transaction")
+        marker_snapshot = io.read_path_snapshot(hermes_root / legacy_observer.MARKER, ValueError,
+                                                "legacy observer record changed before restore")
+        if marker_snapshot[2] != hashlib.sha256(raw).hexdigest():
+            raise ValueError("legacy observer record changed before restore")
+        binding = resolve_runtime_binding(
+            checkout_root=hermes_root, hermes_home=record["home"], profile_id=None)
+        if binding.python_identity != record["python_identity"]:
+            raise ValueError("legacy observer runtime binding changed")
+        if retain_adoption and record["protocol"] == legacy_observer.ADOPTION_PROTOCOL:
+            from .install import recovery as recovery_owner
+            detection = detect_hermes(hermes_root)
+            if not detection.decomposed:
+                raise ValueError("legacy adoption source layout is unsupported")
+            changed = recovery_owner.restore_decomposed(
+                detection, adoption_marker=marker_snapshot, adoption_home=binding.hermes_home)
+            return "adoption-restored" if changed else "adoption-clean"
+        from .install import plugin
+        if plugin._sha256(config) != ownership.pre_sha256:
+            plugin.restore_plugin_config(binding, preimage, ownership)
+    if refuse_adoption or retain_adoption:
+        _restore_legacy_sources(hermes_root, refuse_adoption=True)
+    else:
+        _restore_legacy_sources(hermes_root)
+    if marker_snapshot is not None:
+        legacy_observer.restore(hermes_root, home=hermes_home, expected_marker=marker_snapshot)
+
+
+def _restore_legacy_sources(hermes_root: Path, *, refuse_adoption: bool = False) -> None:
+    from .install import decomposed_ownership
+    from .install import recovery as recovery_owner
+    detection = detect_hermes(hermes_root)
+    if detection.decomposed or decomposed_ownership.is_managed(hermes_root):
+        if refuse_adoption:
+            recovery_owner.restore_decomposed(detection, refuse_adoption=True)
+        else:
+            recovery_owner.restore_decomposed(detection)
+        return
+    run_py = hermes_root / "gateway" / "run.py"
+    cron_py = hermes_root / "cron" / "scheduler.py"
+    base_py = hermes_root / "gateway" / "platforms" / "base.py"
+    backup_path = _backup_path(run_py)
+    cron_backup_path = _backup_path(cron_py)
+    base_backup_path = _backup_path(base_py)
+    manifest_path = _manifest_path(hermes_root)
+    restore_identities, restore_directory_identities = _snapshot_restore_evidence(
+        hermes_root,
+        {
+            "gateway/run.py": run_py,
+            "gateway/run.py backup": backup_path,
+            "cron scheduler": cron_py,
+            "cron backup": cron_backup_path,
+            "exact Base": base_py,
+            "exact Base backup": base_backup_path,
+            "manifest": manifest_path,
+        },
+    )
+    read_restore_text = lambda path: _read_restore_text(
+        path, restore_identities[path]
+    )
+    restore_file_hash = lambda path: hashlib.sha256(
+        read_restore_text(path).encode("utf-8")
+    ).hexdigest()
+    manifest = _read_restore_manifest(manifest_path, read_restore_text)
+    if manifest is not None:
+        if not _manifest_has_cron(
+            manifest
+        ) and _legacy_managed_evidence_requires_refusal(
+            cron_py,
+            cron_backup_path,
+            remove_owned_patch=remove_cron_patch,
+            apply_owned_patch=apply_cron_patch,
+            read_text=read_restore_text,
+        ):
+            raise ValueError(
+                "install state incomplete; cron evidence exists but manifest "
+                "ownership is missing; refusing to restore"
+            )
+        if not _manifest_has_base(
+            manifest
+        ) and _legacy_managed_evidence_requires_refusal(
+            base_py,
+            base_backup_path,
+            remove_owned_patch=remove_base_patch,
+            apply_owned_patch=apply_base_patch,
+            read_text=read_restore_text,
+        ):
+            raise ValueError(
+                "install state incomplete; exact Base evidence exists but manifest "
+                "ownership is missing; refusing to restore"
+            )
+    if backup_path.exists():
+        if manifest is None:
+            if _managed_restore_evidence_exists(
+                cron_py,
+                cron_backup_path,
+                remove_owned_patch=remove_cron_patch,
+                read_text=read_restore_text,
+            ):
+                raise ValueError(
+                    "install state incomplete; cron evidence exists without "
+                    "manifest; refusing to restore"
+                )
+            if _managed_restore_evidence_exists(
+                base_py,
+                base_backup_path,
+                remove_owned_patch=remove_base_patch,
+                read_text=read_restore_text,
+            ):
+                raise ValueError(
+                    "install state incomplete; exact Base evidence exists without "
+                    "manifest; refusing to restore"
+                )
+            backup_text = read_restore_text(backup_path)
+            _validate_backup_contains_original(backup_text, "restore")
+            if run_py.exists() and read_restore_text(run_py) == backup_text:
+                _assert_restore_evidence_set_unchanged(restore_identities)
+                _clear_install_state(
+                    backup_path,
+                    manifest_path,
+                    manifest=None,
+                    restore_identities=restore_identities,
+                    restore_directory_identities=restore_directory_identities,
+                )
+                return
+
+            current = read_restore_text(run_py) if run_py.exists() else ""
+            try:
+                if run_py.exists() and remove_patch(current) == backup_text:
+                    _assert_restore_evidence_set_unchanged(restore_identities)
+                    posix_transaction._write_targets_transactionally(
+                        [(run_py, backup_text)],
+                        expected_identities=restore_identities,
+                        expected_directories=restore_directory_identities,
+                    )
+                    _clear_install_state(
+                        backup_path,
+                        manifest_path,
+                        manifest=None,
+                        restore_identities=restore_identities,
+                        restore_directory_identities=restore_directory_identities,
+                    )
+                    return
+            except ValueError:
+                pass
+
+            patched_backup = apply_patch(backup_text)
+            if not run_py.exists() or current != patched_backup:
+                raise ValueError("run.py changed since install; refusing to restore")
+
+            _assert_restore_evidence_set_unchanged(restore_identities)
+            posix_transaction._write_targets_transactionally(
+                [(run_py, backup_text)],
+                expected_identities=restore_identities,
+                expected_directories=restore_directory_identities,
+            )
+            _clear_install_state(
+                backup_path,
+                manifest_path,
+                manifest=None,
+                restore_identities=restore_identities,
+                restore_directory_identities=restore_directory_identities,
+            )
+            return
+
+        backup_text = _validate_restorable_install_state(
+            run_py,
+            backup_path,
+            manifest,
+            "restore",
+            cron_py=cron_py,
+            cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
+            read_text=read_restore_text,
+            file_hash=restore_file_hash,
+        )
+        cron_backup_text = (
+            read_restore_text(cron_backup_path)
+            if _manifest_has_cron(manifest) and cron_backup_path.exists()
+            else None
+        )
+        base_backup_text = (
+            read_restore_text(base_backup_path)
+            if _manifest_has_base(manifest) and base_backup_path.exists()
+            else None
+        )
+        target_changes = []
+        if base_backup_text is not None:
+            target_changes.append((base_py, base_backup_text))
+        target_changes.append((run_py, backup_text))
+        if cron_backup_text is not None:
+            target_changes.append((cron_py, cron_backup_text))
+        _assert_restore_evidence_set_unchanged(restore_identities)
+        posix_transaction._write_targets_transactionally(
+            target_changes,
+            expected_identities=restore_identities,
+            expected_directories=restore_directory_identities,
+        )
+        _clear_install_state(
+            backup_path,
+            manifest_path,
+            manifest=manifest,
+            restore_identities=restore_identities,
+            restore_directory_identities=restore_directory_identities,
+        )
+        return
+
+    if manifest is not None and _manifest_has_cron(manifest):
+        raise ValueError(
+            "install state incomplete; owned cron state but run.py backup is "
+            "missing; refusing to restore"
+        )
+    if manifest is not None and _manifest_has_base(manifest):
+        raise ValueError(
+            "install state incomplete; owned exact Base state but run.py backup is "
+            "missing; refusing to restore"
+        )
+    if _managed_restore_evidence_exists(
+        cron_py,
+        cron_backup_path,
+        remove_owned_patch=remove_cron_patch,
+        read_text=read_restore_text,
+    ):
+        raise ValueError(
+            "install state incomplete; cron evidence exists without restorable "
+            "run.py state; refusing to restore"
+        )
+    if _managed_restore_evidence_exists(
+        base_py,
+        base_backup_path,
+        remove_owned_patch=remove_base_patch,
+        read_text=read_restore_text,
+    ):
+        raise ValueError(
+            "install state incomplete; exact Base evidence exists without restorable "
+            "run.py state; refusing to restore"
+        )
+    if not run_py.exists():
+        return
+
+    current = read_restore_text(run_py)
+    if manifest_path.exists() and remove_patch(current) == current:
+        if manifest is not None and (_manifest_has_cron(manifest) or _manifest_has_base(manifest)):
+            raise ValueError(
+                "install state incomplete; owned target backup missing; refusing to restore"
+            )
+        _assert_restore_evidence_set_unchanged(restore_identities)
+        _clear_install_state(
+            backup_path,
+            manifest_path,
+            manifest=manifest,
+            restore_identities=restore_identities,
+            restore_directory_identities=restore_directory_identities,
+        )
+        return
+
+    if manifest is not None:
+        patched_sha256 = manifest.get("patched_sha256")
+        if not isinstance(patched_sha256, str) or not patched_sha256:
+            if remove_patch(current) != current:
+                raise ValueError("manifest missing patched run.py sha256")
+        elif restore_file_hash(run_py) != patched_sha256:
+            raise ValueError("run.py changed since install; refusing to restore")
+
+    restored_contents = remove_patch(current)
+    restored = restored_contents != current
+    if restored:
+        _assert_restore_evidence_set_unchanged(restore_identities)
+        posix_transaction._write_targets_transactionally(
+            [(run_py, restored_contents)],
+            expected_identities=restore_identities,
+            expected_directories=restore_directory_identities,
+        )
+    if restored or backup_path.exists() or manifest_path.exists():
+        _clear_install_state(
+            backup_path,
+            manifest_path,
+            manifest=manifest,
+            restore_identities=restore_identities,
+            restore_directory_identities=restore_directory_identities,
+        )
+
+
+def _backup_path(run_py: Path) -> Path:
+    return run_py.with_name(f"{run_py.name}{BACKUP_SUFFIX}")
+
+
+def _read_restore_manifest(
+    manifest_path: Path, read_text: Callable[[Path], str]
+) -> dict[str, object] | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(read_text(manifest_path))
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest could not be parsed") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest could not be parsed")
+    validate_install_manifest(manifest)
+    return manifest
+
+
+def _legacy_managed_evidence_requires_refusal(
+    target_py: Path,
+    target_backup_path: Path,
+    *,
+    remove_owned_patch: Callable[[str], str],
+    apply_owned_patch: Callable[[str], str],
+    read_text: Callable[[Path], str] | None = None,
+) -> bool:
+    if read_text is None:
+        read_text = _read_text_preserve_newlines
+    target_exists = target_py.exists()
+    backup_exists = target_backup_path.exists()
+    try:
+        if target_exists:
+            current = read_text(target_py)
+            if remove_owned_patch(current) != current:
+                return True
+        if not backup_exists:
+            return False
+        backup = read_text(target_backup_path)
+        if remove_owned_patch(backup) != backup:
+            return True
+        try:
+            patched_backup = apply_owned_patch(backup)
+        except ValueError:
+            return False
+        return (
+            patched_backup != backup
+            and remove_owned_patch(patched_backup) == backup
+        )
+    except (OSError, UnicodeError, ValueError):
+        return True
+
+
+def _managed_restore_evidence_exists(
+    target_py: Path,
+    target_backup_path: Path,
+    *,
+    remove_owned_patch,
+    read_text: Callable[[Path], str] | None = None,
+) -> bool:
+    if read_text is None:
+        read_text = _read_text_preserve_newlines
+    if target_backup_path.is_symlink() or target_backup_path.exists():
+        return True
+    if target_py.is_symlink():
+        return True
+    if not target_py.exists():
+        return False
+    try:
+        current = read_text(target_py)
+        return remove_owned_patch(current) != current
+    except (OSError, UnicodeError, ValueError):
+        return True
+
+
+def _manifest_path(hermes_root: Path) -> Path:
+    return hermes_root / MANIFEST_NAME
+
+
+def _clear_install_state(
+    backup_path: Path,
+    manifest_path: Path,
+    *,
+    manifest: dict[str, object] | None,
+    restore_identities: dict[Path, _RestoreEvidenceSnapshot | None] | None = None,
+    restore_directory_identities: dict[Path, _RestoreIdentity | None] | None = None,
+) -> None:
+    paths_to_remove = [backup_path]
+    if manifest is not None and _manifest_has_cron(manifest):
+        cron_backup_path = (
+            backup_path.parent.parent / "cron" / f"scheduler.py{BACKUP_SUFFIX}"
+        )
+        paths_to_remove.append(cron_backup_path)
+    if manifest is not None and _manifest_has_base(manifest):
+        base_backup_path = (
+            backup_path.parent / "platforms" / f"base.py{BACKUP_SUFFIX}"
+        )
+        paths_to_remove.append(base_backup_path)
+    paths_to_remove.append(manifest_path)
+    if restore_identities is None:
+        for path in paths_to_remove:
+            path.unlink(missing_ok=True)
+        return
+    posix_transaction._remove_verified_restore_evidence(
+        paths_to_remove, restore_identities, restore_directory_identities
+    )
+
+
+def _snapshot_transaction_write(
+    path: Path, expected_contents: str
+) -> _RestoreEvidenceSnapshot:
+    try:
+        snapshot = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("restore transaction lost write ownership") from exc
+    if not stat.S_ISREG(snapshot.st_mode):
+        raise ValueError("restore transaction lost write ownership")
+    identity = (snapshot.st_dev, snapshot.st_ino)
+    contents = _read_restore_text(path, identity)
+    digest = _restore_text_sha256(contents)
+    if digest != _restore_text_sha256(expected_contents):
+        raise ValueError("restore transaction could not verify committed write")
+    return snapshot.st_dev, snapshot.st_ino, digest
+
+
+def _write_manifest(
+    manifest_path: Path,
+    run_py: Path,
+    backup_path: Path,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
+) -> None:
+    run_contents = _read_text_preserve_newlines(run_py)
+    run_source = _read_text_preserve_newlines(backup_path)
+    cron_contents = (
+        _read_text_preserve_newlines(cron_py)
+        if cron_py is not None and cron_backup_path is not None and cron_py.exists()
+        else None
+    )
+    cron_source = (
+        _read_text_preserve_newlines(cron_backup_path)
+        if cron_contents is not None
+        and cron_backup_path is not None
+        and cron_backup_path.exists()
+        else None
+    )
+    base_contents = (
+        _read_text_preserve_newlines(base_py)
+        if base_py is not None and base_backup_path is not None and base_py.exists()
+        else None
+    )
+    if base_contents is not None and (
+        base_backup_path is None or not base_backup_path.exists()
+    ):
+        raise ValueError("exact Base backup missing; refusing to write manifest")
+    base_source = (
+        _read_text_preserve_newlines(base_backup_path)
+        if base_contents is not None and base_backup_path is not None
+        else None
+    )
+    rendered = _render_install_manifest(
+        manifest_path,
+        run_py=run_py,
+        run_contents=run_contents,
+        backup_path=backup_path,
+        run_source=run_source,
+        cron_py=cron_py,
+        cron_contents=cron_contents,
+        cron_backup_path=cron_backup_path,
+        cron_source=cron_source,
+        base_py=base_py,
+        base_contents=base_contents,
+        base_backup_path=base_backup_path,
+        base_source=base_source,
+    )
+    posix_transaction._atomic_write_text(manifest_path, rendered)
+
+
+def _render_install_manifest(
+    manifest_path: Path,
+    *,
+    run_py: Path,
+    run_contents: str,
+    backup_path: Path,
+    run_source: str,
+    cron_py: Path | None = None,
+    cron_contents: str | None = None,
+    cron_backup_path: Path | None = None,
+    cron_source: str | None = None,
+    base_py: Path | None = None,
+    base_contents: str | None = None,
+    base_backup_path: Path | None = None,
+    base_source: str | None = None,
+) -> str:
+    manifest = {
+        "manifest_version": INSTALL_MANIFEST_VERSION,
+        "run_py": run_py.relative_to(manifest_path.parent).as_posix(),
+        "patched_sha256": _restore_text_sha256(run_contents),
+        "backup": backup_path.relative_to(manifest_path.parent).as_posix(),
+        "backup_sha256": _restore_text_sha256(run_source),
+    }
+    if (
+        cron_py is not None
+        and cron_contents is not None
+        and cron_backup_path is not None
+        and cron_source is not None
+    ):
+        manifest.update(
+            {
+                "cron_py": cron_py.relative_to(manifest_path.parent).as_posix(),
+                "cron_patched_sha256": _restore_text_sha256(cron_contents),
+                "cron_backup": cron_backup_path.relative_to(
+                    manifest_path.parent
+                ).as_posix(),
+                "cron_backup_sha256": _restore_text_sha256(cron_source),
+            }
+        )
+    if (
+        base_py is not None
+        and base_contents is not None
+        and base_backup_path is not None
+        and base_source is not None
+    ):
+        manifest.update(
+            {
+                "base_py": base_py.relative_to(manifest_path.parent).as_posix(),
+                "base_patched_sha256": _restore_text_sha256(base_contents),
+                "base_backup": base_backup_path.relative_to(
+                    manifest_path.parent
+                ).as_posix(),
+                "base_backup_sha256": _restore_text_sha256(base_source),
+            }
+        )
+    try:
+        manifest["integrity"] = build_integrity_provenance(
+            manifest_path.parent,
+            run_py=run_py,
+            run_source=run_source,
+            cron_py=(cron_py if cron_source is not None else None),
+            cron_source=cron_source,
+            base_py=(base_py if base_source is not None else None),
+            base_source=base_source,
+        )
+    except IntegrityRepairRefused:
+        # Source-stripped/container installs remain supported, but cannot use
+        # automatic safe repair until provenance is explicitly available.
+        pass
+    return json.dumps(manifest, sort_keys=True) + "\n"
+
+
+def _rollback_install(
+    run_py: Path,
+    original: str | None,
+    backup_path: Path,
+    backup_existed: bool,
+    manifest_path: Path,
+    manifest_existed: bool,
+    *,
+    cron_py: Path | None = None,
+    cron_original: str | None = None,
+    cron_backup_path: Path | None = None,
+    cron_backup_existed: bool = False,
+    base_py: Path | None = None,
+    base_original: str | None = None,
+    base_backup_path: Path | None = None,
+    base_backup_existed: bool = False,
+    created_evidence_bindings: dict[Path, posix_transaction._CliTargetBinding] | None = None,
+    created_evidence_snapshots: dict[Path, _RestoreEvidenceSnapshot] | None = None,
+) -> None:
+    rollback_failures: list[tuple[str, Exception]] = []
+
+    def restore_target(label: str, path: Path, contents: str | None) -> None:
+        if contents is None:
+            return
+        try:
+            if path.exists() and _read_text_preserve_newlines(path) == contents:
+                return
+        except (OSError, UnicodeError):
+            pass
+        try:
+            posix_transaction._atomic_write_text(path, contents)
+        except (OSError, UnicodeError, ValueError) as exc:
+            rollback_failures.append((label, exc))
+
+    if base_py is not None:
+        restore_target("exact Base", base_py, base_original)
+    restore_target("run.py", run_py, original)
+    if cron_py is not None:
+        restore_target("cron scheduler", cron_py, cron_original)
+
+    # If any source cannot be restored, keep every backup and manifest as
+    # forensic/recovery evidence. Deleting ownership evidence here would turn
+    # a recoverable partial install into an ambiguous user-owned state.
+    if rollback_failures:
+        labels = ", ".join(label for label, _exc in rollback_failures)
+        raise ValueError(
+            "install rollback failed; manual review required; preserved ownership "
+            f"evidence for: {labels}"
+        ) from rollback_failures[0][1]
+
+    cleanup_failures: list[tuple[str, Exception]] = []
+    owned_bindings = created_evidence_bindings or {}
+    owned_snapshots = created_evidence_snapshots or {}
+
+    def remove_created_evidence(label: str, path: Path | None, existed: bool) -> None:
+        if path is None or existed:
+            return
+        if not posix_transaction._cli_dirfd_binding_supported():
+            try:
+                path.unlink(missing_ok=True)
+            except (OSError, UnicodeError, ValueError) as exc:
+                cleanup_failures.append((label, exc))
+            return
+        expected_snapshot = owned_snapshots.get(path)
+        binding = owned_bindings.get(path)
+        if expected_snapshot is None or binding is None:
+            if path.exists() or path.is_symlink():
+                cleanup_failures.append(
+                    (
+                        label,
+                        ValueError(
+                            "created ownership evidence lacks a bound write snapshot"
+                        ),
+                    )
+                )
+            return
+        try:
+            posix_transaction._unlink_bound_cli_target(binding, expected_snapshot)
+        except (OSError, UnicodeError, ValueError) as exc:
+            cleanup_failures.append((label, exc))
+
+    remove_created_evidence("run.py backup", backup_path, backup_existed)
+    remove_created_evidence(
+        "cron backup", cron_backup_path, cron_backup_existed
+    )
+    remove_created_evidence(
+        "exact Base backup", base_backup_path, base_backup_existed
+    )
+    remove_created_evidence("install manifest", manifest_path, manifest_existed)
+
+    if cleanup_failures:
+        labels = ", ".join(label for label, _exc in cleanup_failures)
+        raise ValueError(
+            "install rollback failed; manual review required; ownership evidence "
+            f"cleanup failed for: {labels}"
+        ) from cleanup_failures[0][1]
+
+
+def _validate_existing_install_state(
+    run_py: Path,
+    backup_path: Path,
+    manifest_path: Path,
+    *,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
+    require_base_manifest: bool = False,
+    allow_manifestless_owned_upgrade: bool = False,
+) -> None:
+    backup_exists = backup_path.exists()
+    manifest_exists = manifest_path.exists()
+    current = _read_text_preserve_newlines(run_py)
+
+    if not backup_exists and not manifest_exists:
+        if remove_patch(current) != current:
+            raise ValueError(
+                "install state incomplete; run.py already contains patch; "
+                "restore or remove patch before installing"
+            )
+        _validate_cron_install_state_without_manifest(cron_py, cron_backup_path)
+        _validate_base_install_state_without_manifest(base_py, base_backup_path)
+        return
+
+    if backup_exists and not manifest_exists:
+        if not allow_manifestless_owned_upgrade:
+            raise ValueError(
+                "install state incomplete; manifest missing; "
+                "restore or remove patch before installing"
+            )
+        if run_py.is_symlink() or backup_path.is_symlink():
+            raise ValueError(
+                "install state incomplete; manifest missing; "
+                "restore or remove patch before installing"
+            )
+        backup_text = _read_text_preserve_newlines(backup_path)
+        _validate_backup_contains_original(backup_text, "install")
+        if not _current_matches_backup_lenient(run_py, backup_path):
+            raise ValueError(
+                "install state incomplete; manifest missing; "
+                "restore or remove patch before installing"
+            )
+        _validate_cron_install_state_without_manifest(
+            cron_py,
+            cron_backup_path,
+            allow_owned_backup=True,
+        )
+        _validate_base_install_state_without_manifest(
+            base_py,
+            base_backup_path,
+            allow_owned_backup=True,
+        )
+        return
+
+    if not backup_exists:
+        manifest = _read_manifest(manifest_path)
+        _validate_manifest_matches_run_py(run_py, manifest)
+        raise ValueError("install state incomplete; backup missing; refusing to install")
+
+    manifest = _read_manifest(manifest_path)
+    try:
+        _validate_complete_install_state(
+            run_py,
+            backup_path,
+            manifest,
+            "install",
+            cron_py=cron_py,
+            cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
+        )
+        if manifest is not None and not _manifest_has_base(manifest):
+            if require_base_manifest and base_py is not None:
+                raise ValueError(
+                    "install state incomplete; exact Base ownership missing "
+                    "from manifest"
+                )
+            _validate_base_install_state_without_manifest(
+                base_py, base_backup_path
+            )
+    except ValueError as exc:
+        lenient_owned_gateway_upgrade = bool(
+            "run.py changed since install" in str(exc)
+            and _current_matches_backup_lenient(run_py, backup_path)
+        )
+        if not lenient_owned_gateway_upgrade:
+            raise
+        _validate_complete_cron_install_state(
+            cron_py, cron_backup_path, manifest, "install"
+        )
+        if (
+            require_base_manifest
+            and base_py is not None
+            and manifest is not None
+            and not _manifest_has_base(manifest)
+        ):
+            raise ValueError(
+                "install state incomplete; exact Base ownership missing from manifest"
+            )
+        _validate_complete_base_install_state(
+            base_py, base_backup_path, manifest, "install"
+        )
+
+
+def _validate_manifest_matches_run_py(
+    run_py: Path, manifest: dict[str, object] | None
+) -> None:
+    if manifest is None:
+        return
+    patched_sha256 = manifest.get("patched_sha256")
+    if not isinstance(patched_sha256, str) or not patched_sha256:
+        raise ValueError("manifest missing patched run.py sha256")
+    if file_sha256(run_py) != patched_sha256:
+        raise ValueError("run.py changed since install; refusing to install")
+
+
+def _validate_complete_install_state(
+    run_py: Path,
+    backup_path: Path,
+    manifest: dict[str, object] | None,
+    operation: str,
+    *,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
+) -> str:
+    if manifest is None:
+        backup_text = _read_text_preserve_newlines(backup_path)
+        _validate_backup_contains_original(backup_text, operation)
+        if not run_py.exists():
+            raise ValueError(f"run.py changed since install; refusing to {operation}")
+        _validate_current_matches_backup(_read_text_preserve_newlines(run_py), backup_text, operation)
+        return backup_text
+
+    patched_sha256 = manifest.get("patched_sha256")
+    if not isinstance(patched_sha256, str) or not patched_sha256:
+        raise ValueError("manifest missing patched run.py sha256")
+    if file_sha256(run_py) != patched_sha256:
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+    backup_sha256 = manifest.get("backup_sha256")
+    if not isinstance(backup_sha256, str) or not backup_sha256:
+        raise ValueError("manifest missing backup sha256")
+    if file_sha256(backup_path) != backup_sha256:
+        raise ValueError(f"backup changed since install; refusing to {operation}")
+
+    current = _read_text_preserve_newlines(run_py)
+    backup_text = _read_text_preserve_newlines(backup_path)
+    _validate_backup_contains_original(backup_text, operation)
+    _validate_current_matches_backup(current, backup_text, operation)
+    _validate_complete_cron_install_state(
+        cron_py, cron_backup_path, manifest, operation
+    )
+    _validate_complete_base_install_state(
+        base_py, base_backup_path, manifest, operation
+    )
+    return backup_text
+
+
+def _validate_restorable_install_state(
+    run_py: Path,
+    backup_path: Path,
+    manifest: dict[str, object],
+    operation: str,
+    *,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
+    read_text: Callable[[Path], str] | None = None,
+    file_hash: Callable[[Path], str] | None = None,
+) -> str:
+    if read_text is None:
+        read_text = _read_text_preserve_newlines
+    if file_hash is None:
+        file_hash = file_sha256
+    backup_sha256 = manifest.get("backup_sha256")
+    if not isinstance(backup_sha256, str) or not backup_sha256:
+        raise ValueError("manifest missing backup sha256")
+    if file_hash(backup_path) != backup_sha256:
+        raise ValueError(f"backup changed since install; refusing to {operation}")
+
+    backup_text = read_text(backup_path)
+    _validate_backup_contains_original(backup_text, operation)
+    if not run_py.exists():
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+    current = read_text(run_py)
+    if current == backup_text:
+        _validate_complete_cron_install_state(
+            cron_py,
+            cron_backup_path,
+            manifest,
+            operation,
+            read_text=read_text,
+            file_hash=file_hash,
+        )
+        _validate_complete_base_install_state(
+            base_py,
+            base_backup_path,
+            manifest,
+            operation,
+            read_text=read_text,
+            file_hash=file_hash,
+        )
+        return backup_text
+
+    patched_sha256 = manifest.get("patched_sha256")
+    if not isinstance(patched_sha256, str) or not patched_sha256:
+        raise ValueError("manifest missing patched run.py sha256")
+    if file_hash(run_py) != patched_sha256:
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+    _validate_current_matches_backup(current, backup_text, operation)
+    _validate_complete_cron_install_state(
+        cron_py,
+        cron_backup_path,
+        manifest,
+        operation,
+        read_text=read_text,
+        file_hash=file_hash,
+    )
+    _validate_complete_base_install_state(
+        base_py,
+        base_backup_path,
+        manifest,
+        operation,
+        read_text=read_text,
+        file_hash=file_hash,
+    )
+    return backup_text
+
+
+def _validate_cron_install_state_without_manifest(
+    cron_py: Path | None,
+    cron_backup_path: Path | None,
+    *,
+    allow_owned_backup: bool = False,
+) -> None:
+    if cron_py is None:
+        return
+    if cron_backup_path is not None and cron_backup_path.exists():
+        if (
+            not allow_owned_backup
+            or cron_py.is_symlink()
+            or cron_backup_path.is_symlink()
+            or not cron_py.exists()
+        ):
+            raise ValueError(
+                "install state incomplete; cron backup exists without manifest; "
+                "restore or remove patch before installing"
+            )
+        current_cron = _read_text_preserve_newlines(cron_py)
+        backup_cron = _read_text_preserve_newlines(cron_backup_path)
+        try:
+            backup_clean = remove_cron_patch(backup_cron) == backup_cron
+            current_matches = remove_cron_patch(current_cron) == backup_cron
+        except ValueError:
+            backup_clean = False
+            current_matches = False
+        if backup_clean and current_matches:
+            return
+        raise ValueError(
+            "install state incomplete; cron backup exists without manifest; "
+            "restore or remove patch before installing"
+        )
+    if cron_py.exists():
+        current_cron = _read_text_preserve_newlines(cron_py)
+        if remove_cron_patch(current_cron) == current_cron:
+            return
+        raise ValueError(
+            "install state incomplete; cron scheduler already contains patch; "
+            "restore or remove patch before installing"
+        )
+
+
+def _validate_base_install_state_without_manifest(
+    base_py: Path | None,
+    base_backup_path: Path | None,
+    *,
+    allow_owned_backup: bool = False,
+) -> None:
+    if base_py is None:
+        return
+    if base_backup_path is not None and base_backup_path.exists():
+        if (
+            not allow_owned_backup
+            or base_py.is_symlink()
+            or base_backup_path.is_symlink()
+            or not base_py.exists()
+        ):
+            raise ValueError(
+                "install state incomplete; exact Base backup exists without manifest; "
+                "restore or remove patch before installing"
+            )
+        current_base = _read_text_preserve_newlines(base_py)
+        backup_base = _read_text_preserve_newlines(base_backup_path)
+        try:
+            backup_clean = remove_base_patch(backup_base) == backup_base
+            current_matches = remove_base_patch(current_base) == backup_base
+        except ValueError:
+            backup_clean = False
+            current_matches = False
+        if backup_clean and current_matches:
+            return
+        raise ValueError(
+            "install state incomplete; exact Base backup exists without manifest; "
+            "restore or remove patch before installing"
+        )
+    if base_py.exists():
+        current_base = _read_text_preserve_newlines(base_py)
+        if remove_base_patch(current_base) == current_base:
+            return
+        raise ValueError(
+            "install state incomplete; exact Base already contains patch; "
+            "restore or remove patch before installing"
+        )
+
+
+def _validate_complete_cron_install_state(
+    cron_py: Path | None,
+    cron_backup_path: Path | None,
+    manifest: dict[str, object] | None,
+    operation: str,
+    *,
+    read_text: Callable[[Path], str] | None = None,
+    file_hash: Callable[[Path], str] | None = None,
+) -> None:
+    if read_text is None:
+        read_text = _read_text_preserve_newlines
+    if file_hash is None:
+        file_hash = file_sha256
+    if manifest is None or not _manifest_has_cron(manifest):
+        return
+    if cron_py is None or cron_backup_path is None:
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+    if not cron_py.exists():
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+    if not cron_backup_path.exists():
+        raise ValueError(f"cron backup changed since install; refusing to {operation}")
+
+    cron_patched_sha256 = manifest.get("cron_patched_sha256")
+    if not isinstance(cron_patched_sha256, str) or not cron_patched_sha256:
+        raise ValueError("manifest missing cron patched sha256")
+    if file_hash(cron_py) != cron_patched_sha256:
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+
+    cron_backup_sha256 = manifest.get("cron_backup_sha256")
+    if not isinstance(cron_backup_sha256, str) or not cron_backup_sha256:
+        raise ValueError("manifest missing cron backup sha256")
+    if file_hash(cron_backup_path) != cron_backup_sha256:
+        raise ValueError(f"cron backup changed since install; refusing to {operation}")
+
+    cron_current = read_text(cron_py)
+    cron_backup_text = read_text(cron_backup_path)
+    if remove_cron_patch(cron_backup_text) != cron_backup_text:
+        raise ValueError(f"cron backup changed since install; refusing to {operation}")
+    try:
+        restored_cron = remove_cron_patch(cron_current)
+    except ValueError as exc:
+        raise ValueError(
+            f"cron scheduler changed since install; refusing to {operation}"
+        ) from exc
+    if restored_cron != cron_backup_text:
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+
+
+def _manifest_has_cron(manifest: dict[str, object]) -> bool:
+    present = _CRON_MANIFEST_FIELDS.intersection(manifest)
+    if present and present != _CRON_MANIFEST_FIELDS:
+        raise ValueError(
+            "manifest cron ownership fields are incomplete; refusing to mutate"
+        )
+    return bool(present)
+
+
+def _manifest_has_base(manifest: dict[str, object]) -> bool:
+    present = _BASE_MANIFEST_FIELDS.intersection(manifest)
+    if present and present != _BASE_MANIFEST_FIELDS:
+        raise ValueError(
+            "manifest exact Base ownership fields are incomplete; refusing to mutate"
+        )
+    return bool(present)
+
+
+def _manifest_path_matches(value: object, expected: str) -> bool:
+    return isinstance(value, str) and value.replace("\\", "/") == expected
+
+
+def _validate_complete_base_install_state(
+    base_py: Path | None,
+    base_backup_path: Path | None,
+    manifest: dict[str, object] | None,
+    operation: str,
+    *,
+    read_text: Callable[[Path], str] | None = None,
+    file_hash: Callable[[Path], str] | None = None,
+) -> None:
+    if read_text is None:
+        read_text = _read_text_preserve_newlines
+    if file_hash is None:
+        file_hash = file_sha256
+    if manifest is None or not _manifest_has_base(manifest):
+        return
+    if base_py is None or base_backup_path is None:
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+    expected_base = "gateway/platforms/base.py"
+    expected_backup = f"gateway/platforms/base.py{BACKUP_SUFFIX}"
+    if not (
+        _manifest_path_matches(manifest.get("base_py"), expected_base)
+        and _manifest_path_matches(manifest.get("base_backup"), expected_backup)
+    ):
+        raise ValueError("manifest exact Base ownership paths are invalid")
+    if not base_py.exists():
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+    if not base_backup_path.exists():
+        raise ValueError(f"exact Base backup changed since install; refusing to {operation}")
+
+    patched_hash = manifest.get("base_patched_sha256")
+    if not isinstance(patched_hash, str) or not patched_hash:
+        raise ValueError("manifest missing exact Base patched sha256")
+    if file_hash(base_py) != patched_hash:
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+    backup_hash = manifest.get("base_backup_sha256")
+    if not isinstance(backup_hash, str) or not backup_hash:
+        raise ValueError("manifest missing exact Base backup sha256")
+    if file_hash(base_backup_path) != backup_hash:
+        raise ValueError(
+            f"exact Base backup changed since install; refusing to {operation}"
+        )
+
+    current = read_text(base_py)
+    backup = read_text(base_backup_path)
+    if remove_base_patch(backup) != backup:
+        raise ValueError(
+            f"exact Base backup changed since install; refusing to {operation}"
+        )
+    try:
+        restored = remove_base_patch(current)
+    except ValueError as exc:
+        raise ValueError(
+            f"exact Base changed since install; refusing to {operation}"
+        ) from exc
+    if restored != backup:
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+
+
+def _validate_backup_contains_original(backup_text: str, operation: str) -> None:
+    if remove_patch(backup_text) != backup_text:
+        raise ValueError(f"backup changed since install; refusing to {operation}")
+
+
+def _validate_current_matches_backup(
+    current: str, backup_text: str, operation: str
+) -> None:
+    try:
+        restored_current = remove_patch(current)
+    except ValueError as exc:
+        raise ValueError(
+            f"run.py changed since install; refusing to {operation}"
+        ) from exc
+    if restored_current != backup_text:
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+
+def _current_matches_backup_lenient(run_py: Path, backup_path: Path) -> bool:
+    try:
+        current = _read_text_preserve_newlines(run_py)
+        backup_text = _read_text_preserve_newlines(backup_path)
+        _validate_backup_contains_original(backup_text, "install")
+        return remove_patch_lenient(current) == backup_text
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _read_manifest(manifest_path: Path) -> dict[str, object] | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(_read_text_preserve_newlines(manifest_path))
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest could not be parsed") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest could not be parsed")
+    validate_install_manifest(manifest)
+    return manifest
+
+
+def _read_text_preserve_newlines(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _file_state_differs(path: Path, contents: str, mode: int) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        return (
+            _read_text_preserve_newlines(path) != contents
+            or stat.S_IMODE(path.stat().st_mode) != mode
+        )
+    except (OSError, UnicodeError):
+        return True
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

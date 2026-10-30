@@ -1,0 +1,1196 @@
+from __future__ import annotations
+
+from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
+
+from hermes_feishu_card.install import detect
+from hermes_feishu_card.install.detect import detect_hermes
+from hermes_feishu_card.install.patcher import PATCH_BEGIN, PATCH_END
+from hermes_feishu_card.integration import IntegrationMode, NativeHookCapabilities
+
+
+FIXTURE_ROOT = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_v2026_4_23"
+)
+EXACT_BASE_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
+)
+EXACT_BASE_V020_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base_v020.py"
+)
+TURN_RUNNER_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_turn_runner.py"
+)
+
+
+def test_detect_hermes_supports_v2026_4_23_fixture():
+    result = detect_hermes(FIXTURE_ROOT)
+
+    assert result.root == FIXTURE_ROOT
+    assert result.version == "v2026.4.23"
+    assert result.version_source == "VERSION"
+    assert result.minimum_version == "v2026.4.23"
+    assert result.run_py_exists is True
+    assert result.run_py.name == "run.py"
+    assert result.supported is True
+    assert result.reason == "supported"
+
+
+def test_detect_legacy_strategy_for_v2026_4_23_fixture():
+    detection = detect_hermes(FIXTURE_ROOT)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "legacy_gateway_run"
+    assert detection.compatibility == "partial"
+    assert detection.capabilities["message_handler"] is True
+
+
+def test_fixed_tag_integration_detection_selects_hybrid_only_from_probe_facts(
+    monkeypatch,
+):
+    class Probe:
+        capabilities = NativeHookCapabilities.from_names(
+            {
+                "turn_start",
+                "turn_terminal_result",
+                "stable_tool_lifecycle",
+                "approval_observe",
+            }
+        )
+        reason_code = "verified"
+
+    monkeypatch.setattr(
+        detect, "probe_native_hook_capabilities", lambda *args, **kwargs: Probe()
+    )
+
+    result = detect.detect_fixed_tag_integration(
+        FIXTURE_ROOT,
+        runtime_python=Path("/verified/venv/bin/python"),
+    )
+
+    assert result.native_probe is not None
+    assert result.decision.supported is True
+    assert result.decision.mode is IntegrationMode.HYBRID
+
+
+def test_detect_013_plus_strategy_reports_optional_capabilities(tmp_path):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    run_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v0.13.0\n", encoding="utf-8")
+    run_py.write_text(
+        '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):
+        response = "ok"
+        agent_result = {"model": "m"}
+        _response_time = 1.0
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+
+    async def _run_agent(self, source, event_message_id=None):
+        _loop_for_step = None
+        _status_chat_id = source.chat_id
+        def _run_still_current():
+            return True
+        def _status_callback_sync(event_type: str, message: str) -> None:
+            return None
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            return None
+        def _stream_delta_cb(text: str) -> None:
+            return None
+        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            return None
+        return {}
+
+def _deliver_result(job: dict, content: str, adapters=None, loop=None):
+    return None
+
+def _reply_anchor_for_event(event):
+    return getattr(event, "reply_to_message_id", None)
+
+def _deliver_media_from_response(response):
+    extract_media(response)
+''',
+        encoding="utf-8",
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "gateway_run_013_plus"
+    assert detection.compatibility == "full"
+    assert detection.capabilities["cron_delivery"] is True
+
+
+def test_detect_status_callback_requires_patchable_scope(tmp_path):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    run_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v0.18.2\n", encoding="utf-8")
+    run_py.write_text(
+        '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source):
+        response = "ok"
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+
+    async def _run_agent(self, source, event_message_id=None):
+        _loop_for_step = None
+        _status_chat_id = source.chat_id
+        def _run_still_current():
+            return True
+        def _status_callback_sync(event_type: str, message: str) -> None:
+            return None
+        return {}
+''',
+        encoding="utf-8",
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.capabilities["status_callback"] is True
+
+
+def test_detect_turn_runner_callbacks_from_actual_patchability(tmp_path):
+    root = tmp_path / "hermes"
+    _write_hermes_root(
+        root,
+        version="v0.18.2",
+        run_py=TURN_RUNNER_FIXTURE.read_text(encoding="utf-8"),
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.compatibility == "full"
+    assert detection.capabilities["tool_callback"] is True
+    assert detection.capabilities["answer_delta_callback"] is True
+    assert detection.capabilities["thinking_delta_callback"] is True
+    assert detection.capabilities["status_callback"] is True
+
+
+def test_detect_rejects_named_turn_runner_callbacks_that_are_not_patchable(tmp_path):
+    root = tmp_path / "hermes"
+    unpatchable = TURN_RUNNER_FIXTURE.read_text(encoding="utf-8").replace(
+        "        ctx = self._ctx\n", "        context = self._ctx\n"
+    )
+    _write_hermes_root(root, version="v0.18.2", run_py=unpatchable)
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is False
+    assert "not safely patchable" in detection.reason
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        ("_status_callback_sync", "_renamed_status_callback_sync"),
+        ("event_type: str, message: str", "event_type: str"),
+        ("        _status_chat_id = source.chat_id\n", ""),
+    ],
+)
+def test_detect_status_callback_rejects_unpatchable_scope(tmp_path, replacement):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    run_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v0.18.2\n", encoding="utf-8")
+    contents = '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source):
+        response = "ok"
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+
+    async def _run_agent(self, source, event_message_id=None):
+        _loop_for_step = None
+        _status_chat_id = source.chat_id
+        def _run_still_current():
+            return True
+        def _status_callback_sync(event_type: str, message: str) -> None:
+            return None
+        return {}
+'''
+    run_py.write_text(contents.replace(*replacement), encoding="utf-8")
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.compatibility == "partial"
+    assert detection.capabilities["status_callback"] is False
+
+
+def test_detect_calendar_version_013_plus_strategy_for_v2026_5_16(tmp_path):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    cron_py = root / "cron" / "scheduler.py"
+    run_py.parent.mkdir(parents=True)
+    cron_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v2026.5.16\n", encoding="utf-8")
+    run_py.write_text(
+        '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):
+        response = "ok"
+        agent_result = {"model": "m"}
+        _response_time = 1.0
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+
+    async def _run_agent(self, source, event_message_id=None):
+        _loop_for_step = None
+        def _run_still_current():
+            return True
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            return None
+        def _stream_delta_cb(text: str) -> None:
+            return None
+        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            return None
+        return {}
+
+def _reply_anchor_for_event(event):
+    return getattr(event, "reply_to_message_id", None)
+''',
+        encoding="utf-8",
+    )
+    cron_py.write_text(
+        '''
+def _deliver_result(job: dict, content: str, adapters=None, loop=None):
+    return None
+''',
+        encoding="utf-8",
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "gateway_run_013_plus"
+    assert detection.compatibility == "partial"
+    assert detection.capabilities["cron_delivery"] is True
+
+
+def test_detect_semver_014_strategy_matches_calendar_v2026_5_16(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.14.0")
+
+    detection = detect_hermes(tmp_path)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "gateway_run_013_plus"
+
+
+def test_detect_semver_017_inner_run_agent_layout(tmp_path):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    cron_py = root / "cron" / "scheduler.py"
+    run_py.parent.mkdir(parents=True)
+    cron_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v0.17.0\n", encoding="utf-8")
+    run_py.write_text(
+        '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):
+        response = "ok"
+        agent_result = {"model": "m"}
+        _response_time = 1.0
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+
+    async def _run_agent(self, source, event_message_id=None):
+        return await self._run_agent_inner(source, event_message_id=event_message_id)
+
+    async def _run_agent_inner(self, source, event_message_id=None):
+        _loop_for_step = None
+        _status_chat_id = source.chat_id
+        def _run_still_current():
+            return True
+        def _status_callback_sync(event_type: str, message: str) -> None:
+            return None
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            return None
+        def _stream_delta_cb(text: str) -> None:
+            return None
+        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            return None
+        return {}
+
+def _reply_anchor_for_event(event):
+    return getattr(event, "reply_to_message_id", None)
+
+def _deliver_media_from_response(response):
+    extract_media(response)
+''',
+        encoding="utf-8",
+    )
+    cron_py.write_text(
+        '''
+def _deliver_result(job: dict, content: str, adapters=None, loop=None):
+    return None
+''',
+        encoding="utf-8",
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "gateway_run_013_plus"
+    assert detection.compatibility == "full"
+    assert detection.capabilities["run_agent"] is True
+    assert detection.capabilities["tool_callback"] is True
+    assert detection.capabilities["answer_delta_callback"] is True
+    assert detection.capabilities["thinking_delta_callback"] is True
+
+
+def test_detect_calendar_v2026_4_30_stays_on_legacy_strategy(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.4.30")
+
+    detection = detect_hermes(tmp_path)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "legacy_gateway_run"
+
+
+def test_detect_cron_delivery_in_scheduler_py_for_latest_layout(tmp_path):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    cron_py = root / "cron" / "scheduler.py"
+    run_py.parent.mkdir(parents=True)
+    cron_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v0.13.0\n", encoding="utf-8")
+    run_py.write_text(
+        '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):
+        response = "ok"
+        agent_result = {"model": "m"}
+        _response_time = 1.0
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+
+    async def _run_agent(self, source, event_message_id=None):
+        _loop_for_step = None
+        _status_chat_id = source.chat_id
+        def _run_still_current():
+            return True
+        def _status_callback_sync(event_type: str, message: str) -> None:
+            return None
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            return None
+        def _stream_delta_cb(text: str) -> None:
+            return None
+        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            return None
+        return {}
+
+def _reply_anchor_for_event(event):
+    return getattr(event, "reply_to_message_id", None)
+
+def _deliver_media_from_response(response):
+    extract_media(response)
+''',
+        encoding="utf-8",
+    )
+    cron_py.write_text(
+        '''
+def _deliver_result(job: dict, content: str, adapters=None, loop=None):
+    return None
+''',
+        encoding="utf-8",
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.compatibility == "full"
+    assert detection.capabilities["cron_delivery"] is True
+    assert detection.cron_py == cron_py
+    assert detection.cron_py_exists is True
+    assert detection.cron_hook_strategy == "cron_scheduler"
+
+
+def test_detect_013_plus_strategy_reports_partial_when_optional_missing(tmp_path):
+    root = tmp_path / "hermes"
+    run_py = root / "gateway" / "run.py"
+    run_py.parent.mkdir(parents=True)
+    (root / "VERSION").write_text("v0.13.0\n", encoding="utf-8")
+    run_py.write_text(
+        '''
+class GatewayRunner:
+    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):
+        response = "ok"
+        await self.hooks.emit("agent:end", {"response": response})
+        return response
+''',
+        encoding="utf-8",
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.hook_strategy == "gateway_run_013_plus"
+    assert detection.compatibility == "partial"
+    assert detection.capabilities["run_agent"] is False
+    assert detection.capabilities["tool_callback"] is False
+    assert detection.capabilities["cron_delivery"] is False
+
+
+def test_detect_hermes_supports_git_tag_when_version_file_missing(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git is required for git tag fallback detection")
+    _write_hermes_root(tmp_path, version=None)
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=Hermes Test",
+        "-c",
+        "user.email=hermes-test@example.com",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    _git(tmp_path, "tag", "v2026.4.23")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "v2026.4.23"
+    assert result.version_source == "git tag"
+    assert result.run_py_exists is True
+
+
+def test_detect_hermes_prefers_static_package_version_over_stale_git_tag(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git is required for git tag fallback detection")
+    root = _write_hermes_root(tmp_path, version=None)
+    package = root / "hermes_cli"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        '__version__ = "0.20.0"\n',
+        encoding="utf-8",
+    )
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(
+        EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    _git(root, "init")
+    _git(root, "add", ".")
+    _git(
+        root,
+        "-c",
+        "user.name=Hermes Test",
+        "-c",
+        "user.email=hermes-test@example.com",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    _git(root, "tag", "v2026.7.30")
+
+    result = detect_hermes(root)
+
+    assert result.supported is True
+    assert result.version == "0.20.0"
+    assert result.version_source == "hermes_cli.__version__"
+    assert result.base_required is True
+
+
+def test_detect_hermes_supports_four_part_git_tag_when_version_file_missing(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git is required for git tag fallback detection")
+    _write_hermes_root(tmp_path, version=None)
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=Hermes Test",
+        "-c",
+        "user.email=hermes-test@example.com",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    _git(tmp_path, "tag", "v2026.7.7.2")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "v2026.7.7.2"
+    assert result.version_source == "git tag"
+    assert result.hook_strategy == "gateway_run_013_plus"
+
+
+def test_detect_hermes_supports_descriptive_version_metadata(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        version="Hermes Agent v0.18.2 (2026.7.7.2) · upstream f64e4f4f",
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version_source == "VERSION"
+    assert result.hook_strategy == "gateway_run_013_plus"
+
+
+def test_detect_hermes_uses_gateway_anchors_for_unparseable_version_metadata(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        version="rolling-nightly",
+        run_py=(
+            "class GatewayRunner:\n"
+            "    async def _handle_message_with_agent(self, event, source):\n"
+            "        response = 'ok'\n"
+            "        agent_result = {'model': 'm'}\n"
+            "        _response_time = 1.0\n"
+            "        await self.hooks.emit('agent:end', {'response': response})\n"
+            "        return response\n"
+            "    async def _run_agent(self, source, event_message_id=None):\n"
+            "        return {}\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "rolling-nightly"
+    assert result.version_source == "VERSION + gateway anchors"
+    assert result.hook_strategy == "gateway_run_013_plus"
+
+
+def test_detect_hermes_ignores_parent_git_tag_when_version_file_missing(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git is required for git tag fallback detection")
+    hermes_root = tmp_path / "nested-hermes"
+    _write_hermes_root(hermes_root, version=None)
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=Hermes Test",
+        "-c",
+        "user.email=hermes-test@example.com",
+        "commit",
+        "-m",
+        "parent fixture",
+    )
+    _git(tmp_path, "tag", "v2026.4.23")
+
+    result = detect_hermes(hermes_root)
+
+    assert result.supported is True
+    assert result.version == "unknown"
+    assert result.version_source == "gateway anchors"
+    assert result.reason == "supported"
+
+
+def test_detect_hermes_accepts_self_hooks_emit_inside_handler(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "class Gateway:\n"
+            "    async def _handle_message_with_agent(self, message):\n"
+            "        self.hooks.emit(\"agent:end\", {\"message\": message})\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+
+
+def test_detect_hermes_accepts_direct_hooks_emit_inside_handler(tmp_path):
+    _write_hermes_root(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+
+
+def test_detect_hermes_rejects_missing_gateway_run_py(tmp_path):
+    (tmp_path / "VERSION").write_text("v2026.4.23\n", encoding="utf-8")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.run_py_exists is False
+    assert result.version_source == "VERSION"
+    assert "gateway/run.py" in result.reason
+    assert "missing" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_symlinked_gateway_run_py(tmp_path):
+    target = tmp_path / "target_run.py"
+    target.write_text(_supported_run_py(), encoding="utf-8")
+    gateway = tmp_path / "gateway"
+    gateway.mkdir()
+    (tmp_path / "VERSION").write_text("v2026.4.23\n", encoding="utf-8")
+    (gateway / "run.py").symlink_to(target)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "symlink" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_missing_required_anchor(tmp_path):
+    gateway = tmp_path / "gateway"
+    gateway.mkdir()
+    (tmp_path / "VERSION").write_text("v2026.4.23\n", encoding="utf-8")
+    (gateway / "run.py").write_text(
+        "async def _handle_message_with_agent(message, hooks):\n"
+        "    return message\n",
+        encoding="utf-8",
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+    assert 'hooks.emit("agent:end"' in result.reason
+
+
+def test_detect_hermes_rejects_versions_below_minimum(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.4.22")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "v2026.4.23" in result.reason
+
+
+def test_detect_hermes_uses_numeric_version_comparison(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.10.1")
+    _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_strategy"),
+    [
+        ("v2026.4.23", "legacy_gateway_run"),
+        ("v2026.5.7", "gateway_run_013_plus"),
+        ("v2026.5.16", "gateway_run_013_plus"),
+        ("v2026.5.29", "gateway_run_013_plus"),
+        ("0.13.0", "gateway_run_013_plus"),
+        ("v0.13.0", "gateway_run_013_plus"),
+        ("0.14.0", "gateway_run_013_plus"),
+        ("v0.14.0", "gateway_run_013_plus"),
+        ("0.15.1", "gateway_run_013_plus"),
+        ("v0.15.1", "gateway_run_013_plus"),
+        ("v2026.7.1", "gateway_run_013_plus"),
+        ("v2026.7.7.2", "gateway_run_013_plus"),
+        ("0.18.0", "gateway_run_013_plus"),
+        ("v0.18.0", "gateway_run_013_plus"),
+        ("0.18.2", "gateway_run_013_plus"),
+        ("v0.18.2", "gateway_run_013_plus"),
+        ("0.19.0", "gateway_run_013_plus"),
+        ("v0.19.0", "gateway_run_013_plus"),
+        ("v2026.7.20", "gateway_run_013_plus"),
+    ],
+)
+def test_detect_hermes_key_release_matrix(tmp_path, version, expected_strategy):
+    _write_hermes_root(tmp_path, version=version)
+    if _requires_exact_fixture(version):
+        _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.hook_strategy == expected_strategy
+
+
+def test_detect_019_requires_exact_base_delivery_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.19.0")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.base_required is True
+    assert result.base_py == tmp_path / "gateway" / "platforms" / "base.py"
+    assert result.base_py_exists is False
+    assert result.capabilities["exact_base_delivery"] is False
+    assert "gateway/platforms/base.py missing" in result.reason
+
+
+def test_detect_019_accepts_exact_base_delivery_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.19.0")
+    base_py = _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
+    assert result.base_py == base_py
+    assert result.base_py_exists is True
+    assert result.base_hook_strategy == "exact_base_delivery"
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_020_accepts_awaited_to_thread_delivery_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.8.3")
+    base_py = tmp_path / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(
+        EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
+    assert result.base_hook_strategy == "exact_base_delivery"
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_accepts_session_scoped_delivery_filter_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.8.25")
+    source = EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8")
+    source = source.replace(
+        "media_files = self.filter_media_delivery_paths(media_files)",
+        (
+            "media_files = self.filter_media_delivery_paths("
+            "media_files, session_key=session_key)"
+        ),
+        1,
+    ).replace(
+        "local_files = self.filter_local_delivery_paths(local_files)",
+        (
+            "local_files = self.filter_local_delivery_paths("
+            "local_files, session_key=session_key)"
+        ),
+        1,
+    )
+    base_py = tmp_path / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(source, encoding="utf-8")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
+    assert result.base_hook_strategy == "exact_base_delivery"
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_source_stripped_exact_ledger_requires_valid_base_contract(tmp_path):
+    _write_hermes_root(tmp_path, version=None)
+    base_py = _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "unknown"
+    assert result.base_required is True
+    assert result.base_py == base_py
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_019_rejects_symlinked_exact_base(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.19.0")
+    target = tmp_path / "base-target.py"
+    target.write_text(EXACT_BASE_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    base_py = tmp_path / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True)
+    base_py.symlink_to(target)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.base_required is True
+    assert "gateway/platforms/base.py must not be a symlink" in result.reason
+
+
+def test_detect_calendar_2026_7_20_requires_exact_base_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.7.20")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.base_required is True
+    assert result.capabilities["exact_base_delivery"] is False
+    assert "gateway/platforms/base.py missing" in result.reason
+
+
+def test_detect_verified_ledger_signals_require_base_on_earlier_version(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.18.2")
+    _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_hermes_version_components_are_semantic_not_calendar_bounds(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.99.99")
+    _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+
+
+def test_detect_hermes_supports_gateway_anchors_when_version_file_missing(tmp_path):
+    _write_hermes_root(tmp_path, version=None)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "unknown"
+    assert result.version_source == "gateway anchors"
+    assert result.hook_strategy == "legacy_gateway_run"
+
+
+def test_detect_hermes_supports_modern_gateway_anchors_when_version_file_missing(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        version=None,
+        run_py=(
+            "class GatewayRunner:\n"
+            "    async def _handle_message_with_agent(self, event, source):\n"
+            "        response = 'ok'\n"
+            "        agent_result = {'model': 'm'}\n"
+            "        _response_time = 1.0\n"
+            "        await self.hooks.emit('agent:end', {'response': response})\n"
+            "        return response\n"
+            "    async def _run_agent(self, source, event_message_id=None):\n"
+            "        _loop_for_step = None\n"
+            "        def _run_still_current():\n"
+            "            return True\n"
+            "        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):\n"
+            "            return None\n"
+            "        def _stream_delta_cb(text: str) -> None:\n"
+            "            return None\n"
+            "        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:\n"
+            "            return None\n"
+            "        return {}\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "unknown"
+    assert result.version_source == "gateway anchors"
+    assert result.hook_strategy == "gateway_run_013_plus"
+    assert result.compatibility == "partial"
+
+
+def test_detect_hermes_uses_gateway_anchors_for_bad_explicit_version(tmp_path):
+    _write_hermes_root(tmp_path, version="not-a-version")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version_source == "VERSION + gateway anchors"
+    assert result.reason == "supported"
+
+
+def test_detect_hermes_rejects_comment_or_unrelated_anchor_matches(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "# async def _handle_message_with_agent(message, hooks):\n"
+            "#     hooks.emit(\"agent:end\", {})\n"
+            "async def helper(hooks):\n"
+            "    hooks.emit(\"agent:end\", {})\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_handler_nested_inside_function(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "def outer():\n"
+            "    async def _handle_message_with_agent(message, hooks):\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return _handle_message_with_agent\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor function" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_handler_in_class_nested_inside_function(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "def outer():\n"
+            "    class Gateway:\n"
+            "        async def _handle_message_with_agent(self, message):\n"
+            "            self.hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return Gateway\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor function" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_only_in_nested_async_function(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    async def nested():\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return nested\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_only_in_nested_class_method(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    class Nested:\n"
+            "        def emit_later(self):\n"
+            "            hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return Nested\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_only_in_lambda(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    emit_later = lambda: hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return emit_later\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_after_return(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    return message\n"
+            "    hooks.emit(\"agent:end\", {\"message\": message})\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_after_return_in_for_body(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    for item in [message]:\n"
+            "        return item\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_after_return_in_try_body(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    try:\n"
+            "        return message\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    except Exception:\n"
+            "        return None\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_only_in_static_false_branch(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    if False:\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return message\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_anchor_only_in_static_false_while(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    while False:\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    return message\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "anchor" in result.reason.lower()
+
+
+def test_detect_hermes_accepts_reachable_anchor_in_try_body(tmp_path):
+    _write_hermes_root(
+        tmp_path,
+        run_py=(
+            "async def _handle_message_with_agent(message, hooks):\n"
+            "    try:\n"
+            "        hooks.emit(\"agent:end\", {\"message\": message})\n"
+            "    except Exception:\n"
+            "        return None\n"
+        ),
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+
+
+def test_detect_hermes_rejects_invalid_utf8_run_py(tmp_path):
+    gateway = tmp_path / "gateway"
+    gateway.mkdir()
+    (tmp_path / "VERSION").write_text("v2026.4.23\n", encoding="utf-8")
+    (gateway / "run.py").write_bytes(b"\xff\xfe")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "gateway/run.py" in result.reason
+    assert "read" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_unreadable_version_directory(tmp_path):
+    gateway = tmp_path / "gateway"
+    gateway.mkdir()
+    (tmp_path / "VERSION").mkdir()
+    (gateway / "run.py").write_text(_supported_run_py(), encoding="utf-8")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "version" in result.reason.lower()
+    assert "read" in result.reason.lower()
+
+
+def test_detect_hermes_rejects_invalid_utf8_version(tmp_path):
+    gateway = tmp_path / "gateway"
+    gateway.mkdir()
+    (tmp_path / "VERSION").write_bytes(b"\xff\xfe")
+    (gateway / "run.py").write_text(_supported_run_py(), encoding="utf-8")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert "version" in result.reason.lower()
+    assert "read" in result.reason.lower()
+
+
+def test_patch_markers_are_stable_constants_only():
+    assert PATCH_BEGIN == "# HERMES_FEISHU_CARD_PATCH_BEGIN"
+    assert PATCH_END == "# HERMES_FEISHU_CARD_PATCH_END"
+
+
+def _write_hermes_root(
+    root: Path,
+    version: str | None = "v2026.4.23",
+    run_py: str | None = None,
+) -> Path:
+    gateway = root / "gateway"
+    gateway.mkdir(parents=True)
+    if version is not None:
+        (root / "VERSION").write_text(f"{version}\n", encoding="utf-8")
+    (gateway / "run.py").write_text(run_py or _supported_run_py(), encoding="utf-8")
+    return root
+
+
+def _supported_run_py() -> str:
+    return (
+        "async def _handle_message_with_agent(message, hooks):\n"
+        "    hooks.emit(\"agent:end\", {\"message\": message})\n"
+    )
+
+
+def _write_exact_base(root: Path) -> Path:
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(EXACT_BASE_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    return base_py
+
+
+def _requires_exact_fixture(version: str) -> bool:
+    normalized = version.lstrip("v")
+    parts = tuple(int(part) for part in normalized.split("."))
+    return (parts[0] == 0 and parts >= (0, 19, 0)) or parts >= (2026, 7, 20)
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )

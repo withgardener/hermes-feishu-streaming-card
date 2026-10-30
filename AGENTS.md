@@ -1,0 +1,212 @@
+# AGENTS.md — hermes-feishu-streaming-card
+
+## Scope and authority
+
+HFC is the Feishu/Lark presentation and delivery sidecar for Hermes Agent.
+Hermes owns task execution, model calls, conversation ownership and permission
+resolution. HFC owns card presentation, bounded display state, delivery,
+diagnostics and its reversible installation. Do not build a second agent loop,
+approval queue or execution-recovery engine here.
+
+- Active code: `hermes_feishu_card/`; tests: `tests/`; maintainer docs: `docs/wiki/`.
+- `legacy/` is archived, not active runtime. Do not edit it without explicit scope.
+- Talk to Bailey in Chinese; keep code identifiers and protocol names unchanged.
+- An audit or roadmap request authorizes the requested documentation, not the
+  proposed runtime features, a production upgrade or a release. Existing explicit
+  authorization remains valid within its scope; do not ask for it repeatedly.
+- Keep unrelated working changes. Verify checkout, branch, base and package
+  origin before editing; verify host/service/config before touching a live system.
+
+## Start with the smallest useful context
+
+1. Read `pyproject.toml`, the relevant implementation/tests and `git status`.
+2. Run `python tools/preflight.py --check-only` with the intended Python.
+   `ready` is environment readiness; `pytest.status=not_run` is not a test pass.
+3. Read [maintenance routing](docs/wiki/maintenance-guide.md) before changing
+   runtime, server, patcher, process/service, installer or release code.
+4. Use [development rules](docs/wiki/development-rules.md) for dependencies,
+   modules and validation; use [feature rules](docs/wiki/feature-rules.md) for
+   user-facing changes. Read only the pages relevant to this change.
+   Card layout, typography, color and motion follow
+   [card visual guidelines](docs/wiki/card-visual-guidelines.md).
+5. [Architecture](docs/architecture.md), [event flow](docs/wiki/event-flow.md),
+   [stability policy](docs/wiki/stability-test-policy.md) and
+   [release playbook](docs/wiki/release-playbook.md) are the detailed references.
+   Dated reviews and roadmaps are evidence/proposals, not implementation status.
+
+## Stack and ownership
+
+The current stack is Python + asyncio/aiohttp, PyYAML, dataclasses/manual boundary
+validation, setuptools and pytest. Read the supported Python floor and package
+version from `pyproject.toml`; do not implement a proposed V5 floor implicitly.
+Hermes supplies the Feishu SDK environment. Ruff and mypy cover the extracted
+boundaries listed in `pyproject.toml`; install the `quality` extra on Python 3.12,
+then run `python -m ruff check` and `python -m mypy`. Expand the scope with each
+extraction. Do not mass-format existing code or hide failures with blanket ignores.
+Python 3.9 runtime coverage remains separate from this development-tool runtime.
+
+| Concern | Primary code |
+| --- | --- |
+| Hermes capability/plugin/legacy adapters | `hermes_plugin*`, `hook_runtime.py`, `install/native_hooks.py` |
+| Event and interaction contracts | `events.py`, `event_rules.py`, `interaction_input.py`, `interaction_resolver.py`, `interaction_receipts.py`, `session.py`, `runtime_interaction_transport.py` |
+| Orchestration, identity and delivery ownership | `server.py`, `terminal_delivery.py`, `delivery.py`, `native_handoff.py`, `delivery_policy.py` |
+| Shared display redaction | `display_redaction.py`; no session/render imports; consumers keep their normalization and clipping order |
+| Presentation and payload budgets | `card_view.py`, `content_plan.py`, `render.py`, `presentation.py`, `reading.py`, `render_options.py`, `card_limits.py` |
+| Feishu I/O and CardKit sequencing | `feishu_client.py`, `cardkit.py` |
+| Per-turn display metrics and bounded request deduplication | `turn_metrics.py`; official plugin observations feed display only, canonical carrier borrows the Agent through a weak reference |
+| Session Authority cross-Task terminal display handoff | `admission_completion.py`; single-use event carrier borrows native admission/marker maps and exact post-extraction Base seam; no execution registry |
+| Canonical turn carrier and borrowed metrics context | `canonical_turn.py`; one thread/task registry, hook compatibility exports and plugin metrics share it without adapter cycles |
+| Pure config values, presets, validation and merge | `config_rules.py`; config/reading/runtime policy consume the same rules without reverse imports |
+| Config, installation and safe recovery | `config.py`, `cli.py`, `install/`; read-only source ownership in `install/decomposed_ownership.py`, family transactions in `install/recovery.py` |
+| Process credentials and service ownership | `process.py`, `runner.py`, `persistent_service.py` |
+| Bounded display/notice persistence | `session_store.py`, `notice_lifecycle.py` |
+| Current-owner input freeze and receipt replacement policy | `owner_display_policy.py` |
+| Borrowed live registry/controller cleanup state | `lifecycle.py` (`CleanupState`); `server.py` supplies the AppKey adapter |
+| Confirmed continuation message navigation and button budget | `message_navigation.py`; `server.py` commits only after delivery/owner transfer |
+| Secure directory-bound file/stage I/O and cleanup | `install/posix_transaction.py`; Recovery/Integrity retain their planner/lock/Git/fingerprint gates; portable I/O stays in `install/file_transaction.py` |
+
+Read [implemented boundaries and compatibility names](docs/wiki/refactor-boundaries.md)
+when moving an existing helper. New internal callers import its implementation
+owner; test fault injection must target the real I/O module.
+
+Read [interaction protocol](docs/wiki/interaction-protocol.md) for runtime
+admission, callback and expiry ownership. Keep the original runtime handle as
+the sole execution claim; server retains lock/compare-and-commit orchestration.
+Do not add another resolver, claim registry or display owner just to move code.
+
+Keep event normalization, state decisions, rendering and external I/O separable.
+New substantial behavior belongs in a focused module with a tested boundary,
+not another unrelated branch in the largest coordinator. Extract incrementally;
+do not combine rebranding, broad rewrites and behavior fixes in one PR.
+
+## Non-negotiable runtime boundaries
+
+- Do not hand-edit installed Hermes source. Only
+  `hermes_feishu_card/install/patcher.py` may patch managed Hermes targets.
+- Prefer verified native extension points. A version string or documentation
+  example is not capability proof: retain source hashes, exact call-site checks,
+  drift rejection, idempotence and byte-for-byte restore tests.
+- Unknown/unsupported delivery paths remain fail-open to Hermes. Once HFC has
+  accepted a card path, preserve its ownership and suppress duplicate native gray
+  text. Installation, authorization and uncertain filesystem mutation fail closed.
+- At process-ownership and filesystem mutation gates, distinguish missing from
+  uninspectable metadata. Use exception-aware stat/lstat and reject unexpected
+  OSError; a false exists/is_symlink result can hide errors on newer Python.
+- Preserve profile/bot/chat/thread/sender/turn boundaries. A reply alias is not a
+  new turn identity, and group membership does not authorize replacing another
+  sender's card. Test terminal, duplicate, late and reordered events.
+- Resolve interactions through the original Hermes handle exactly once. Never
+  revive expired approvals or infer successful completion from missing events.
+- Display checkpoints restore presentation, not execution or old authorization.
+  Keep state, caches, replay windows and retries bounded; define failure behavior.
+  Every new CardSession field must explicitly choose persistence or exclusion:
+  session_store derives its schema from dataclass fields. Transient display state
+  belongs in its exclusion set, with old-checkpoint and rollback tests.
+- Use the shared serializer and `card_limits.py` for every final combined payload.
+  Do not truncate final answers or permission scope merely to fit a card.
+- Keep slow external I/O outside session/message locks where the contract permits;
+  preserve the documented post-lock work and terminal ordering when extracting.
+- Never commit credentials, control/interaction tokens, raw chat/user identifiers,
+  local `.env`, private checkpoints or unredacted screenshots. Managed launchers
+  use private token files, with no insecure argv fallback. Keep health/logs redacted.
+
+## Feature and configuration rules
+
+Every substantive feature must name a user problem, authoritative data source,
+current behavior, intended behavior, failure/unknown behavior and acceptance test.
+Reuse existing capabilities before proposing a new one. Review new settings for
+scope, default, precedence, validation, restart needs, migration and rollback.
+Global -> profile -> bot precedence and explicit user values must remain clear.
+
+Preserve existing defaults unless an explicitly approved migration says otherwise.
+Progress is observed state, not invented percent/ETA. UI actions need a valid
+current owner and authorization path. Desktop, Android and iOS visual acceptance
+are separate evidence. See [feature rules](docs/wiki/feature-rules.md).
+Quota, usage and cost must be attributed to the actual turn/model/provider;
+an available account does not justify displaying its allowance on unrelated turns.
+Visual quality is a core deliverable: compare the same content across states and
+clients, preserve readable hierarchy and stable streaming layout, and validate
+supported card components. Present visual options for Bailey's direction approval
+before a card redesign; a rules/specification task does not authorize UI implementation.
+Treat [card visual guidelines](docs/wiki/card-visual-guidelines.md) as a release gate.
+Review layout logic, hierarchy, typography, color, spacing, visual cleanliness and
+information density together. Repeated turn state/action, poor primary-content
+placement, clipping or input instability block release. A prettier screenshot,
+valid JSON or passing tests cannot substitute for real-client visual and interaction
+evidence; missing required client coverage is unverified until supplied or Bailey
+explicitly narrows the release scope.
+
+## Validation: isolate first, then scale to risk
+
+Run from the checkout root using its compatible environment. Prefer the existing
+preflight tool so tests use private HOME/state and do not inspect production by
+accident. Never repair production or install global dependencies to make tests pass.
+
+```bash
+python tools/preflight.py --check-only
+python tools/preflight.py --suite focused --module docs
+python tools/preflight.py --suite focused --module runtime --module render
+python tools/preflight.py --suite focused --module install
+python tools/preflight.py --suite focused --module process
+python tools/preflight.py --suite full
+git diff --check
+```
+
+Choose only the relevant commands, not every group for every change. `AGENTS.md`
+routes to docs; the new `appearance` and `quota` groups cover their feature
+boundaries. Other unmapped files still require explicit groups and focused tests
+from the maintenance matrix. Pure docs/rules changes need docs/metadata and
+link/contract checks; they do not require a new product release or a redundant
+local full run. Runtime/stability changes need meaningful failing reproduction,
+normal/failure/duplicate/late-event assertions and the affected integration paths.
+Run full regression before release, broad runtime claims or substantial refactors.
+Full regression may be supplied by the complete CI matrix on the exact commit;
+do not repeat an identical local full run after that evidence passes. Ordinary PRs
+use the conservative scope and isolated sharding in
+[regression CI policy](docs/wiki/regression-ci.md). Focused checks do not count as
+a full Python/platform pass. Keep all supported versions at the release gate.
+
+Full runs require `HFC_FIXED_TAG_SOURCE_ROOT` pointing to the verified clean Git
+fixture described in `docs/testing.md`; never substitute production or an archive
+without Git identity. Missing fixtures/skips must be reported. The current
+preflight sanitizes `HFC_UPSTREAM_*`; latest stable/main compatibility therefore
+needs the separate pinned matrix in `.github/workflows/tests.yml` (or a documented
+isolated equivalent). Do not claim those checks from a preflight full pass alone.
+
+Installed-runtime changes also require ordinary non-editable wheel provenance and
+real child-process checks. UI changes need relevant real-client checks. Distinguish
+source tests, mock/local HTTP, public installation, real platform API, visual QA
+and actual Gateway/model execution. Preserve failures before a justified rerun.
+
+Reclaim owned test artifacts as each completed batch no longer needs them. Check
+process/open-file references before removing temporary test trees, copied fixtures,
+old candidate packages or preview servers. Keep the current retest environment,
+failure logs, screenshots, provenance and production restore evidence; record the
+exact cleanup scope. Never clean production runtimes or unrelated user files.
+Check available disk space before another full run, clone or dependency install.
+Reuse one compatible test environment and the verified source fixture; private
+HOME/state does not require a fresh virtualenv for every candidate. Retire obsolete
+public-install environments after preserving their provenance and logs. Do not
+let completed pytest trees and source archives accumulate across release rounds.
+Check both the designated task directory and the actual OS temporary directory
+for owned HFC prefixes, including macOS `/private/tmp`. Sanitized subprocesses
+may not retain `TMPDIR`; never infer cleanup completeness from one directory.
+Inspect ownership and live references before removal; do not sweep unrelated temp files.
+
+## Delivery and release
+
+- PRs state the user-visible problem, final change, affected boundary, tests and
+  remaining uncertainty. Keep runtime fixes and unrelated cleanup separate.
+- Report what changed, what passed and what remains unverified. Test totals are
+  not branch coverage, service readiness or proof of production acceptance.
+- Follow `docs/wiki/release-playbook.md` for an authorized release: version/docs,
+  full checks, exact merge/tree, annotated tag, CI, assets/checksums and isolated
+  public install. Do not move a published tag to hide a failure.
+- Preserve full tag/release history, merged or materially absorbed PRs,
+  accepted issue evidence, commit authors and accurate `Co-authored-by` trailers.
+  Never fabricate authorship. Credit relevant contributors in both READMEs and
+  release notes; retain earlier credits. Issue evidence is distinct from code authorship.
+  Audit both the release interval and historical credits before publishing.
+- Public project knowledge belongs in repository docs. Synchronize personal/global
+  memory or an external wiki only when explicitly requested; do not make that a
+  hidden prerequisite for completing repository work.

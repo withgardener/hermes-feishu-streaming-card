@@ -1,0 +1,158 @@
+name: hfc-runtime-smoke
+
+x-hfc-runtime-environment: &hfc-runtime-environment
+  HERMES_DIR: /opt/hermes
+  HFC_CONFIG: /opt/data/config.yaml
+  HERMES_FEISHU_CARD_EVENT_URL: http://sidecar:8765/events
+  HERMES_FEISHU_CARD_STATE_DIR: /opt/hfc-state
+  HERMES_FEISHU_CARD_SERVICE_MANAGER: detached
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-hfc-runtime-volumes: &hfc-runtime-volumes
+  - hermes-runtime:/opt/hermes
+  - hermes-data:/opt/data
+  - hfc-smoke-state:/opt/hfc-state
+
+services:
+  setup:
+    image: python:3.12-slim
+    user: "0:0"
+    working_dir: /opt/hermes
+    environment:
+      <<: *hfc-runtime-environment
+      HFC_ENV_FILE: /opt/data/.env
+      HFC_INSTALL_SOURCE: /tmp/hfc-install-source
+      HFC_TEST_NOOP_DELIVERY: "1"
+      HFC_SKIP_START: "1"
+      HFC_NO_PROMPT: "1"
+    volumes:
+      - .:/src:ro
+      - hermes-runtime:/opt/hermes
+      - hermes-data:/opt/data
+      - hfc-smoke-state:/opt/hfc-state
+    command:
+      - bash
+      - -ec
+      - |
+        mkdir -p /tmp/hfc-install-source
+        cp /src/pyproject.toml /src/README.md /src/LICENSE /tmp/hfc-install-source/
+        cp -R /src/hermes_feishu_card /tmp/hfc-install-source/
+        cp -R /src/tests/fixtures/hermes_v2026_4_23/. /opt/hermes/
+        python -m venv /opt/hermes/venv
+        cp /src/tests/fixtures/docker-smoke-config.yaml /opt/data/config.yaml
+        bash /src/install-docker.sh
+        /opt/hermes/venv/bin/python /src/tests/fixtures/docker_ownership_probe.py --expected refused
+        chown -R 65532:65532 /opt/hermes /opt/data /opt/hfc-state
+        /opt/hermes/venv/bin/python /src/tests/fixtures/docker_ownership_probe.py --expected installed
+
+  sidecar:
+    image: python:3.12-slim
+    user: "65532:65532"
+    working_dir: /opt/hermes
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment: *hfc-runtime-environment
+    volumes: *hfc-runtime-volumes
+    command:
+      - /opt/hermes/venv/bin/python
+      - -m
+      - hermes_feishu_card.runner
+      - --config
+      - /opt/data/config.yaml
+    healthcheck:
+      test:
+        - CMD
+        - /opt/hermes/venv/bin/python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8765/health', timeout=2).read()"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  gateway:
+    image: python:3.12-slim
+    user: "65532:65532"
+    working_dir: /opt/hermes
+    depends_on:
+      sidecar:
+        condition: service_healthy
+    environment: *hfc-runtime-environment
+    volumes:
+      - .:/src:ro
+      - hermes-runtime:/opt/hermes
+      - hermes-data:/opt/data
+      - hfc-smoke-state:/opt/hfc-state
+    command:
+      - sh
+      - -ec
+      - |
+        exec /opt/hermes/venv/bin/python /src/tests/fixtures/docker_gateway_smoke.py --stay-alive
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "test -s /opt/data/gateway-result.json"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  probe:
+    image: python:3.12-slim
+    user: "65532:65532"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment: *hfc-runtime-environment
+    volumes:
+      - hermes-runtime:/opt/hermes:ro
+      - hermes-data:/opt/data:ro
+      - hfc-smoke-state:/opt/hfc-state:ro
+    command:
+      - /opt/hermes/venv/bin/python
+      - -c
+      - |
+        import json
+        from pathlib import Path
+        import urllib.request
+
+        receipt = json.loads(
+            Path("/opt/data/gateway-result.json").read_text(encoding="utf-8")
+        )
+        assert receipt["hook_installed"] is True, receipt
+        assert receipt["start_marker_count"] == 1, receipt
+        assert receipt["complete_marker_count"] == 1, receipt
+        assert receipt["response"] == "fixture answer", receipt
+        assert receipt["event_response"]["ok"] is True, receipt
+        assert receipt["event_response"]["disposition"] == "native", receipt
+        assert receipt["runtime_readiness"]["status"] == "degraded", receipt
+        assert receipt["runtime_readiness"]["reason"] == "runtime_owner_unverified", receipt
+        assert receipt["patched_events_before_direct"] >= 1, receipt
+        assert receipt["package_location"].startswith(
+            "/opt/hermes/venv/"
+        ), receipt
+        assert Path("/opt/hermes/.hermes_feishu_card_manifest").is_file()
+        assert Path(
+            "/opt/hermes/gateway/run.py.hermes_feishu_card.bak"
+        ).is_file()
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open("http://sidecar:8765/health", timeout=5) as response:
+            health = json.load(response)
+        assert health["status"] == "degraded", health
+        assert health["delivery"] == {"mode": "noop"}, health
+        assert health["event_auth_required"] is True, health
+        assert health["readiness"]["status"] == "degraded", health
+        assert health["readiness"]["reason"] == "runtime_owner_unverified", health
+        assert health["readiness"]["active_work_count_complete"] is not True, health
+        assert health["metrics"]["runtime_control_events_received"] >= 1, health
+        assert health["metrics"]["runtime_control_events_accepted"] >= 1, health
+        assert health["metrics"]["runtime_control_auth_rejections"] == 0, health
+        assert health["metrics"]["events_received"] >= 1, health
+        assert health["metrics"]["event_auth_rejections"] == 0, health
+
+volumes:
+  hermes-runtime:
+  hermes-data:
+  hfc-smoke-state:

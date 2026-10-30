@@ -1,0 +1,256 @@
+# Hermes Feishu Streaming Card V5.0.12 sidecar configuration
+# Copy to a local path and fill credentials from your environment or secret store.
+# Default config path: ~/.hermes_feishu_card/config.yaml
+
+server:
+  host: 127.0.0.1
+  port: 8765
+  # 默认保持 loopback 本机进程互信。非 loopback 只有显式开启后才允许，
+  # 并强制使用 state-dir HMAC 事件鉴权；不要把 sidecar 未鉴权暴露到网络。
+  # Keep local-process trust on loopback. Non-loopback requires explicit opt-in
+  # and state-directory HMAC event authentication. Do not expose an unauthenticated sidecar.
+  allow_non_loopback: false
+
+# New installations may repair only strictly verified stale HFC hook state.
+# Existing configs without this section load as `notify` until explicitly migrated.
+integrity:
+  mode: safe
+
+# Sidecar process ownership. `auto` selects user systemd only when available,
+# otherwise detached. It never enters system systemd or invokes sudo.
+service:
+  manager: auto
+  # Optional exact Gateway process HOME (not an HFC chat-routing profile).
+  # setup --hermes-home persists this via HERMES_FEISHU_CARD_HERMES_HOME.
+  # hermes_home: /absolute/path/to/hermes-data
+  # Set true on ALL sidecars sharing source code, including the default HOME.
+  # Shared source updates require coordinated terminal maintenance.
+  # shared_source: true
+  # Optional stable HFC venv, outside Hermes PM environments. Must contain the
+  # same HFC release as an ordinary install. Hooks still use Hermes Python.
+  # python_executable: /absolute/path/to/hfc-venv/bin/python
+
+# ── Single Profile (minimal) ─────────────────────────────────────────────────
+# For simple setups with one Hermes profile and optionally multiple bots.
+feishu:
+  # Prefer FEISHU_APP_ID and FEISHU_APP_SECRET environment variables.
+  # In multi-profile mode (see profiles section below), these top-level
+  # values are ignored — each profile provides its own credentials.
+  app_id: ""
+  app_secret: ""
+  base_url: https://open.feishu.cn/open-apis
+  timeout_seconds: 30
+
+card:
+  # Released in 4.7.0: reading_preset: task opts into task layout.
+  # Check sources/preview with card-config --config <path> --preview-dir <new-dir>.
+  # Global fallback title. profiles.<id>.card.title and bots.items.<id>.card.title
+  # can override it; bot title wins over profile title.
+  title: Hermes Agent
+  # JSON 2.0 width: default | compact | fill. default preserves existing layout
+  # by omitting width_mode from the payload; fill adapts to the chat window.
+  # Global < profile < bot; omitted overrides inherit, explicit default resets.
+  # JSON 1.0 approval/legacy cards retain wide_screen_mode instead.
+  # Final dimensions remain client-controlled; this does not set pixel height.
+  width_mode: default
+  # auto: use Feishu CardKit buttons through the native WebSocket card-action path.
+  # callback: explicitly keep native CardKit callback buttons.
+  # text: explicitly render numbered text choices and let Hermes handle the reply.
+  interaction_mode: auto
+  # Opt-in CardKit entity streaming. Requires cardkit:card:write permission.
+  streaming_mode: false
+  # panel (default) keeps reasoning in the collapsible execution timeline.
+  # code displays reasoning as visible fenced text blocks; tools stay in the panel.
+  reasoning_format: panel
+  # Applies to both formats; false hides reasoning and the tool timeline.
+  show_reasoning: true
+  # false keeps live raw thinking in a bounded panel preview instead of main_content.
+  # Does not change final/failed content, archived reasoning_format or whole-card limits.
+  stream_thinking_to_body: true
+  # Optional live-body tail window (0 = unchanged/unlimited; integer 0..1000000).
+  # Tries a smaller window if needed; answers and timeline budgets are unchanged.
+  thinking_body_tail_chars: 0
+  # Hide content-area tool rows after completed/failed; timeline and counts stay visible.
+  hide_completed_tool_activity: false
+  timeline_expanded: false
+  # Opt-in chronological panel order; card-body reasoning remains chronological.
+  timeline_order: newest_first
+  # 0 keeps all tools. 2 keeps the last two successes per reasoning block;
+  # failures/running tools remain eligible for the global max_timeline_items window.
+  timeline_tools_per_reasoning: 0
+  max_reasoning_chars: 1200
+  max_wait_ms: 800
+  max_chars: 240
+  # compact preserves rows from table 6 onward as readable field lists.
+  # truncate keeps the legacy five-table behavior when explicitly selected.
+  table_overflow_mode: compact
+  # Opt-in native card tables for body Markdown tables (default false keeps
+  # Markdown). The Markdown rich-text component cannot set a column width
+  # ("表格的富文本语法不支持设置列宽等"), so a long value column is squeezed into
+  # mid-word breaks. The native table element can set per-column widths, and
+  # row_height: auto grows the row to fit wrapped content instead of clipping
+  # the cell. Tables without data rows or with more than 50 columns, and any
+  # card that then exceeds the safe budget, fall back to the Markdown layout.
+  # row_height: auto requires Feishu client V7.33+ (data_type markdown: V7.14+).
+  native_tables: false
+  # Opt-in: after the final card update succeeds, send one new text reply that
+  # @mentions the initiating Feishu user. Card edits themselves do not notify.
+  completion_notify:
+    enabled: false
+    # message preserves a separate notification; card puts @ above the answer.
+    # A card edit is visual only and does not guarantee a push notification.
+    placement: message
+    # Explicit @ mention toggle for the completion notification. Absent =
+    # fall back to the global mentions_in_cards switch (absent = enabled).
+    mention: true
+  # Global switch for @ mentions of the initiating Feishu user inside
+  # interaction cards (approval / clarify) and in the completion notification.
+  # Set to false to disable the feature entirely (this is the master OFF
+  # switch and wins over per-kind settings). Absent key = enabled.
+  # Per-kind overrides below (interaction_mentions) only apply when the
+  # global switch is not disabled.
+  mentions_in_cards: true
+  # Per-kind @ mention switches for interaction cards. Absent key falls back
+  # to mentions_in_cards (absent = enabled). Uncomment to configure:
+  # interaction_mentions:
+  #   clarify: true
+  #   approval: true
+  # Optional role-based CardKit text sizes. Roles: body, reasoning, tool,
+  # notice, footer. Values may be scalar or default/pc/mobile mappings.
+  # Width mode is configured above; final layout is controlled by Feishu/Lark.
+  # text_sizes:
+  #   body: normal
+  #   footer:
+  #     default: x-small
+  #     pc: x-small
+  #     mobile: notation
+  # Optional conservative handoff inference. Both an active marker and a future
+  # marker must appear; explicit event data.display_status always wins.
+  status:
+    active_markers:
+      - 正在收集
+      - 数据收集中
+      - 资料收集中
+      - 处理中
+      - working on
+      - gathering
+      - collecting
+    future_markers:
+      - 到位后
+      - 完成后我会继续
+      - 我会继续
+      - will continue
+      - once available
+      - when it arrives
+      - when ready
+  # Footer fields and order. Supported values:
+  # duration, model, input_tokens, output_tokens, context, subscription_usage, output_rate
+  # output_rate is opt-in: exact output tokens / observed invocation windows.
+  # "~42 tok/s (流式)" includes role/reasoning/lifecycle timing; "含TTFT" uses request time.
+  # Hidden when any invocation lacks usage/timing, or the sample is too small.
+  # subscription_usage is opt-in and uses Hermes native Codex account usage.
+  # Only shown for GPT turns attributed to openai-codex; other/unknown routes omit it.
+  footer_fields:
+    - duration
+    - model
+    - input_tokens
+    - output_tokens
+    - context
+
+# ── Multi-Bot (optional) ─────────────────────────────────────────────────────
+# Define multiple Feishu bots under bots.items. Each bot gets its own
+# app_id/app_secret. Bind chat IDs to bots via bindings.chats.
+# Unbound sessions use bindings.fallback_bot.
+#
+# Note: V3.3.0 does NOT filter group triggers. Hermes Gateway still decides
+# whether to respond based on its own rules (mention, private, reply, etc.).
+# The sidecar only ensures the card is sent via the correct bot.
+bots:
+  default: default
+  items: {}
+  # Example:
+  # sales:
+  #   name: Sales Group Bot
+  #   app_id: cli_sales_xxxxx
+  #   app_secret: ""
+  #   card:
+  #     title: Sales Bot
+  # support:
+  #   name: Support Bot
+  #   app_id: cli_support_yyyyy
+  #   app_secret: ""
+  #   card:
+  #     title: Support Bot
+
+bindings:
+  fallback_bot: default
+  chats: {}
+  # Exact chat IDs listed here use Hermes native delivery for the next new turn.
+  # Wildcards are rejected. In multi-profile mode configure this per profile.
+  native_chats: []
+  # Example:
+  # oc_xxxxxxxxxxxx: sales
+  # oc_yyyyyyyyyyyy: support
+  group_rules:
+    # Hermes Gateway owns real @robot and allowlist admission.
+    # V3.8.10 reads this section for safe diagnostics and /hfc status hints.
+    enabled: false
+    require_mention: true
+    allowed_chats: []
+    allowed_users: []
+
+# ── Multi-Profile (V3.3.0+, optional) ────────────────────────────────────────
+# For setups with multiple Hermes profiles sharing one sidecar process.
+# When profiles is non-empty, the top-level feishu/bots/bindings sections
+# above are IGNORED. Each profile provides its own independent credentials,
+# bot registry, and chat bindings.
+# Each profile may set card.title for its default title; each bot may set
+# card.title for per-bot branding. Bot title has the highest priority.
+# card.width_mode follows the same global < profile < bot precedence.
+# Omit it to inherit, or use default to reset an inherited compact/fill mode.
+#
+# FEISHU_APP_ID and FEISHU_APP_SECRET environment variables are also
+# ignored in multi-profile mode.
+#
+# Uncomment and customize:
+#
+# profiles:
+#   default:
+#     feishu:
+#       app_id: "cli_default_xxx"
+#       app_secret: ""
+#       base_url: https://open.feishu.cn/open-apis
+#       timeout_seconds: 30
+#     bots:
+#       default: default
+#       items: {}
+#     bindings:
+#       fallback_bot: default
+#       chats: {}
+#       native_chats: []
+#     card:
+#       title: Default Profile
+#
+#   work:
+#     feishu:
+#       app_id: "cli_work_yyy"
+#       app_secret: ""
+#       base_url: https://open.feishu.cn/open-apis
+#       timeout_seconds: 30
+#     bots:
+#       default: default
+#       items:
+#         default:
+#           name: Work Bot
+#           app_id: "cli_work_yyy"
+#           app_secret: ""
+#           card:
+#             title: Work Bot
+#             width_mode: default  # Reset the profile's fill mode for this bot.
+#     bindings:
+#       fallback_bot: default
+#       chats: {}
+#       native_chats: []
+#     card:
+#       title: Work Profile
+#       width_mode: fill

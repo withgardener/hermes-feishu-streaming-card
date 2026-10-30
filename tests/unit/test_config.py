@@ -1,0 +1,997 @@
+from pathlib import Path
+
+import pytest
+import yaml
+
+from hermes_feishu_card.config import (
+    load_config,
+    normalize_text_sizes,
+    resolve_operations_hermes_root,
+)
+
+
+CONFIG_ENV_VARS = (
+    "HERMES_FEISHU_CARD_HOST",
+    "HERMES_FEISHU_CARD_PORT",
+    "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+    "HERMES_FEISHU_CARD_SERVICE_MANAGER",
+    "HERMES_FEISHU_CARD_INTEGRITY_MODE",
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "HERMES_DIR",
+    "HFC_HERMES_DIR",
+    "HERMES_AGENT_ROOT",
+)
+
+
+@pytest.fixture(autouse=True)
+def clear_config_env(monkeypatch):
+    for name in CONFIG_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_width_mode_resolves_each_scope_and_explicit_default_resets_parent(tmp_path):
+    from hermes_feishu_card.bots import resolve_card_config
+    from hermes_feishu_card.render import render_card
+    from hermes_feishu_card.session import CardSession
+
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({
+        "card": {"width_mode": " FILL "},
+        "profiles": {"work": {
+            "card": {"width_mode": "COMPACT"},
+            "bots": {"items": {"sales": {"card": {"width_mode": " Default "}}}},
+        }},
+    }), encoding="utf-8")
+    config = load_config(path)
+    profile = config["profiles"]["work"]
+    session = CardSession("c", "m", "c")
+    inherited = resolve_card_config(config["card"], {}, {})
+    scoped = resolve_card_config(config["card"], profile["card"], {})
+    reset = resolve_card_config(config["card"], profile["card"], profile["bots"]["items"]["sales"]["card"])
+    assert render_card(session, width_mode=inherited["width_mode"])["config"]["width_mode"] == "fill"
+    assert render_card(session, width_mode=scoped["width_mode"])["config"]["width_mode"] == "compact"
+    assert "width_mode" not in render_card(session, width_mode=reset["width_mode"])["config"]
+
+
+@pytest.mark.parametrize("value", [None, "", "wide", True, 400])
+@pytest.mark.parametrize("scope", ["global", "profile", "bot", "profile_bot"])
+def test_width_mode_rejects_invalid_values_at_every_scope(tmp_path, value, scope):
+    card = {"width_mode": value}
+    configs = {
+        "global": ({"card": card}, "card.width_mode"),
+        "profile": ({"profiles": {"work": {"card": card}}}, "profiles.work.card.width_mode"),
+        "bot": ({"bots": {"items": {"sales": {"card": card}}}}, "bots.items.sales.card.width_mode"),
+        "profile_bot": ({"profiles": {"work": {"bots": {"items": {"sales": {"card": card}}}}}}, "profiles.work.bots.items.sales.card.width_mode"),
+    }
+    config, expected_path = configs[scope]
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    with pytest.raises(ValueError, match=expected_path):
+        load_config(path)
+
+
+def test_load_config_missing_file_returns_defaults(tmp_path):
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config == {
+        "server": {
+            "host": "127.0.0.1",
+            "port": 8765,
+            "allow_non_loopback": False,
+        },
+        "feishu": {"app_id": "", "app_secret": ""},
+        "profiles": {},
+        "bots": {"default": "default", "items": {}},
+        "bindings": {
+            "chats": {},
+            "native_chats": [],
+            "group_rules": {"enabled": False},
+        },
+        "integrity": {"mode": "notify"},
+        "service": {"manager": "auto"},
+        "card": {
+            "max_wait_ms": 800,
+            "max_chars": 240,
+            "flush_interval_ms": 200,
+            "final_drain_timeout_ms": 900,
+            "title": "Hermes Agent",
+            "interaction_mode": "auto",
+        "streaming_mode": False,
+            "show_reasoning": True,
+        "hide_completed_tool_activity": False,
+            "stream_thinking_to_body": True,
+            "thinking_body_tail_chars": 0,
+            "reasoning_format": "panel",
+            "timeline_expanded": False,
+            "timeline_order": "newest_first",
+            "timeline_tools_per_reasoning": 0,
+            "max_timeline_items": 12,
+            "max_reasoning_chars": 1200,
+            "max_tool_result_chars": 600,
+            "table_overflow_mode": "compact",
+            "native_tables": False,
+            "completion_notify": {"enabled": False},
+            # UNSET by default: resolving helpers fall back to the legacy
+            # ``mentions_in_cards`` key and then to enabled.
+            "interaction_mentions": None,
+            "footer_fields": [
+                "duration",
+                "model",
+                "input_tokens",
+                "output_tokens",
+                "context",
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "manager", ["auto", "systemd-user", "systemd-system", "detached"]
+)
+def test_load_config_accepts_exact_service_managers(tmp_path, manager):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"service:\n  manager: {manager}\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["service"] == {"manager": manager}
+
+
+@pytest.mark.parametrize(
+    "manager", ["", "systemd", "SYSTEMD-USER", "auto ", 1, True, None]
+)
+def test_load_config_rejects_invalid_service_manager(tmp_path, manager):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump({"service": {"manager": manager}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="service.manager"):
+        load_config(path)
+
+
+def test_load_config_applies_container_service_and_listener_overrides(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK", "true")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_SERVICE_MANAGER", "detached")
+
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["server"]["host"] == "0.0.0.0"
+    assert config["server"]["allow_non_loopback"] is True
+    assert config["service"]["manager"] == "detached"
+
+
+@pytest.mark.parametrize("value", ["", "2", "sometimes"])
+def test_load_config_rejects_invalid_non_loopback_environment_boolean(
+    tmp_path, monkeypatch, value
+):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK", value)
+
+    with pytest.raises(ValueError, match="HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"):
+        load_config(tmp_path / "missing.yaml")
+
+
+def test_setup_template_writes_explicit_auto_service_manager():
+    from hermes_feishu_card.cli import _default_setup_config_text
+
+    config = yaml.safe_load(_default_setup_config_text())
+
+    assert config["service"] == {"manager": "auto"}
+
+
+def test_load_config_normalizes_native_chats_and_preserves_order(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bindings:
+  native_chats:
+    - chat-b
+    - chat-a
+    - chat-b
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bindings"]["native_chats"] == ["chat-b", "chat-a"]
+
+
+@pytest.mark.parametrize("value", ["'*'", "chat-a", "{}", "[1]"])
+def test_load_config_rejects_non_exact_native_chat_arrays(tmp_path, value):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"bindings:\n  native_chats: {value}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bindings.native_chats"):
+        load_config(path)
+
+
+def test_load_config_normalizes_profile_native_chats_without_top_level_inheritance(
+    tmp_path,
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bindings:
+  native_chats: [chat-top]
+profiles:
+  work:
+    bindings:
+      native_chats: [chat-work, chat-work]
+  personal: {}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bindings"]["native_chats"] == ["chat-top"]
+    assert config["profiles"]["work"]["bindings"]["native_chats"] == ["chat-work"]
+    assert config["profiles"]["personal"]["bindings"]["native_chats"] == []
+
+
+def test_operations_hermes_root_uses_process_hint_without_user_config(
+    monkeypatch, tmp_path
+):
+    hinted = tmp_path / "hermes-agent"
+    monkeypatch.setenv("HFC_HERMES_DIR", str(hinted))
+
+    assert resolve_operations_hermes_root() == hinted
+
+
+def test_operations_hermes_root_prefers_explicit_then_process_environment(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    dotenv_root = tmp_path / "from-dotenv"
+    explicit_root = tmp_path / "explicit"
+    process_root = tmp_path / "from-process"
+    (tmp_path / ".env").write_text(f"HERMES_DIR={dotenv_root}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_DIR", str(process_root))
+
+    assert resolve_operations_hermes_root(config_path=config_path) == process_root
+    assert (
+        resolve_operations_hermes_root(explicit_root, config_path=config_path)
+        == explicit_root
+    )
+
+
+def test_operations_hermes_root_prefers_process_environment_over_selected_env_file(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "config.yaml"
+    selected_env = tmp_path / "selected.env"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("HERMES_DIR=config-root\n", encoding="utf-8")
+    selected_env.write_text("HERMES_DIR=selected-root\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_DIR", "process-root")
+
+    assert resolve_operations_hermes_root(
+        config_path=config_path, env_file=selected_env
+    ) == Path("process-root")
+
+
+def test_operations_hermes_root_uses_selected_env_before_config_env(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    selected_env = tmp_path / "selected.env"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("HERMES_DIR=config-root\n", encoding="utf-8")
+    selected_env.write_text("HERMES_DIR=selected-root\n", encoding="utf-8")
+    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert resolve_operations_hermes_root(
+        config_path=config_path, env_file=selected_env
+    ) == Path("selected-root")
+
+
+def test_example_config_uses_current_sidecar_schema():
+    config = load_config("config.yaml.example")
+    raw = yaml.safe_load(Path("config.yaml.example").read_text(encoding="utf-8"))
+
+    assert "feishu" in raw
+    assert "cardkit" not in raw
+    assert raw["integrity"] == {"mode": "safe"}
+    assert config["feishu"] == {
+        "app_id": "",
+        "app_secret": "",
+        "base_url": "https://open.feishu.cn/open-apis",
+        "timeout_seconds": 30,
+    }
+
+
+def test_new_setup_template_explicitly_enables_safe_integrity():
+    from hermes_feishu_card.cli import _default_setup_config_text
+
+    raw = yaml.safe_load(_default_setup_config_text())
+
+    assert raw["integrity"] == {"mode": "safe"}
+
+
+def test_load_config_shallow_merges_yaml_sections(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+server:
+  port: 9000
+feishu:
+  app_id: cli_test
+card:
+  max_chars: 120
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["server"] == {
+        "host": "127.0.0.1",
+        "port": 9000,
+        "allow_non_loopback": False,
+    }
+    assert config["feishu"] == {"app_id": "cli_test", "app_secret": ""}
+    assert config["card"] == {
+        "max_wait_ms": 800,
+        "max_chars": 120,
+        "flush_interval_ms": 200,
+        "final_drain_timeout_ms": 900,
+        "title": "Hermes Agent",
+        "interaction_mode": "auto",
+        "streaming_mode": False,
+        "show_reasoning": True,
+        "hide_completed_tool_activity": False,
+        "stream_thinking_to_body": True,
+        "thinking_body_tail_chars": 0,
+        "reasoning_format": "panel",
+        "timeline_expanded": False,
+        "timeline_order": "newest_first",
+        "timeline_tools_per_reasoning": 0,
+        "max_timeline_items": 12,
+        "max_reasoning_chars": 1200,
+        "max_tool_result_chars": 600,
+        "table_overflow_mode": "compact",
+        "native_tables": False,
+        "completion_notify": {"enabled": False},
+        "interaction_mentions": None,
+        "footer_fields": [
+            "duration",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "context",
+        ],
+    }
+
+
+def test_load_config_normalizes_card_text_sizes(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+card:
+  text_sizes:
+    body: large
+    footer:
+      default: x-small
+      mobile: notation
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["card"]["text_sizes"] == {
+        "body": "large",
+        "footer": {
+            "default": "x-small",
+            "pc": "x-small",
+            "mobile": "notation",
+        },
+    }
+
+
+def test_load_config_normalizes_reasoning_format_for_profiles_and_bots(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "card:\n  reasoning_format: CODE\n"
+        "profiles:\n  work:\n    card:\n      reasoning_format: panel\n"
+        "    bots:\n      items:\n        work:\n          card:\n            reasoning_format: code\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["card"]["reasoning_format"] == "code"
+    assert config["profiles"]["work"]["card"]["reasoning_format"] == "panel"
+    assert config["profiles"]["work"]["bots"]["items"]["work"]["card"]["reasoning_format"] == "code"
+
+
+@pytest.mark.parametrize("value", ["unknown", "true", "1", "null"])
+def test_load_config_rejects_invalid_reasoning_format(tmp_path, value):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"card:\n  reasoning_format: {value}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="card.reasoning_format must be panel or code"):
+        load_config(path)
+
+
+def test_load_config_defaults_table_overflow_mode_to_compact(tmp_path):
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["card"]["table_overflow_mode"] == "compact"
+
+
+def test_load_config_normalizes_table_overflow_mode_at_global_profile_and_bot_paths(
+    tmp_path,
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+card:
+  table_overflow_mode: truncate
+bots:
+  items:
+    sales:
+      card:
+        table_overflow_mode: compact
+profiles:
+  work:
+    card:
+      table_overflow_mode: compact
+    bots:
+      items:
+        support:
+          card:
+            table_overflow_mode: truncate
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["card"]["table_overflow_mode"] == "truncate"
+    assert config["bots"]["items"]["sales"]["card"]["table_overflow_mode"] == "compact"
+    assert config["profiles"]["work"]["card"]["table_overflow_mode"] == "compact"
+    assert (
+        config["profiles"]["work"]["bots"]["items"]["support"]["card"][
+            "table_overflow_mode"
+        ]
+        == "truncate"
+    )
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "expected_path"),
+    [
+        ("card:\n  table_overflow_mode: drop\n", "card.table_overflow_mode"),
+        (
+            "bots:\n  items:\n    sales:\n      card:\n        table_overflow_mode: 1\n",
+            "bots.items.sales.card.table_overflow_mode",
+        ),
+        (
+            "profiles:\n  work:\n    card:\n      table_overflow_mode: legacy\n",
+            "profiles.work.card.table_overflow_mode",
+        ),
+    ],
+)
+def test_load_config_rejects_invalid_table_overflow_mode_with_exact_path(
+    tmp_path, yaml_text, expected_path
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        load_config(path)
+
+    assert expected_path in str(exc_info.value)
+
+
+def test_normalize_text_sizes_uses_role_default_for_pc_only_mapping():
+    assert normalize_text_sizes({"reasoning": {"pc": "large"}}) == {
+        "reasoning": {
+            "default": "small",
+            "pc": "large",
+            "mobile": "small",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_path"),
+    [
+        ({"unknown": "small"}, "card.text_sizes.unknown"),
+        ({"footer": {"tablet": "small"}}, "card.text_sizes.footer.tablet"),
+        ({"body": ""}, "card.text_sizes.body"),
+        ({"body": "normal_v2"}, "card.text_sizes.body"),
+        ({"body": 12}, "card.text_sizes.body"),
+        ({"footer": []}, "card.text_sizes.footer"),
+        ({"footer": {}}, "card.text_sizes.footer"),
+        ({"footer": {"mobile": 12}}, "card.text_sizes.footer.mobile"),
+    ],
+)
+def test_normalize_text_sizes_rejects_invalid_values_with_exact_path(
+    value, expected_path
+):
+    with pytest.raises(ValueError) as exc_info:
+        normalize_text_sizes(value)
+
+    message = str(exc_info.value)
+    assert expected_path in message
+    assert "private-sibling-secret" not in message
+
+
+def test_load_config_normalizes_profile_and_bot_text_sizes(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bots:
+  items:
+    sales:
+      app_id: app
+      app_secret: secret
+      card:
+        text_sizes:
+          footer:
+            mobile: notation
+profiles:
+  work:
+    card:
+      text_sizes:
+        body: large
+    bots:
+      items:
+        support:
+          app_id: app
+          app_secret: secret
+          card:
+            text_sizes:
+              tool: small
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bots"]["items"]["sales"]["card"]["text_sizes"]["footer"] == {
+        "default": "x-small",
+        "pc": "x-small",
+        "mobile": "notation",
+    }
+    assert config["profiles"]["work"]["card"]["text_sizes"]["body"] == "large"
+    assert (
+        config["profiles"]["work"]["bots"]["items"]["support"]["card"][
+            "text_sizes"
+        ]["tool"]
+        == "small"
+    )
+
+
+def test_load_config_defaults_include_multi_bot_sections(tmp_path):
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["bots"] == {"default": "default", "items": {}}
+    assert config["bindings"] == {
+        "chats": {},
+        "native_chats": [],
+        "group_rules": {"enabled": False},
+    }
+
+
+def test_load_config_accepts_multi_bot_sections(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+feishu:
+  app_id: cli_default
+  app_secret: default-secret
+bots:
+  default: default
+  items:
+    sales:
+      app_id: cli_sales
+      app_secret: sales-secret
+bindings:
+  fallback_bot: default
+  chats:
+    oc_sales: sales
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bots"]["items"]["sales"]["app_id"] == "cli_sales"
+    assert config["bindings"]["chats"] == {"oc_sales": "sales"}
+
+
+def test_load_config_accepts_custom_footer_fields(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "card:\n"
+        "  footer_fields:\n"
+        "    - model\n"
+        "    - duration\n"
+        "    - context\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["card"]["footer_fields"] == ["model", "duration", "context"]
+
+
+def test_load_config_accepts_custom_card_title(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("card:\n  title: 研发助手\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["card"]["title"] == "研发助手"
+
+
+def test_load_config_defaults_include_v38_card_options(tmp_path):
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["card"]["flush_interval_ms"] == 200
+    assert config["card"]["final_drain_timeout_ms"] == 900
+    assert config["card"]["show_reasoning"] is True
+    assert config["card"]["timeline_expanded"] is False
+    assert config["card"]["max_timeline_items"] == 12
+    assert config["card"]["max_reasoning_chars"] == 1200
+    assert config["card"]["max_tool_result_chars"] == 600
+
+
+def test_load_config_accepts_v38_card_options(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "card:\n"
+        "  flush_interval_ms: 80\n"
+        "  final_drain_timeout_ms: 1500\n"
+        "  show_reasoning: false\n"
+        "  timeline_expanded: true\n"
+        "  max_timeline_items: 6\n"
+        "  max_reasoning_chars: 800\n"
+        "  max_tool_result_chars: 300\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["card"]["flush_interval_ms"] == 80
+    assert config["card"]["final_drain_timeout_ms"] == 1500
+    assert config["card"]["show_reasoning"] is False
+    assert config["card"]["timeline_expanded"] is True
+    assert config["card"]["max_timeline_items"] == 6
+    assert config["card"]["max_reasoning_chars"] == 800
+    assert config["card"]["max_tool_result_chars"] == 300
+
+
+def test_load_config_accepts_yaml_string_port_and_normalizes_to_int(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("server:\n  port: '9003'\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["server"]["port"] == 9003
+
+
+def test_load_config_empty_file_returns_defaults(tmp_path):
+    path = tmp_path / "empty.yaml"
+    path.write_text("", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["server"]["host"] == "127.0.0.1"
+    assert config["server"]["port"] == 8765
+
+
+def test_load_config_rejects_non_mapping_top_level(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text("- server\n- feishu\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="top-level"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("section", ["server", "feishu", "card"])
+def test_load_config_rejects_non_mapping_known_sections(tmp_path, section):
+    path = tmp_path / "bad.yaml"
+    path.write_text(f"{section}: 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=f"{section}.*mapping"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("port", [True, False, 0, -1, 65536, "not-a-port"])
+def test_load_config_rejects_invalid_yaml_ports(tmp_path, port):
+    path = tmp_path / "bad.yaml"
+    value = repr(port).lower() if isinstance(port, bool) else repr(port)
+    path.write_text(f"server:\n  port: {value}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="server.port"):
+        load_config(path)
+
+
+def test_load_config_applies_supported_environment_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_PORT", "9001")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "cli_secret")
+
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["server"] == {
+        "host": "0.0.0.0",
+        "port": 9001,
+        "allow_non_loopback": False,
+    }
+    assert config["feishu"] == {"app_id": "cli_app", "app_secret": "cli_secret"}
+
+
+def test_load_config_applies_dotenv_next_to_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "HERMES_FEISHU_CARD_HOST=0.0.0.0",
+                "HERMES_FEISHU_CARD_PORT=9012",
+                "FEISHU_APP_ID=dotenv_app",
+                "FEISHU_APP_SECRET='dotenv secret'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config["server"] == {
+        "host": "0.0.0.0",
+        "port": 9012,
+        "allow_non_loopback": False,
+    }
+    assert config["feishu"] == {
+        "app_id": "dotenv_app",
+        "app_secret": "dotenv secret",
+    }
+
+
+def test_load_config_environment_overrides_dotenv(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "HERMES_FEISHU_CARD_PORT=9012\n"
+        "FEISHU_APP_ID=dotenv_app\n"
+        "FEISHU_APP_SECRET=dotenv_secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_FEISHU_CARD_PORT", "9013")
+    monkeypatch.setenv("FEISHU_APP_ID", "env_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "env_secret")
+
+    config = load_config(config_path)
+
+    assert config["server"]["port"] == 9013
+    assert config["feishu"] == {"app_id": "env_app", "app_secret": "env_secret"}
+
+
+def test_load_config_selected_env_overrides_sibling_dotenv(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    selected_env = tmp_path / "selected.env"
+    config_path.write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "FEISHU_APP_ID=sibling_app\nFEISHU_APP_SECRET=sibling_secret\n",
+        encoding="utf-8",
+    )
+    selected_env.write_text(
+        "FEISHU_APP_ID=selected_app\nFEISHU_APP_SECRET=selected_secret\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, env_file=selected_env)
+
+    assert config["feishu"] == {
+        "app_id": "selected_app",
+        "app_secret": "selected_secret",
+    }
+
+    monkeypatch.setenv("FEISHU_APP_ID", "process_app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "process_secret")
+
+    config = load_config(config_path, env_file=selected_env)
+
+    assert config["feishu"] == {
+        "app_id": "process_app",
+        "app_secret": "process_secret",
+    }
+
+
+def test_load_config_rejects_invalid_environment_port(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_PORT", "not-a-port")
+
+    with pytest.raises(ValueError, match="HERMES_FEISHU_CARD_PORT"):
+        load_config(tmp_path / "missing.yaml")
+
+
+@pytest.mark.parametrize("port", ["0", "-1", "65536", "true"])
+def test_load_config_rejects_out_of_range_environment_port(tmp_path, monkeypatch, port):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_PORT", port)
+
+    with pytest.raises(ValueError, match="HERMES_FEISHU_CARD_PORT"):
+        load_config(tmp_path / "missing.yaml")
+
+
+# ── profile support ──────────────────────────────────────────────
+
+
+def test_load_config_with_profiles(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+profiles:
+  default:
+    feishu:
+      app_id: cli_a
+      app_secret: s_a
+    bots:
+      default: default
+      items: {}
+    bindings:
+      chats: {}
+      fallback_bot: default
+  work:
+    feishu:
+      app_id: cli_b
+      app_secret: s_b
+""",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+
+    assert "profiles" in config
+    assert config["profiles"]["default"]["feishu"]["app_id"] == "cli_a"
+    # 验证 work profile 自动继承了默认的 bots / bindings
+    assert config["profiles"]["work"]["bots"]["default"] == "default"
+    assert config["profiles"]["work"]["bindings"] == {
+        "chats": {},
+        "native_chats": [],
+        "group_rules": {"enabled": False},
+    }
+
+
+def test_load_config_without_profiles_still_works(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "feishu:\n  app_id: cli_top\n  app_secret: s_top\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+
+    assert config["feishu"]["app_id"] == "cli_top"
+    assert "profiles" in config  # DEFAULT_CONFIG 带入了空 dict
+    assert not config["profiles"]  # 为空
+
+
+def test_profiles_env_override_skipped_when_profiles_present(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+profiles:
+  default:
+    feishu:
+      app_id: cli_a
+      app_secret: s_a
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_env")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "s_env")
+
+    config = load_config(path)
+
+    # 环境变量不应覆盖 profile 中的凭据
+    assert config["profiles"]["default"]["feishu"]["app_id"] == "cli_a"
+    assert config["profiles"]["default"]["feishu"]["app_secret"] == "s_a"
+
+
+def test_load_config_rejects_non_mapping_profile_value(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+profiles:
+  bad: 123
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="profile"):
+        load_config(path)
+
+
+def test_profile_card_config_inherits_global_card_defaults(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+card:
+  title: Global
+  footer_fields: [model]
+profiles:
+  work:
+    card:
+      title: Work
+    feishu:
+      app_id: cli_work
+      app_secret: s
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["profiles"]["work"]["card"]["title"] == "Work"
+    assert config["profiles"]["work"]["card"]["footer_fields"] == ["model"]
+
+
+def test_profile_card_text_size_override_preserves_global_roles(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+card:
+  text_sizes:
+    body: normal
+    footer: x-small
+profiles:
+  work:
+    card:
+      text_sizes:
+        footer: notation
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["profiles"]["work"]["card"]["text_sizes"] == {
+        "body": "normal",
+        "footer": "notation",
+    }
+
+
+def test_load_config_rejects_non_mapping_profile_card(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+profiles:
+  work:
+    card: bad
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="profile 'work' card must be a mapping"):
+        load_config(path)
+
+
+def test_existing_config_without_integrity_section_defaults_to_notify(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("server:\n  port: 8765\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["integrity"] == {"mode": "notify"}
+
+
+@pytest.mark.parametrize("mode", ["safe", "notify", "off"])
+def test_integrity_mode_accepts_only_explicit_supported_values(tmp_path, mode):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"integrity:\n  mode: {mode}\n", encoding="utf-8")
+
+    assert load_config(path)["integrity"]["mode"] == mode
+
+
+def test_invalid_integrity_mode_is_rejected_with_exact_path(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("integrity:\n  mode: automatic\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integrity.mode"):
+        load_config(path)

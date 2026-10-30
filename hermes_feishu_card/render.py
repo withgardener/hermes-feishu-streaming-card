@@ -1,0 +1,2849 @@
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+import html
+import json
+import math
+import re
+import time as _time
+from collections.abc import Mapping
+from typing import Any, Dict, Literal, Optional
+
+from .display_redaction import (
+    KEY_VALUE_SECRET_RE, SECRET_FLAG_RE, URL_SECRET_RE, redact_tool_detail,
+)
+from .card_limits import CardLimitInspection, inspect_card_limits
+from .card_timeline import TERMINAL_TOOL_STATUSES
+from .approval_receipts import has_confirmed_approval_receipt
+from .config_rules import card_width_config
+from .session import (
+    CardSession,
+    ToolState,
+    _exact_feishu_open_id,
+    _runtime_tool_summary,
+)
+from .status import StatusConfig, resolve_display_status
+from .subscription_usage import uses_codex_subscription
+from .turn_metrics import retained_output_rate
+from .card_view import TASK_TEXT_SIZE_DEFAULTS, task_presentation
+from .presentation import (
+    apply_task_presentation, task_interaction_prompt,
+    task_button_label, task_answer_code_projection,
+)
+from .content_plan import plan_main_content, render_content_plan
+from .text import (
+    TableOverflowResult,
+    normalize_stream_text,
+    split_markdown_blocks,
+    transform_table_overflow,
+)
+
+DEFAULT_FOOTER_FIELDS = (
+    "duration",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "context",
+)
+MAIN_CONTENT_CHUNK_CHARS = 2400
+DEFAULT_TITLE = "Hermes Agent"
+RUNTIME_HEADER_MAX_CHARS = 120
+CARD_QUOTE_SUMMARY_MAX_CHARS = 120
+TEXT_SIZE_ROLE_ORDER = ("body", "reasoning", "tool", "notice", "footer")
+MODEL_COLOR_PREFIXES = (
+    (("gpt-", "o1", "o3"), "blue"),
+    (("claude-",), "orange"),
+    (("deepseek-", "deepseek/"), "indigo"),
+    (("kimi-", "kimi/", "moonshot-"), "purple"),
+    (("glm-",), "green"),
+    (("hy3", "tencent/", "hunyuan"), "teal"),
+)
+
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_RUNTIME_FENCE_RE = re.compile(r"```[A-Za-z0-9_-]*")
+_TOOL_DURATION_LINE_RE = re.compile(r"^耗时:\s*(.+?)\s*$")
+
+
+@dataclass(frozen=True)
+class CardRenderResult:
+    card: Dict[str, Any]
+    disposition: Literal["card", "deferred_native", "native"]
+    inspection: CardLimitInspection
+    table_overflow: TableOverflowResult
+    limit_reason: str = ""
+    primary_text: str = ""
+
+
+def _spinner_text(label: str = "生成中") -> str:
+    return f"{_spinner_frame()} {label}"
+
+
+def _spinner_frame() -> str:
+    frame = _SPINNER_FRAMES[int(_time.time() * 8) % len(_SPINNER_FRAMES)]
+    return frame
+
+
+def render_card(
+    session: CardSession,
+    footer_fields: list[str] | tuple[str, ...] | None = None,
+    title: str = DEFAULT_TITLE,
+    interaction_mode: str = "callback",
+    show_reasoning: bool = True,
+    timeline_expanded: bool = False,
+    max_timeline_items: int = 12,
+    max_reasoning_chars: int = 1200,
+    max_tool_result_chars: int = 600,
+    status_config: Optional[StatusConfig] = None,
+    text_sizes: Mapping[str, Any] | None = None,
+    table_overflow_mode: str = "compact",
+    interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
+    reasoning_format: str = "panel",
+    completion_mention: bool = False,
+    hide_completed_tool_activity: bool = False,
+    stream_thinking_to_body: bool = True,
+    hide_successful_tool_activity: bool = False,
+    timeline_order: str = "newest_first",
+    timeline_tools_per_reasoning: int = 0,
+    thinking_body_tail_chars: int = 0,
+    width_mode: str = "default",
+    presentation: str = "classic",
+    native_tables: bool = False,
+) -> Dict[str, Any]:
+    return render_card_result(
+        session,
+        footer_fields=footer_fields,
+        title=title,
+        interaction_mode=interaction_mode,
+        show_reasoning=show_reasoning,
+        timeline_expanded=timeline_expanded,
+        max_timeline_items=max_timeline_items,
+        max_reasoning_chars=max_reasoning_chars,
+        max_tool_result_chars=max_tool_result_chars,
+        status_config=status_config,
+        text_sizes=text_sizes,
+        table_overflow_mode=table_overflow_mode,
+        interaction_profile_id=interaction_profile_id,
+        mentions_enabled=mentions_enabled,
+        reasoning_format=reasoning_format,
+        completion_mention=completion_mention,
+        hide_completed_tool_activity=hide_completed_tool_activity,
+        stream_thinking_to_body=stream_thinking_to_body,
+        hide_successful_tool_activity=hide_successful_tool_activity,
+        timeline_order=timeline_order,
+        timeline_tools_per_reasoning=timeline_tools_per_reasoning,
+        thinking_body_tail_chars=thinking_body_tail_chars,
+        width_mode=width_mode,
+        presentation=presentation,
+        native_tables=native_tables,
+    ).card
+
+
+def render_card_result(
+    session: CardSession,
+    footer_fields: list[str] | tuple[str, ...] | None = None,
+    title: str = DEFAULT_TITLE,
+    interaction_mode: str = "callback",
+    show_reasoning: bool = True,
+    timeline_expanded: bool = False,
+    max_timeline_items: int = 12,
+    max_reasoning_chars: int = 1200,
+    max_tool_result_chars: int = 600,
+    status_config: Optional[StatusConfig] = None,
+    text_sizes: Mapping[str, Any] | None = None,
+    table_overflow_mode: str = "compact",
+    interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
+    reasoning_format: str = "panel",
+    completion_mention: bool = False,
+    hide_completed_tool_activity: bool = False,
+    stream_thinking_to_body: bool = True,
+    hide_successful_tool_activity: bool = False,
+    timeline_order: str = "newest_first",
+    timeline_tools_per_reasoning: int = 0,
+    thinking_body_tail_chars: int = 0,
+    width_mode: str = "default",
+    presentation: str = "classic",
+    native_tables: bool = False,
+) -> CardRenderResult:
+    if presentation == "task" and session.status == "failed" and session.terminal_reasoning_notice:
+        # This source marker comes from the terminal event, never a text match.
+        # Keep one view for both the payload budget and actual body rendering.
+        session = copy.copy(session)
+        # The task header already owns this exact generic interruption notice.
+        # Real answers and specific failure explanations retain their body text.
+        session.answer_text = (
+            "" if session.terminal_reasoning_notice == "任务已中断" and not session.presentation_state
+            else session.terminal_reasoning_notice
+        )
+    primary_text = _primary_text_for_session(
+        session, stream_thinking_to_body=stream_thinking_to_body,
+        thinking_body_tail_chars=thinking_body_tail_chars,
+        presentation=presentation,
+    )
+    table_overflow = transform_table_overflow(
+        primary_text,
+        mode=table_overflow_mode,
+    )
+    render_options = dict(
+        footer_fields=footer_fields,
+        title=title,
+        interaction_mode=interaction_mode,
+        show_reasoning=show_reasoning,
+        timeline_expanded=timeline_expanded,
+        max_timeline_items=max_timeline_items,
+        max_reasoning_chars=max_reasoning_chars,
+        max_tool_result_chars=max_tool_result_chars,
+        status_config=status_config,
+        text_sizes=text_sizes,
+        table_overflow_mode=table_overflow_mode,
+        interaction_profile_id=interaction_profile_id,
+        mentions_enabled=mentions_enabled,
+        reasoning_format=reasoning_format,
+        completion_mention=completion_mention,
+        hide_completed_tool_activity=hide_completed_tool_activity,
+        stream_thinking_to_body=stream_thinking_to_body,
+        hide_successful_tool_activity=hide_successful_tool_activity,
+        timeline_order=timeline_order,
+        timeline_tools_per_reasoning=timeline_tools_per_reasoning,
+        thinking_body_tail_chars=thinking_body_tail_chars,
+        width_mode=width_mode,
+        presentation=presentation,
+        native_tables=native_tables,
+    )
+    card = _render_card_unchecked(session, **render_options)
+    inspection = inspect_card_limits(card)
+    # Only opt-in live reasoning is expendable. Never shrink answers or the
+    # auxiliary timeline, and always inspect the complete serialized card.
+    if (not inspection.safe and type(thinking_body_tail_chars) is int
+            and thinking_body_tail_chars > 0 and stream_thinking_to_body
+            and session.status not in {"completed", "failed"}
+            and not session.answer_text and session.thinking_text):
+        low, high = 1, min(thinking_body_tail_chars, len(primary_text)) - 1
+        best = None
+        while low <= high:
+            limit = (low + high) // 2
+            probe_options = dict(render_options, thinking_body_tail_chars=limit)
+            probe = _render_card_unchecked(session, **probe_options)
+            probe_inspection = inspect_card_limits(probe)
+            if probe_inspection.safe:
+                best = (probe, probe_inspection, limit)
+                low = limit + 1
+            else:
+                high = limit - 1
+        # Markdown/table structure need not be monotonic in character count:
+        # retain only a candidate whose complete card was actually verified.
+        if best is not None:
+            card, inspection, limit = best
+            primary_text = _primary_text_for_session(
+                session, stream_thinking_to_body=True, thinking_body_tail_chars=limit,
+                presentation=presentation,
+            )
+            table_overflow = transform_table_overflow(primary_text, mode=table_overflow_mode)
+    if not inspection.safe and native_tables:
+        # Native table elements cost more JSON bytes than the Markdown they
+        # replace. Fall back to the Markdown layout before the limit-handoff
+        # card, so a rich table can never make the whole answer undeliverable.
+        markdown_options = dict(render_options, native_tables=False)
+        markdown_card = _render_card_unchecked(session, **markdown_options)
+        markdown_inspection = inspect_card_limits(markdown_card)
+        if markdown_inspection.safe:
+            card, inspection = markdown_card, markdown_inspection
+    if inspection.safe:
+        return CardRenderResult(
+            card=card,
+            disposition="card",
+            inspection=inspection,
+            table_overflow=table_overflow,
+            primary_text=primary_text,
+        )
+
+    terminal = session.status in {"completed", "failed"}
+    disposition: Literal["deferred_native", "native"] = (
+        "native" if terminal else "deferred_native"
+    )
+    return CardRenderResult(
+        card=_render_limit_handoff_card(
+            title=title,
+            terminal=terminal,
+            width_mode=width_mode,
+        ),
+        disposition=disposition,
+        inspection=inspection,
+        table_overflow=table_overflow,
+        limit_reason=inspection.primary_reason,
+    )
+
+
+def _render_card_unchecked(
+    session: CardSession,
+    footer_fields: list[str] | tuple[str, ...] | None = None,
+    title: str = DEFAULT_TITLE,
+    interaction_mode: str = "callback",
+    show_reasoning: bool = True,
+    timeline_expanded: bool = False,
+    max_timeline_items: int = 12,
+    max_reasoning_chars: int = 1200,
+    max_tool_result_chars: int = 600,
+    status_config: Optional[StatusConfig] = None,
+    text_sizes: Mapping[str, Any] | None = None,
+    table_overflow_mode: str = "compact",
+    interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
+    reasoning_format: str = "panel",
+    completion_mention: bool = False,
+    hide_completed_tool_activity: bool = False,
+    stream_thinking_to_body: bool = True,
+    hide_successful_tool_activity: bool = False,
+    timeline_order: str = "newest_first",
+    timeline_tools_per_reasoning: int = 0,
+    thinking_body_tail_chars: int = 0,
+    width_mode: str = "default",
+    presentation: str = "classic",
+    native_tables: bool = False,
+) -> Dict[str, Any]:
+    if presentation == "task":
+        text_sizes = {**TASK_TEXT_SIZE_DEFAULTS, **dict(text_sizes or {})}
+    used_text_size_roles: set[str] = set()
+    status = _render_status(session, status_config=status_config)
+    display_status = resolve_display_status(
+        session, status_config or StatusConfig.defaults()
+    ).value
+    native_reply_completed = (
+        session.status == "completed"
+        and session.delivery_kind == "chat"
+        and bool(session.reply_to_message_id)
+    )
+    primary_text = _primary_text_for_session(
+        session, stream_thinking_to_body=stream_thinking_to_body,
+        thinking_body_tail_chars=thinking_body_tail_chars,
+        presentation=presentation,
+    )
+    attachment_summary = _render_attachment_summary(session)
+    footer = _render_footer(
+        session,
+        footer_fields,
+        display_status=display_status,
+        compact=presentation == "task",
+        include_status=presentation != "task" or native_reply_completed,
+        # Maintainer note (contract change): the footer no longer repeats "本轮回复结束" at all.
+        # The user asked for it to go from the footer ("footer 区域不显示本轮回复结束"), and only
+        # the native-reply rail ever had it there — that rail drops the whole header
+        # (`if not native_reply_completed: card["header"] = header`), so this note was its only
+        # completion marker. It is a third telling of one fact: the state pill right beside it
+        # already reads 已完成, the header sub-title says "本轮回复结束" on every other completed
+        # card (`_render_status`), and the completion rail posts a standalone native message
+        # ("✅ 本轮回复结束（用时 …）") that the user sees as its own line.
+    )
+    if session.delivery_kind == "notice" and session.notice_title:
+        configured_title = session.notice_title
+    else:
+        configured_title = (
+            title.strip() if isinstance(title, str) and title.strip() else DEFAULT_TITLE
+        )
+    runtime_summary = _runtime_header_summary(session)
+    header_action = _header_action_text(session, display_status=display_status)
+    header_title = _header_title_with_state(
+        session,
+        configured_title,
+        display_status=display_status,
+    )
+    pending_interaction = session.active_interaction
+    pending_approval = (
+        pending_interaction is not None
+        and pending_interaction.status == "pending"
+        and pending_interaction.kind == "approval"
+    )
+    if (
+        pending_interaction is not None
+        and pending_interaction.status == "pending"
+        and pending_interaction.kind in {"approval", "clarify"}
+    ):
+        prefix = (
+            "待审批："
+            if pending_interaction.kind == "approval"
+            else "待选择："
+        )
+        header_title = f"{prefix}{header_title}"
+    main_role = "notice" if session.delivery_kind == "notice" else "body"
+    elements = []
+    if pending_approval:
+        # Keep the authorization scope and choices together. Prior answers and
+        # the execution timeline must not push this decision below old output.
+        primary_text = pending_interaction.prompt
+    if primary_text:
+        if mentions_enabled and session.delivery_kind == "chat" and not pending_approval:
+            primary_text = _render_known_requester_mentions(primary_text, session)
+        if completion_mention and session.status == "completed" and session.delivery_kind == "chat":
+            requester = _exact_feishu_open_id(session.sender_open_id)
+            mention = f'<at id="{requester}"></at>' if requester else ""
+            if mention and mention not in primary_text:
+                primary_text = mention + "\n\n" + primary_text
+        elements = _render_main_content_elements(
+            primary_text,
+            table_overflow_mode=table_overflow_mode,
+            native_tables=native_tables,
+            text_size=_role_text_size(
+                text_sizes,
+                main_role,
+                default=None,
+                used_roles=used_text_size_roles,
+            ),
+        )
+    # Keep live progress and pending interaction layouts unchanged. Only the
+    # content tool area is optional; timeline evidence and counts stay intact.
+    hide_terminal_tools = (
+        hide_completed_tool_activity and session.status in {"completed", "failed"}
+    ) or (hide_successful_tool_activity and session.status == "completed")
+    timeline_elements: list[Dict[str, Any]] = []
+    rendered_tool_ids: set[str] = set()
+    if show_reasoning and not pending_approval:
+        timeline_elements = _render_timeline_elements(
+            session,
+            expanded=timeline_expanded,
+            max_items=max_timeline_items,
+            max_reasoning_chars=max_reasoning_chars,
+            max_tool_result_chars=max_tool_result_chars,
+            timeline_order=timeline_order,
+            tools_per_reasoning=timeline_tools_per_reasoning,
+            text_sizes=text_sizes,
+            used_text_size_roles=used_text_size_roles,
+            reasoning_format=reasoning_format,
+            rendered_tool_ids=rendered_tool_ids,
+            live_thinking=(
+                session.thinking_text
+                if (not stream_thinking_to_body and session.status not in {"completed", "failed"}
+                    or presentation == "task" and session.status == "failed"
+                    and session.terminal_reasoning_notice)
+                else ""
+            ),
+        )
+    tool_activity_elements = (
+        []
+        if pending_approval
+        else _render_tool_activity_elements(
+            session,
+            text_sizes=text_sizes,
+            used_text_size_roles=used_text_size_roles,
+            display_status=display_status,
+            max_chars=max_tool_result_chars,
+            hide_successful=hide_terminal_tools,
+            task_layout=presentation == "task",
+            details_in_timeline=rendered_tool_ids,
+            observation_only=presentation == "task" and bool(task_presentation(session).observation),
+        )
+    )
+    elements.extend(tool_activity_elements)
+    elements.extend(timeline_elements)
+    elements.extend(
+        _render_interaction_elements(
+            session,
+            interaction_mode=interaction_mode,
+            mentions_enabled=mentions_enabled,
+            presentation=presentation,
+        )
+    )
+    if attachment_summary and not pending_approval:
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": "attachment_summary",
+                "content": attachment_summary,
+            }
+        )
+    elements.append({"tag": "hr", "element_id": "main_divider"})
+    if (
+        not timeline_elements
+        and not hide_terminal_tools
+        and not tool_activity_elements
+        and not pending_approval
+        and session.tool_count
+    ):
+        tool_summary = {
+            "tag": "markdown",
+            "element_id": "tool_summary",
+            "content": _render_tool_summary(session),
+        }
+        _set_text_size(
+            tool_summary,
+            _role_text_size(
+                text_sizes,
+                "tool",
+                default=None,
+                used_roles=used_text_size_roles,
+            ),
+        )
+        elements.append(tool_summary)
+    footer_element = {
+        "tag": "markdown",
+        "element_id": "footer",
+        "content": footer,
+        "text_size": _role_text_size(
+            text_sizes,
+            "footer",
+            default="x-small",
+            used_roles=used_text_size_roles,
+        ),
+    }
+    elements.append(footer_element)
+    header = {
+        "template": status["template"],
+        "title": {"tag": "plain_text", "content": header_title},
+    }
+    # Maintainer note (contract change): the sub-title now prefers the ACTION phrase, so the title's
+    # last segment ("正在读取文件") sits on the row beneath it — the user asked for that split
+    # ("标题的正在使用之类的，放到第二行"). The phase ("生成中"/"思考中") only takes the slot when no
+    # tool is running, and "本轮回复结束" keeps it for a completed turn (both are mutually exclusive
+    # with a running tool by construction — see ``_header_action_text``).
+    if header_action:
+        header["subtitle"] = {"tag": "plain_text", "content": header_action}
+    elif runtime_summary:
+        header["subtitle"] = {"tag": "plain_text", "content": runtime_summary}
+    elif status["subtitle"]:
+        header["subtitle"] = {"tag": "plain_text", "content": status["subtitle"]}
+
+    card = {
+        "schema": "2.0",
+        "config": {
+            **card_width_config(width_mode),
+            "update_multi": True,
+            "summary": {
+                "content": _card_quote_summary(
+                    session,
+                    status,
+                    display_status=display_status,
+                )
+            },
+        },
+        "body": {
+            "elements": elements
+        },
+    }
+    mapped_styles = {
+        f"hfc_{role}": dict(text_sizes[role])
+        for role in TEXT_SIZE_ROLE_ORDER
+        if role in used_text_size_roles
+        and isinstance(text_sizes, Mapping)
+        and isinstance(text_sizes.get(role), Mapping)
+    }
+    if mapped_styles:
+        card["config"]["style"] = {"text_size": mapped_styles}
+    if not native_reply_completed:
+        card["header"] = header
+    legacy_fallback_card = None
+    if _uses_legacy_callback_card(session, interaction_mode=interaction_mode):
+        if presentation == "task":
+            legacy_fallback_card = _render_legacy_callback_card(
+                session, header=header,
+                profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+                mentions_enabled=mentions_enabled,
+            )
+        card = _render_legacy_callback_card(
+            session,
+            header=header,
+            profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+            mentions_enabled=mentions_enabled,
+            presentation=presentation,
+        )
+    if presentation == "task":
+        card = apply_task_presentation(
+            card, session, title=configured_title, action=header_action or runtime_summary,
+            has_primary_content=bool(session.answer_text or (stream_thinking_to_body and session.thinking_text)),
+            legacy_fallback_card=legacy_fallback_card,
+        )
+    return card
+
+
+def _uses_legacy_callback_card(
+    session: CardSession, *, interaction_mode: str
+) -> bool:
+    interaction = session.active_interaction
+    if (
+        interaction is None
+        or interaction.status != "pending"
+        or _normalize_interaction_mode(interaction_mode) != "callback"
+    ):
+        return False
+    if str(getattr(interaction, "feishu_message_id", "") or "").strip():
+        # Maintainer note (contract change): an interaction that already has a message of its own
+        # must not turn the session card into a second copy of it.
+        #
+        # `feishu_message_id` is recorded only by the two deliveries that send an interaction as a
+        # STANDALONE card (both use delivery_kind="interaction"), i.e. the approval card the user
+        # clicks. Answering True here made the SESSION's card take the same approval shape, so one
+        # approval appeared as two cards — the double-track the user reported ("双轨审批卡"). The
+        # session card now stays a streaming card; _render_interaction_elements keeps its rows out of
+        # it, and the header still announces 待审批：… so the pending decision is not hidden.
+        return False
+    return True
+
+
+def render_legacy_interaction_callback_card(
+    session: CardSession,
+    *,
+    title: str = DEFAULT_TITLE,
+    interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
+    presentation: str = "classic",
+) -> Dict[str, Any]:
+    """Render one interaction entirely on Feishu's legacy callback rail.
+
+    This is the dedicated legacy auxiliary renderer used for interaction
+    messages that are NOT the session's streaming card: the streaming card
+    (schema 2.0) keeps its stable owner, and the interaction replies on this
+    legacy rail instead of switching the session card's dialect.
+    """
+    interaction = session.active_interaction
+    if interaction is None:
+        raise ValueError("active interaction is required")
+    template = {
+        "completed": "green",
+        "failed": "red",
+    }.get(interaction.status, "blue")
+    header_title = interaction.prompt or title
+    if (
+        interaction.status == "pending"
+        and interaction.kind in {"approval", "clarify"}
+    ):
+        prefix = "待审批：" if interaction.kind == "approval" else "待选择："
+        header_title = f"{prefix}{header_title}"
+    header = {
+        "template": template,
+        "title": {
+            "tag": "plain_text",
+            "content": header_title,
+        },
+    }
+    card = _render_legacy_callback_card(
+        session,
+        header=header,
+        profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+        mentions_enabled=mentions_enabled,
+        presentation=presentation,
+    )
+
+    if presentation == "task":
+        classic = _render_legacy_callback_card(
+            session, header=header,
+            profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+            mentions_enabled=mentions_enabled,
+        )
+        return apply_task_presentation(card, session, title=title, legacy_fallback_card=classic)
+    return card
+
+
+def _render_legacy_callback_card(
+    session: CardSession,
+    *,
+    header: Mapping[str, Any],
+    profile_id: str,
+    mentions_enabled: bool = True,
+    presentation: str = "classic",
+) -> Dict[str, Any]:
+    """Render an interaction on Feishu's server-callback card rail.
+
+    CardKit v2 ``behaviors`` callbacks are client-side interactions and do not
+    reach Hermes' ``p2.card.action.trigger`` WebSocket handler.  Conversely,
+    the legacy ``action`` container is rejected when embedded in a schema-2.0
+    card.  Pending and terminal renders therefore stay in the legacy dialect.
+    """
+    interaction = session.active_interaction
+    if interaction is None:  # Defensive: caller already checked the state.
+        return {}
+
+    elements: list[Dict[str, Any]] = []
+    if interaction.status == "completed":
+        elements.extend(_interaction_review_elements(interaction, presentation=presentation))
+        choice = interaction.choice_label or interaction.choice or "已完成"
+        user = f" by {interaction.user_name}" if interaction.user_name else ""
+        elements.append(
+            {"tag": "markdown", "content": f"已选择：{choice}{user}"}
+        )
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": dict(header),
+            "elements": elements,
+        }
+    if interaction.status == "paused":
+        elements.extend(_interaction_review_elements(interaction, presentation=presentation))
+        elements.append({"tag": "markdown", "content": interaction.error})
+        elements.append({"tag": "action", "actions": [{
+            "tag": "button", "type": "primary",
+            "text": {"tag": "plain_text", "content": "查看并继续审批"},
+            "value": {"hfc_action": "interaction.select", "interaction_id": interaction.interaction_id,
+                      "token": interaction.callback_token, "choice": "__hfc_resume_approval__",
+                      "profile_id": profile_id},
+        }]})
+        return {"config": {"wide_screen_mode": True, "update_multi": True},
+                "header": {"template": "orange", "title": {"tag": "plain_text", "content": "任务已暂停，等待审批"}},
+                "elements": elements}
+    if interaction.status != "pending":
+        elements.extend(_interaction_review_elements(interaction, presentation=presentation))
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": interaction.error or "交互请求失败",
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": dict(header),
+            "elements": elements,
+        }
+
+    if interaction.kind == "approval":
+        elements.append({"tag": "markdown", "content":
+            "请核对下方完整操作后，单击授权按钮一次。若手机显示“展开”，展开仅查看内容，不会提交授权。"})
+
+    # Mobile clients truncate long headers without exposing their full text.
+    # Keep the complete question in the body before options and controls.
+    prompt = normalize_stream_text(interaction.prompt).strip()
+    if len(prompt) > 40:
+        elements.append({"tag": "markdown", "content": prompt})
+    description = mask_approval_scope(normalize_stream_text(interaction.description).strip())
+    if description:
+        elements.append({"tag": "markdown", "content": description})
+
+    # These task buttons use the same complete-label predicate as presentation.
+    # Omit only our generated list, never matching prompt/description content.
+    choices_on_buttons = (
+        presentation == "task" and not interaction.multi_select and bool(interaction.options)
+        and len({option.value for option in interaction.options}) == len(interaction.options)
+        and all(task_button_label(option.label) for option in interaction.options)
+    )
+    if interaction.kind in {"approval", "clarify"} and not choices_on_buttons:
+        elements.extend(_interaction_option_descriptions(interaction))
+
+    mention = _interaction_mention_content(
+        session,
+        interaction,
+        mentions_enabled=mentions_enabled,
+    )
+    if interaction.multi_select:
+        if mention:
+            hint = f"{mention} 请选择（可多选）"
+            if interaction.allow_custom_input:
+                hint += "，或输入自定义内容"
+            elements.append({"tag": "markdown", "content": hint})
+        elements.append(
+            _legacy_form(
+                _render_multi_select_form(interaction, profile_id=profile_id)
+            )
+        )
+    else:
+        hint = "请选择一个选项"
+        if interaction.allow_custom_input:
+            hint += "，或输入自定义内容"
+        if mention:
+            hint = f"{mention} {hint}"
+        elements.append({"tag": "markdown", "content": hint})
+        buttons = [
+            _legacy_button(
+                _render_choice_button(
+                    interaction,
+                    index,
+                    option,
+                    profile_id=profile_id,
+                )
+            )
+            for index, option in enumerate(interaction.options)
+        ]
+        elements.extend(_legacy_choice_button_rows(buttons))
+        if interaction.allow_custom_input:
+            elements.append(
+                _legacy_form(_render_other_form(interaction, profile_id=profile_id))
+            )
+
+    elements.extend(
+        [
+            {"tag": "hr"},
+            {"tag": "markdown", "content": "等待选择…"},
+        ]
+    )
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": dict(header),
+        "elements": elements,
+    }
+
+
+def _legacy_button(button: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in button.items()
+        if key not in {"element_id", "size", "width", "behaviors"}
+    }
+
+
+def _legacy_choice_button_rows(buttons: list[Mapping[str, Any]]) -> list[Dict[str, Any]]:
+    """Compact legacy callbacks; full option explanations remain above the controls.
+
+    Used for every single-select choice, not only approvals. The legacy ``action``
+    container stretches each button across the row on mobile, which is what made
+    non-approval choices (clarify and friends) read as long bars. A ``column_set``
+    of auto-width columns keeps four small buttons on one line and wraps a longer
+    option list instead of squeezing it.
+    """
+    return [
+        {
+            "tag": "column_set", "flex_mode": "flow",
+            "horizontal_spacing": "8px", "horizontal_align": "left",
+            "columns": [
+                {"tag": "column", "width": "auto", "vertical_align": "top",
+                 "elements": [dict(button, width="default")]}
+                for button in buttons[offset:offset + 4]
+            ],
+        }
+        for offset in range(0, len(buttons), 4)
+    ]
+
+
+def _legacy_form(form: Mapping[str, Any]) -> Dict[str, Any]:
+    elements: list[Dict[str, Any]] = []
+    for raw_element in form.get("elements", []):
+        if not isinstance(raw_element, Mapping):
+            continue
+        element = {
+            key: value
+            for key, value in raw_element.items()
+            if key not in {"element_id", "size", "width", "behaviors"}
+        }
+        if element.pop("form_action_type", None) == "submit":
+            element["action_type"] = "form_submit"
+        elements.append(element)
+    return {
+        "tag": "form",
+        "name": form.get("name", "hfc_interaction_form"),
+        "elements": elements,
+    }
+
+
+def _normalize_interaction_profile_id(value: Any) -> str:
+    if type(value) is not str:
+        return "default"
+    candidate = value.strip()
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", candidate) is None:
+        return "default"
+    return candidate
+
+
+def _card_quote_summary(
+    session: CardSession,
+    status: Mapping[str, str],
+    *,
+    display_status: str,
+) -> str:
+    if display_status == "completed":
+        answer = normalize_stream_text(session.answer_text).strip()
+        if answer:
+            normalized = " ".join(answer.split())
+            if len(normalized) <= CARD_QUOTE_SUMMARY_MAX_CHARS:
+                return normalized
+            return (
+                normalized[: CARD_QUOTE_SUMMARY_MAX_CHARS - 1].rstrip()
+                + "…"
+            )
+    return status.get("summary", status.get("subtitle", ""))
+
+
+def _primary_text_for_session(
+    session: CardSession, *, stream_thinking_to_body: bool = True,
+    thinking_body_tail_chars: int = 0, presentation: str = "classic",
+) -> str:
+    if session.status in {"completed", "failed"} or session.answer_text:
+        text = normalize_stream_text(session.answer_text)
+        if (presentation == "task" and session.delivery_kind == "chat"
+                and not session.terminal_reasoning_notice):
+            return task_answer_code_projection(text, max_block_size=MAIN_CONTENT_CHUNK_CHARS)
+        return text
+    if stream_thinking_to_body and session.thinking_text:
+        text = normalize_stream_text(session.thinking_text)
+        if type(thinking_body_tail_chars) is int and thinking_body_tail_chars > 0:
+            return text[-thinking_body_tail_chars:]
+        return text
+    if session.latest_tool_preview or session.tools:
+        return ""
+    return _spinner_text("正在加载上下文…")
+
+
+def _render_limit_handoff_card(
+    *, title: str, terminal: bool, width_mode: str = "default"
+) -> Dict[str, Any]:
+    configured_title = (
+        title.strip()
+        if isinstance(title, str) and title.strip()
+        else DEFAULT_TITLE
+    )
+    if len(configured_title) > 80:
+        configured_title = configured_title[:79].rstrip() + "…"
+    if terminal:
+        content = "完整内容已切换为 Hermes 原生消息发送。"
+        summary = "已切换为原生消息"
+        template = "green"
+        footer = "已完成"
+    else:
+        content = "内容较长，完成后将由 Hermes 原生消息发送。"
+        summary = "等待原生消息"
+        template = "orange"
+        footer = "生成中"
+    return {
+        "schema": "2.0",
+        "config": {
+            **card_width_config(width_mode),
+            "update_multi": True,
+            "summary": {"content": summary},
+        },
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": configured_title},
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "element_id": "main_content", "content": content},
+                {"tag": "hr", "element_id": "main_divider"},
+                {
+                    "tag": "markdown",
+                    "element_id": "footer",
+                    "content": footer,
+                    "text_size": "x-small",
+                },
+            ]
+        },
+    }
+
+
+def render_terminal_limit_handoff_card(
+    title: str = DEFAULT_TITLE,
+    *, width_mode: str = "default",
+) -> Dict[str, Any]:
+    """Render the fixed, answer-free terminal handoff used for repair retries."""
+
+    return _render_limit_handoff_card(title=title, terminal=True, width_mode=width_mode)
+
+
+def _render_status(
+    session: CardSession, *, status_config: Optional[StatusConfig] = None
+) -> Dict[str, str]:
+    if session.delivery_kind == "notice":
+        return {
+            "subtitle": "已完成" if session.status == "completed" else "",
+            "template": _notice_template(session.notice_level),
+        }
+    display_status = resolve_display_status(session, status_config or StatusConfig.defaults()).value
+    if display_status == "completed":
+        return {"subtitle": "本轮回复结束", "template": "green"}
+    if display_status == "failed":
+        return {"subtitle": "", "summary": "处理失败", "template": "red"}
+    if display_status == "waiting":
+        return {"subtitle": "", "summary": "等待选择", "template": "orange"}
+    if display_status == "in_progress":
+        return {"subtitle": "", "summary": "生成中", "template": "blue"}
+    return {"subtitle": "", "summary": "思考中", "template": "indigo"}
+
+
+def _tool_action_phrase(tool: ToolState) -> str:
+    """The ACTION phrase for the title, PREFIXED with 正在 — "正在读取文件", "正在执行命令".
+
+    Maintainer note (contract change): the 正在 prefix now lives here and only here. The user
+    asked for it in the title (it is the status line: "⏳ Sales Bot · 工具 3 · 1m12s · 正在读取文件")
+    and removed from the content-area row, where the 运行中/已完成 status pill already says it.
+    `_runtime_tool_summary` therefore returns the phrase WITHOUT the prefix.
+    """
+    summary = _runtime_tool_summary(tool.name, _tool_detail_lines(tool.detail)[0])
+    if summary:
+        phrase = summary.split("：", 1)[0].split(":", 1)[0].strip()
+        if phrase:
+            return f"正在{phrase}" if not phrase.startswith("正在") else phrase
+    return ""
+
+
+def _latest_running_action_phrase(session: CardSession) -> str:
+    """The phrase for the tool running right now, so the header can say what it is doing.
+
+    Only the verb phrase, never the target: the target is what made the old header unreadable
+    (truncated mid-word after 120 chars). The full line lives in the content-area tool block.
+    """
+    running = [tool for tool in session.tools.values() if _tool_is_running(tool)]
+    if not running:
+        return ""
+    latest = max(running, key=lambda tool: tool.started_at or 0.0)
+    return _tool_action_phrase(latest)
+
+
+def _last_tool_action_phrase(session: CardSession) -> str:
+    """The phrase for the most recent tool REGARDLESS of state — used for a stopped turn.
+
+    A stopped run usually has no tool still running, yet the point of the phrase is to say where
+    it stopped; the last tool seen is that answer.
+    """
+    tools = list(session.tools.values())
+    if not tools:
+        return ""
+    latest = max(tools, key=lambda tool: (tool.ordinal or 0, tool.started_at or 0.0))
+    return _tool_action_phrase(latest)
+
+
+def _latest_running_action_text(session: CardSession) -> str:
+    """The CONCRETE action line for the tool running right now — target included.
+
+    ``_tool_activity_text`` names the work the same way the content-area tool row does
+    ("读取文件：render.py"). The verb-only phrase is the FALLBACK for a tool that reports no target:
+    without it a nameless tool would leave the row blank, hiding that anything is running at all.
+    """
+    running = [tool for tool in session.tools.values() if _tool_is_running(tool)]
+    if not running:
+        return ""
+    latest = max(running, key=lambda tool: tool.started_at or 0.0)
+    return _tool_activity_text(
+        latest, max_chars=_HEADER_ACTION_TEXT_MAX_CHARS
+    ) or _tool_action_phrase(latest)
+
+
+def _last_tool_action_text(session: CardSession) -> str:
+    """The same, for the most recent tool REGARDLESS of state — used for a stopped turn.
+
+    A stopped run usually has no tool still running, yet the point of the line is to say where it
+    stopped; the last tool seen is that answer.
+    """
+    tools = list(session.tools.values())
+    if not tools:
+        return ""
+    latest = max(tools, key=lambda tool: (tool.ordinal or 0, tool.started_at or 0.0))
+    return _tool_activity_text(
+        latest, max_chars=_HEADER_ACTION_TEXT_MAX_CHARS
+    ) or _tool_action_phrase(latest)
+
+
+def _header_action_text(session: CardSession, *, display_status: str) -> str:
+    """The ACTION line for the header's SUB-TITLE — the concrete work, target included.
+
+    Maintainer note (contract change): this row has moved twice. It began as the title's LAST
+    segment ("⏳ Sales Bot · 1m12s · 正在读取文件"); the user then asked for it on its own row
+    ("标题的正在使用之类的，放到第二行"), carrying only the verb phrase. They then asked to see the
+    CONCRETE action there exactly as the tool row shows it ("标题行这边的第二个行像工具行那样看到
+    具体的工具动作"), so it now reuses ``_tool_activity_text`` — the same source, the same header
+    sanitizer as the content-area tool block, so the two can never disagree about WHICH tool is
+    running.
+
+    Maintainer note (contract change): the two surfaces no longer share a character BUDGET. They did
+    (both 100), and that made the content row the least complete surface in the card — the header cap
+    exists to stop a one-line identity strip from taking over, and applying it to the row the user
+    actually reads cut a long command short while the 思考过程 panel below showed the same command in
+    full ("正文里面的工具行的执行命令和参数没有像 timeline 里面那样子比较全"). The header keeps
+    ``_HEADER_ACTION_TEXT_MAX_CHARS``; the content rows take the card's tool-detail budget. Both still
+    cap the SAME string from the same source, so they cannot disagree about which tool is running —
+    only about how much of its command fits on their own row.
+
+    Empty while an interaction is pending, matching ``_runtime_header_summary``: the title is then
+    the prompt itself ("待审批：…"), and a tool line underneath it would read as a second subject.
+    A COMPLETED turn is also empty — its sub-title slot belongs to "本轮回复结束".
+    """
+    interaction = session.active_interaction
+    if interaction is not None and interaction.status == "pending":
+        return ""
+    if display_status == "completed" or session.status == "completed":
+        return ""
+    if display_status == "failed" or session.status == "failed":
+        return _last_tool_action_text(session)
+    return _latest_running_action_text(session)
+
+
+def _header_title_with_state(
+    session: CardSession,
+    configured_title: str,
+    *,
+    display_status: str,
+) -> str:
+    """Answer "is it still working, and at what?" in the header — the card's most-read line.
+
+    The title used to BE the full tool preview while running: the session name disappeared and
+    long previews were cut off mid-word. It now leads with the state, keeps the action PHRASE
+    ("读取") which is what made the old line useful, and drops the target (command/path)
+    to the content area, which has room for it.
+
+    Pending interactions keep their own wording (待审批：/待选择： is prefixed by the caller).
+    """
+    if session.delivery_kind == "notice":
+        return configured_title
+    interaction = session.active_interaction
+    if interaction is not None and interaction.status == "pending":
+        return _sanitize_runtime_header(interaction.prompt) or configured_title
+    metrics = _runtime_header_metrics(session, display_status=display_status)
+    if display_status == "completed":
+        return f"✅ {configured_title}" + (f" · {metrics}" if metrics else "")
+    if display_status == "failed":
+        # Maintainer note (contract change): this used to collapse to "⛔ <name>", which hid where
+        # the run stopped. The metrics stay for that reason; the action phrase moved to the
+        # sub-title (see ``_header_action_text``) so the title stays an identity line.
+        parts = [f"⛔ {configured_title}"]
+        if metrics:
+            parts.append(metrics)
+        return " · ".join(parts)
+    if not metrics:
+        # Nothing measured: keep the legacy wording rather than a bare "⏳ <name>", which reads as
+        # a label instead of a state. What it is doing now lives on the sub-title.
+        return f"⏳ 执行中 · {configured_title}"
+    # Maintainer note (contract change): the reader's order is name → metrics → prose. The title
+    # used to lead with the phrase ("⏳ 正在读取 · Sales Bot") and carry no numbers at all, so the
+    # elapsed time and tool count lived only in the footer. The user asked for both in the title,
+    # both AFTER the name: "⏳ Sales Bot · 工具 3 · 1m12s". The name stays first because it is what
+    # identifies WHICH conversation is still working.
+    # Maintainer note (contract change 2): the action phrase was then the title's LAST segment
+    # ("… · 正在读取文件"). The user asked for it on the next row ("标题的正在使用之类的，放到第二行"),
+    # so it is rendered as the header sub-title instead.
+    return f"⏳ {configured_title} · {metrics}"
+
+
+def _runtime_header_metrics(session: CardSession, *, display_status: str) -> str:
+    """``"工具 3 · 1m12s"`` for the header — the numbers the user asked to see up there.
+
+    Maintainer note (contract change): the order used to be elapsed then tool count. The user
+    asked for the COUNT first, so the title reads name → how many tools → how long → what it is
+    doing. Elapsed comes from the same source the footer uses (live clock while running, the
+    recorded duration once done). Sub-second elapsed is omitted: a freshly started turn would
+    otherwise open with "0s", which reads as a broken clock rather than "just started".
+    """
+    parts: list[str] = []
+    if session.tool_count:
+        # Maintainer note (contract change): the user asked for a hash before the count
+        # ("工具 #3"), so it reads as a numbered tally rather than prose.
+        parts.append(f"工具 #{session.tool_count}")
+    # A stopped turn is over too: report the recorded duration instead of a live clock that keeps
+    # climbing after the run ended.
+    finished = (
+        display_status in {"completed", "failed"}
+        or session.status in {"completed", "failed"}
+    )
+    if finished:
+        try:
+            duration = float(session.duration)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration >= 1.0:
+            parts.append(_format_duration(duration))
+    else:
+        created_at = session.created_at
+        if created_at:
+            elapsed = max(0.0, _time.time() - float(created_at))
+            if elapsed >= 1.0:
+                parts.append(_format_duration(elapsed))
+    return " · ".join(parts)
+
+
+def _runtime_header_summary(session: CardSession) -> str:
+    """The sub-title carries the runtime PHASE only.
+
+    It used to fall back to the latest tool preview; that moved to the content area along
+    with the rest of the tool activity, so a phase is all that is left to say here.
+    """
+    interaction = session.active_interaction
+    if interaction is not None and interaction.status == "pending":
+        return ""
+    if session.status == "completed":
+        return ""
+    return _sanitize_runtime_header(session.runtime_phase_text)
+
+
+def _is_initial_loading(session: CardSession) -> bool:
+    return (
+        session.status not in {"completed", "failed"}
+        and session.delivery_kind == "chat"
+        and session.active_interaction is None
+        and not session.answer_text
+        and not session.thinking_text
+        and not session.runtime_phase_text
+        and not session.latest_tool_preview
+        and not session.tools
+    )
+
+
+def _sanitize_runtime_header(
+    text: str, *, max_chars: int = RUNTIME_HEADER_MAX_CHARS
+) -> str:
+    """Strip fences/markdown noise and redact secrets, then cap.
+
+    ``max_chars`` defaults to the HEADER budget because that is where this started (a sub-title is a
+    one-line strip). Content-area rows pass their own budget: leaving this at the header's 120 held
+    those rows to 120 chars no matter what the card configured, which is why they read as truncated
+    next to the 思考过程 panel.
+    """
+    normalized = normalize_stream_text(str(text or ""))
+    normalized = _RUNTIME_FENCE_RE.sub("", normalized)
+    normalized = " ".join(normalized.split())
+    normalized = redact_tool_detail(normalized)
+    normalized = SECRET_FLAG_RE.sub(r"\1[REDACTED]", normalized)
+    normalized = URL_SECRET_RE.sub(r"\1[REDACTED]", normalized)
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 1].rstrip() + "…"
+
+
+def _render_known_requester_mentions(text: str, session: CardSession) -> str:
+    """Resolve only the authenticated requester name, never guess other users."""
+    name = getattr(session, "sender_name", "")
+    open_id = _exact_feishu_open_id(getattr(session, "sender_open_id", ""))
+    if not name or not open_id or len(name) > 80 or any(ord(c) < 32 or c in "<>" for c in name):
+        return text
+    # Preserve code, links, and existing markup literally.
+    protected = re.compile(r"(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*(?:`|$)|<at\b[^>]*>[\s\S]*?</at>|<[^>]*>|https?://[^\s]+|\[[^\]]*\]\([^)]*\))")
+    mention = re.compile(r"(?<![\w@])@" + re.escape(name) + r"(?=$|[\s，。！？、,.!?;:：；）)\]】*])")
+    parts = protected.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = mention.sub(lambda _: f'<at id="{open_id}"></at>', parts[index])
+    return "".join(parts)
+
+
+def _render_main_content_elements(
+    main_text: str,
+    *,
+    text_size: str | None = None,
+    table_overflow_mode: str = "compact",
+    native_tables: bool = False,
+) -> list[Dict[str, Any]]:
+    """Render a complete body projection; final admission is whole-card based."""
+    plan = plan_main_content(
+        main_text, table_overflow_mode=table_overflow_mode,
+        native_tables=native_tables, chunk_chars=MAIN_CONTENT_CHUNK_CHARS,
+    )
+    return render_content_plan(plan, text_size=text_size)
+
+
+def _interaction_mention_content(
+    session: CardSession,
+    interaction: Any,
+    *,
+    mentions_enabled: bool = True,
+) -> str:
+    """Return the in-card @ mention prefix for an approval/clarify card, or ``""``.
+
+    The @ mention of the requester / clarified user is returned as a bare
+    ``<at id=...>`` prefix (no trailing text) so callers can merge it into
+    the interaction hint line instead of rendering a separate mention row.
+    Only pending approval/clarify interactions are mentioned, only when the
+    per-kind mention flag is enabled, and only when the session carries a
+    valid Feishu open_id for the requester.
+    """
+    if not mentions_enabled:
+        return ""
+    if getattr(interaction, "status", "") != "pending":
+        return ""
+    if getattr(interaction, "kind", "") not in {"approval", "clarify"}:
+        return ""
+    open_id = _exact_feishu_open_id(getattr(session, "sender_open_id", ""))
+    if not open_id:
+        return ""
+    return f'<at id="{open_id}"></at>'
+
+
+def _render_interaction_elements(
+    session: CardSession,
+    *,
+    interaction_mode: str = "callback",
+    mentions_enabled: bool = True,
+    presentation: str = "classic",
+) -> list[Dict[str, Any]]:
+    interaction = session.active_interaction
+    if interaction is None:
+        return []
+    if (has_confirmed_approval_receipt(session)
+            and (session.status in {"completed", "failed"} or interaction.status == "failed")):
+        # #337/#339: only remove a duplicate after the complete independent
+        # receipt has been confirmed by Feishu; rendering a callback is no ACK.
+        return []
+    if (
+        interaction.status == "pending"
+        and str(getattr(interaction, "feishu_message_id", "") or "").strip()
+    ):
+        # Maintainer note (contract change): a PENDING interaction that already owns a card of its
+        # own must not be rendered here as well.
+        #
+        # `feishu_message_id` is recorded only by the two paths that deliver an interaction as a
+        # STANDALONE card (both pass delivery_kind="interaction") — that is the approval card sitting
+        # in front of the user. This function used to draw the same prompt, description, options and
+        # buttons into the streaming card unconditionally, so one approval could appear twice: once
+        # in the turn's card (where the buttons are inert) and once in the real approval card. The
+        # user reported the double-track ("双轨审批卡").
+        #
+        # ONLY the pending case is suppressed. Once the interaction is decided, this card is where a
+        # reader of the conversation sees the outcome ("已选择：…" / "交互已过期") and that row must
+        # stay — gating on `feishu_message_id` alone silently removed it from every decided card.
+        #
+        # Nothing is lost while pending either: the card's title already reads 待审批：… then
+        # (_runtime_header_summary), and the standalone card is the surface that accepts the click.
+        return []
+
+    elements: list[Dict[str, Any]] = []
+    mention = _interaction_mention_content(
+        session,
+        interaction,
+        mentions_enabled=mentions_enabled,
+    )
+    if interaction.status == "pending" and interaction.description:
+        # Masked even here: this card lives in a chat other members can read for as long as the
+        # approval is open, so a credential in the scope leaks there just as it would on the
+        # retained (decided) card. The command stays readable.
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": "interaction_description",
+                "content": mask_approval_scope(interaction.description),
+            }
+        )
+    if interaction.status == "pending" and _normalize_interaction_mode(interaction_mode) == "text":
+        choice_lines = [
+            f"{index}. {option.label}"
+            for index, option in enumerate(interaction.options, start=1)
+        ]
+        if choice_lines:
+            if interaction.multi_select:
+                instruction = "Reply with numbers separated by commas or the option text."
+            else:
+                instruction = "Reply with the number or the option text."
+            if interaction.allow_custom_input:
+                instruction = instruction[:-1] + ", or your own answer."
+            choice_lines += ["", instruction]
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "interaction_text_choices",
+                    "content": "\n".join(choice_lines),
+                }
+            )
+        if mention:
+            hint = (
+                f"{mention} 请选择（可多选）"
+                if interaction.multi_select
+                else f"{mention} 请选择一个选项"
+            )
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "interaction_hint",
+                    "content": hint,
+                }
+            )
+        return elements
+
+    if interaction.status == "pending":
+        if interaction.kind in {"approval", "clarify"}:
+            elements.extend(_interaction_option_descriptions(interaction))
+        if interaction.multi_select:
+            if mention:
+                hint = f"{mention} 请选择（可多选）"
+                if interaction.allow_custom_input:
+                    hint += "，或输入自定义内容"
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "element_id": "interaction_hint",
+                        "content": hint,
+                    }
+                )
+            elements.append(_render_multi_select_form(interaction))
+        else:
+            hint = "（单选）请选择"
+            if interaction.allow_custom_input:
+                hint += "，或输入自定义内容"
+            if mention:
+                hint = f"{mention} {hint}"
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "interaction_hint",
+                    "content": hint,
+                }
+            )
+            choice_buttons = [
+                _render_choice_button(interaction, index, option)
+                for index, option in enumerate(interaction.options)
+            ]
+            # The Feishu long-connection p2.card.action.trigger channel only
+            # dispatches server-side button events from an ``action`` element.
+            # Keep groups within the legacy five-action limit while retaining
+            # the surrounding CardKit v2 streaming card.
+            for offset in range(0, len(choice_buttons), 5):
+                elements.append(
+                    {
+                        "tag": "action",
+                        "element_id": f"hfc_choice_actions_{offset // 5}",
+                        "actions": choice_buttons[offset : offset + 5],
+                    }
+                )
+            if interaction.allow_custom_input:
+                elements.append(_render_other_form(interaction))
+        return elements
+
+    if interaction.status == "completed":
+        choice = interaction.choice_label or interaction.choice or "已完成"
+        user = f" by {interaction.user_name}" if interaction.user_name else ""
+        content = f"已选择：{choice}{user}"
+        for index, element in enumerate(_interaction_review_elements(interaction, presentation=presentation)):
+            elements.append(dict(element, element_id=f"interaction_review_{index}"))
+        elements.append({
+            "tag": "markdown", "element_id": "interaction_result",
+            "content": content,
+        })
+        return elements
+
+    content = interaction.error or "交互请求失败"
+    elements.extend(_interaction_review_elements(interaction, presentation=presentation))
+    elements.append(
+        {
+            "tag": "markdown",
+            "element_id": "interaction_result",
+            "content": content,
+        }
+    )
+    return elements
+
+
+# ---------------------------------------------------------------------------
+# Maintainer note — why a decided approval now KEEPS its operation scope, masked
+# ---------------------------------------------------------------------------
+# Upstream deliberately dropped ``description`` (the operation scope: what the command does plus
+# the exact command line) as soon as a decision was taken, and a test froze that
+# ("敏感命令详情不应保留在完成态"). The threat behind it is real: the card is one message edited in
+# place, so not rendering the scope on the completed card removes the command from the group's
+# history — useful when a command carries a credential and the chat has other members.
+#
+# We changed the contract because the same edit destroyed the audit trail. After a click the card
+# showed the question and the choice but NOT what had actually been approved, so neither the
+# approver nor anyone reviewing the chat later could reconstruct the decision. Keeping the scope
+# and masking credentials gets both properties: the command stays identifiable, the secret never
+# appears on a group-visible card (the pending card is masked too — a secret pasted while the
+# approval is open leaks exactly the same way).
+#
+# If upstream prefers the original behaviour, the only thing to change is whether
+# ``_interaction_review_elements`` renders ``description``; do NOT re-gate it on
+# ``status == "paused"`` (that is what made the card unauditable).
+#
+# What the mask does NOT cover, stated plainly so this is not mistaken for a guarantee: a secret
+# passed as a bare positional argument (``redis-cli -a hunter2``) or any credential shape not
+# listed below stays visible. Masking is defence in depth for the command scope of an approval;
+# it is not a reason to put credentials on a command line in the first place.
+_APPROVAL_SCOPE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|"
+    r"CREDENTIAL|AUTHORIZATION)[A-Za-z0-9_]*\s*=\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
+)
+_APPROVAL_SCOPE_BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=\-]{8,})")
+_APPROVAL_SCOPE_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@")
+_APPROVAL_SCOPE_TOKEN_LITERAL_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}"
+    r"|glpat-[A-Za-z0-9_\-]{16,})\b"
+)
+_APPROVAL_SCOPE_REDACTED = "[REDACTED]"
+
+
+def mask_approval_scope(text: str) -> str:
+    """Mask credentials inside an approval's operation scope, keeping the command readable.
+
+    Only value positions are replaced (``KEY=``, ``--flag``, URL userinfo/query, ``Bearer``, known
+    token shapes), so a reviewer still sees which command ran with which flags — the audit value —
+    without exposing the credential itself. Applied to every render of the scope, pending included.
+    """
+    if not text:
+        return text
+    masked = SECRET_FLAG_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", str(text))
+    masked = URL_SECRET_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
+    masked = _APPROVAL_SCOPE_ASSIGNMENT_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
+    masked = _APPROVAL_SCOPE_BEARER_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
+    masked = _APPROVAL_SCOPE_URL_USERINFO_RE.sub(rf"\1\2:{_APPROVAL_SCOPE_REDACTED}@", masked)
+    masked = _APPROVAL_SCOPE_TOKEN_LITERAL_RE.sub(_APPROVAL_SCOPE_REDACTED, masked)
+    return KEY_VALUE_SECRET_RE.sub(rf"\1{_APPROVAL_SCOPE_REDACTED}", masked)
+
+
+def _interaction_review_elements(interaction: Any, *, presentation: str = "classic") -> list[Dict[str, Any]]:
+    # Mobile has no hover: keep the original question, the full operation scope and the options in
+    # the card body after submission/expiry, without retaining callback credentials. An approval
+    # must stay auditable afterwards — what was asked, what was chosen, and what would run — so the
+    # result is APPENDED below these, never swapped in for them. Two rules matter here:
+    #   1. never gate the description on ``status == "paused"`` — that hid the command as soon as a
+    #      decision was taken and left the card unauditable (see the maintainer note above);
+    #   2. the scope is always masked, so retention does not put credentials into group history.
+    elements = []
+    if interaction.prompt:
+        prompt = task_interaction_prompt(interaction) if presentation == "task" else interaction.prompt
+        elements.append({"tag": "markdown", "content": prompt})
+    if interaction.description:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": mask_approval_scope(normalize_stream_text(interaction.description)),
+            }
+        )
+    elements.extend(_interaction_option_descriptions(interaction))
+    return elements
+
+
+def _interaction_callback_value(
+    interaction: Any, **extra: Any
+) -> Dict[str, Any]:
+    """Base callback value for an interaction action — always carries the
+    interaction id + token so the sidecar can authenticate the click."""
+    value: Dict[str, Any] = {
+        "hfc_action": "interaction.select",
+        "interaction_id": interaction.interaction_id,
+        "token": interaction.callback_token,
+    }
+    value.update(extra)
+    return value
+
+
+def _interaction_option_descriptions(interaction: Any) -> list[Dict[str, Any]]:
+    # Labels were plain_text on buttons. Preserve that meaning in the body:
+    # do not let Markdown links or tags hide any part of a decision.
+    lines = []
+    for index, option in enumerate(interaction.options, start=1):
+        label = re.sub(
+            r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1",
+            html.escape(option.label, quote=False),
+        )
+        lines.append(f"{index}. {label}")
+    if not lines:
+        return []
+    return [{"tag": "markdown", "content": "\n\n".join(lines)}]
+
+
+def _render_choice_button(
+    interaction: Any,
+    index: int,
+    option: Any,
+    *,
+    profile_id: str = "default",
+) -> Dict[str, Any]:
+    return {
+        "tag": "button",
+        "element_id": f"hfc_btn_{index}",
+        # Sequence number is display-only (like the multi-select dropdown);
+        # the submitted value stays the clean option value.
+        "text": {
+            "tag": "plain_text",
+            "content": (
+                str(index + 1) if interaction.kind in {"approval", "clarify"}
+                else f"{index + 1}. {option.label}"
+            ),
+        },
+        "type": _button_type(option.style),
+        "size": "medium",
+        "width": "default",
+        # Hermes Feishu receives card actions through the server-side
+        # p2.card.action.trigger WebSocket callback.  That callback exposes the
+        # button's top-level ``value`` as event.action.value.  A CardKit
+        # ``behaviors: callback`` entry only drives client callback behavior and
+        # does not reach this long-connection handler.
+        "value": _interaction_callback_value(
+            interaction,
+            choice=option.value,
+            choice_label=option.label,
+            profile_id=_normalize_interaction_profile_id(profile_id),
+        ),
+    }
+
+
+def _render_other_input() -> Dict[str, Any]:
+    """Free-text input used for the 'Other' answer path (Hermes native clarify
+    always appends an 'Other (type your answer)' option)."""
+    return {
+        "tag": "input",
+        "element_id": "hfc_other",
+        "name": "hfc_other",
+        "input_type": "text",
+        "placeholder": {"tag": "plain_text", "content": "或输入自定义答案…"},
+        "width": "fill",
+    }
+
+
+def _render_other_form(
+    interaction: Any, *, profile_id: str = "default"
+) -> Dict[str, Any]:
+    """Single-select card footer: a form with the free-text input + submit
+    button. On submit, Feishu returns action.form_value.hfc_other with the
+    user's typed answer and action.name = hfc_other_<callback_token>.
+    Form-submit buttons must not carry behaviors callbacks, so the unguessable
+    token in the button name preserves the normal callback authentication
+    boundary without exposing the interaction id as a credential."""
+    return {
+        "tag": "form",
+        "name": "hfc_other_form",
+        "elements": [
+            _render_other_input(),
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✏️ 提交自定义答案"},
+                "type": "default",
+                "width": "default",
+                "form_action_type": "submit",
+                "name": f"hfc_other_{interaction.callback_token}",
+                "value": {
+                    "profile_id": _normalize_interaction_profile_id(profile_id)
+                },
+            },
+        ],
+    }
+
+
+def _render_multi_select_form(
+    interaction: Any, *, profile_id: str = "default"
+) -> Dict[str, Any]:
+    """Multi-select card body: a form with a native multi-select dropdown
+    (multi_select_static) + a single confirm button, plus the free-text
+    'Other' input.
+
+    One submit button only: if the user typed into hfc_other the typed text
+    wins (custom answer); otherwise the selected options are submitted.
+    On submit, Feishu returns action.form_value (hfc_multi list /
+    hfc_other text) and action.name = hfc_confirm_<callback_token>."""
+    options = [
+        {
+            "text": {
+                "tag": "plain_text",
+                "content": (
+                    str(index) if interaction.kind in {"approval", "clarify"}
+                    else f"{index}. {option.label}"
+                ),
+            },
+            "value": option.value,
+        }
+        for index, option in enumerate(interaction.options, start=1)
+    ]
+    elements = [
+        {
+            "tag": "multi_select_static",
+            "element_id": "hfc_multi",
+            "name": "hfc_multi",
+            "type": "default",
+            "width": "fill",
+            "required": False,
+            "placeholder": {
+                "tag": "plain_text",
+                "content": "请选择（可多选）",
+            },
+            "options": options,
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": {"hfc_action": "interaction.noop"},
+                }
+            ],
+        }
+    ]
+    if interaction.allow_custom_input:
+        elements.append(_render_other_input())
+    elements.append(
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✅ 确认选择"},
+            "type": "primary",
+            "width": "fill",
+            "form_action_type": "submit",
+            "name": f"hfc_confirm_{interaction.callback_token}",
+            "value": {
+                "profile_id": _normalize_interaction_profile_id(profile_id)
+            },
+        }
+    )
+    return {
+        "tag": "form",
+        "name": "hfc_clarify_form",
+        "elements": elements,
+    }
+
+
+def _normalize_interaction_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"text", "markdown", "reply"}:
+        return "text"
+    return "callback"
+
+
+def _button_type(style: str) -> str:
+    normalized = str(style or "").strip().lower()
+    if normalized in {"primary", "danger", "default"}:
+        return normalized
+    if normalized in {"red", "warning", "destructive"}:
+        return "danger"
+    if normalized in {"green", "success"}:
+        return "primary"
+    return "default"
+
+
+def _render_tool_summary(session: CardSession) -> str:
+    if not session.tools:
+        return "工具调用 0 次"
+    lines = [f"工具调用 {session.tool_count} 次"]
+    for tool in session.tools.values():
+        lines.append(f"- {_name_tag(tool.name)}: {tool.status}")
+    return "\n".join(lines)
+
+
+# One word for "still working", wherever the card says it. It used to differ per surface —
+# 运行中 on the tool row, 进行中 in the panel, 执行中 in the footer — which read as three
+# different states on one card. The user settled on 执行中.
+_RUNNING_TOOL_PILL = ("执行中", "blue")
+_FINISHED_TOOL_PILL = ("已完成", "green")
+_FAILED_TOOL_PILL = ("失败", "red")
+# The turn ended while this tool was still going: it never reported a result, so calling it
+# 已完成 would be a lie, and it is the row a reader looks at to see WHERE the run stopped.
+_INTERRUPTED_TOOL_PILL = ("已中断", "orange")
+# A row, not a paragraph: this is the live action line, not a place to dump a whole command.
+# The header's sub-title keeps its short cap: it is a one-line identity strip at the top of the
+# card, and mobile clients truncate long headers without exposing the full text. The CONTENT-AREA
+# tool rows are deliberately NOT capped this short — see _TOOL_ACTIVITY_TEXT_MAX_CHARS.
+_HEADER_ACTION_TEXT_MAX_CHARS = 100
+# Budget for the content-area tool rows (the action + parameter lines under the answer). Same budget
+# the 思考过程 panel gives a tool's detail, so the two surfaces show the same command.
+#
+# Maintainer note (contract change): these rows used to share the header's 100-char cap, on the
+# reasoning that the two surfaces "can never disagree about what is running". In practice that made
+# the content row the LEAST complete surface in the card — a long command was cut at 100 chars with
+# an ellipsis while the panel below showed the same command up to 600. The user reported exactly that
+# ("正文里面的工具行的执行命令和参数没有像 timeline 里面那样子比较全"). The surfaces still share one
+# source (_tool_activity_text) and one sanitizer; only the budget differs, by design, per surface.
+# render_card passes the card's configured max_tool_result_chars through; this default keeps direct
+# callers (and the config default in config.py) in step.
+_TOOL_ACTIVITY_TEXT_MAX_CHARS = 600
+# How many tool rows the content area shows. A single row answered "what is running now", but the
+# moment a tool was replaced the reader lost the previous step — the user's report was that on a
+# changeover they could not tell what the PREVIOUS command had been
+# (「如果更换的时候 不知道上一条执行的是什么」). Two rows, oldest first, keep the current step and the
+# one before it.
+_TOOL_ACTIVITY_WINDOW = 2
+# A tool's stored detail is MULTI-LINE: the tool preview, then "参数: …", then "耗时: …" (see
+# session._tool_detail_from_event_data). The action line must read the part that names the work.
+# Maintainer note (contract change): the argument line used to be treated as "no target" and the
+# whole row's action was dropped, so a run whose preview was missing rendered as bare
+# "执行中 · terminal · #4" — the user could not tell what the agent was doing. The arguments are now
+# the fallback target instead: naming the work beats an empty row.
+_TOOL_ARGUMENT_LINE_RE = re.compile(r"^(?:参数|args|arguments)\s*[:：]\s*(.*)$", re.IGNORECASE)
+# Meta lines already rendered elsewhere in the row (duration in the row, failure in its own pill).
+_TOOL_META_LINE_RE = re.compile(r"^(?:耗时|用时|失败|错误|duration|elapsed|error)\s*[:：]", re.IGNORECASE)
+# Which argument names the work. First match wins; the rest is a JSON blob the reader does not need.
+_TOOL_ARGUMENT_KEY_PRIORITY = (
+    "command", "cmd", "file_path", "path", "file", "pattern", "query", "url", "text",
+    "code", "prompt", "task", "name", "goal", "message",
+)
+
+
+def _status_tag(label: str, color: str) -> str:
+    """A coloured pill. Feishu rejects a standalone text_tag element (230099/200621) but
+    renders the <text_tag> form inside lark_md, which is what every caller here produces."""
+    return f"<text_tag color='{color}'>{label}</text_tag>"
+
+
+def _name_tag(name: str) -> str:
+    """A grey-background pill for an identifier (tool name).
+
+    Rendered as a neutral text_tag rather than `code`: the grey block separates the name from
+    surrounding prose far more clearly than inline-code styling does.
+    """
+    safe = html.escape(str(name or ""), quote=False)
+    return f"<text_tag color='neutral'>{safe}</text_tag>"
+
+
+def _tool_is_running(tool: ToolState) -> bool:
+    return str(tool.status or "").strip().lower() not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
+
+
+def _selected_tool_activity(session: CardSession, *, turn_is_live: bool) -> list[ToolState]:
+    running = [
+        tool for tool in session.tools.values() if turn_is_live and _tool_is_running(tool)
+    ]
+    # Terminal-only events have no start timestamp. Call ordinals keep their
+    # actual position and let each running tool retain its immediate predecessor.
+    ordered = sorted(session.tools.values(), key=lambda tool: tool.ordinal or 0)
+    if running:
+        running.sort(key=lambda tool: tool.started_at or 0.0)
+        # Pair each running tool independently; do not fill gaps between parallel calls.
+        keep_ids = set()
+        for tool in running:
+            keep_ids.add(id(tool))
+            position = next(
+                index for index, candidate in enumerate(ordered) if candidate is tool
+            )
+            if position > 0:
+                keep_ids.add(id(ordered[position - 1]))
+        selected = [tool for tool in ordered if id(tool) in keep_ids]
+    else:
+        # Nothing is running: a finished card keeps the last two steps so a changeover is still
+        # readable after the turn ends (same rule the user gave for the live case).
+        selected = ordered[-_TOOL_ACTIVITY_WINDOW:]
+    return selected
+
+
+def _render_tool_activity_elements(
+    session: CardSession,
+    *,
+    text_sizes: Mapping[str, Any] | None = None,
+    used_text_size_roles: set[str] | None = None,
+    display_status: str = "",
+    max_chars: int = _TOOL_ACTIVITY_TEXT_MAX_CHARS,
+    hide_successful: bool = False,
+    task_layout: bool = False,
+    details_in_timeline: set[str] | None = None,
+    observation_only: bool = False,
+) -> list[Dict[str, Any]]:
+    """Show what the agent is doing RIGHT NOW, right under the answer.
+
+    This used to be squeezed into the header as a truncated one-liner, where the session name
+    was the thing that got dropped. A row per tool with a coloured status pill instead: one
+    glance at the content area answers "still working?". The window is the last
+    ``_TOOL_ACTIVITY_WINDOW`` tools in start order, so a finished card still shows what it did and a
+    running card also shows the step it replaced (the full history lives in 思考过程, the count in the
+    footer).
+    """
+    if not session.tools:
+        return []
+    # A finished turn cannot have a running tool: without this, a tool whose terminal event
+    # never arrived sat on a "✅ 已完成" card labelled 运行中.
+    turn_is_live = display_status not in {"completed", "failed"} and session.status not in {
+        "completed",
+        "failed",
+    }
+    selected = _selected_tool_activity(session, turn_is_live=turn_is_live)
+    if hide_successful and not turn_is_live:
+        selected = sorted((tool for tool in session.tools.values()
+                           if str(tool.status).strip().lower() not in _SUCCESS_TOOL_STATUSES),
+                          key=lambda tool: tool.ordinal)[-_TOOL_ACTIVITY_WINDOW:]
+    if task_layout:
+        # Frozen display copies have no current action. Keep their details in
+        # the actual process panel, or retain the body row when no panel fits.
+        selected = [tool for tool in selected
+                    if str(tool.status).strip().lower() not in {"display_handoff", "display_receipt"}
+                    or tool.tool_id not in (details_in_timeline or set())]
+    now = _time.time()
+    text_size = _role_text_size(
+        text_sizes,
+        "tool",
+        default="x-small",
+        used_roles=used_text_size_roles,
+    )
+    return [
+        _tool_activity_row(
+            tool,
+            index=index,
+            now=now,
+            text_size=text_size,
+            running=turn_is_live and _tool_is_running(tool),
+            turn_over=not turn_is_live,
+            max_chars=max_chars,
+            task_layout=task_layout,
+            include_params=not (task_layout and tool.tool_id in (details_in_timeline or set())),
+            observation_only=observation_only,
+        )
+        for index, tool in enumerate(selected)
+    ]
+
+
+def _tool_detail_lines(detail: str) -> tuple[str, str]:
+    """Split a stored detail into (the line naming the work, leftover parameters).
+
+    A stored detail is MULTI-LINE: the tool's own preview, then "参数: {json}", then "耗时: 12s"
+    (see session._tool_detail_from_event_data). The preview names the work; the arguments line
+    carries the rest. Both halves are returned so each can have its own row — a single joined line
+    read as noise.
+
+    Maintainer note (contract change): the arguments used to be treated as "no target" and the whole
+    row's action was dropped, so a run whose preview was missing rendered as a bare
+    "执行中 · terminal · #4" and the user could not tell what the agent was doing. Arguments now name
+    the work when there is no preview, and whatever is left over becomes the parameter row.
+    """
+    preview = ""
+    arguments = ""
+    for raw in str(detail or "").splitlines():
+        line = raw.strip()
+        if not line or _TOOL_META_LINE_RE.match(line):
+            continue
+        match = _TOOL_ARGUMENT_LINE_RE.match(line)
+        if match:
+            arguments = arguments or match.group(1)
+            continue
+        preview = preview or line
+
+    pairs = _tool_argument_pairs(arguments)
+    if preview:
+        # The preview is the work; the parameters are everything it does not already say.
+        return preview, _format_tool_arguments([pair for pair in pairs if pair[1] != preview])
+    for key, value in pairs:
+        if key.lower() in _TOOL_ARGUMENT_KEY_PRIORITY:
+            return value, _format_tool_arguments(
+                [pair for pair in pairs if pair[1] != value]
+            )
+    # Unrecognised shape: keep the text as the work, without also echoing it as "parameters".
+    return arguments, ""
+
+
+def _tool_argument_pairs(raw: str) -> list[tuple[str, str]]:
+    """The scalar entries of a stored arguments object, in event order.
+
+    The stored arguments are a compact JSON object. Dumped verbatim they are noise in a chat line
+    ('{"command": "pytest -q", "timeout": 120}'), so the entries are unpacked into key=value pairs;
+    nested/complex values are skipped rather than printed as a blob.
+    """
+    text = str(raw or "").strip()
+    if not text.startswith("{"):
+        return []
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    return [
+        (str(key), str(value))
+        for key, value in parsed.items()
+        if isinstance(value, (str, int, float, bool)) and str(value).strip()
+    ]
+
+
+def _format_tool_arguments(pairs: list[tuple[str, str]]) -> str:
+    return " ".join(f"{key}={value}" for key, value in pairs)
+
+
+def _tool_activity_text(
+    tool: ToolState, *, max_chars: int = _TOOL_ACTIVITY_TEXT_MAX_CHARS,
+    prefer_full_target: bool = False,
+) -> str:
+    """The live action line for a tool: its friendly action plus target ("读取文件：session.py").
+
+    This is the text the header used to carry as a truncated one-liner. It belongs here, in the
+    content area, where there is room for it — the header only answers "still working?".
+    Sanitized through the header sanitizer (untrusted paths/commands/secrets) and capped.
+
+    Maintainer note: the target comes from `_tool_detail_lines`, not from the raw detail — a stored
+    detail is multi-line, and only one of those lines belongs on this row. A line with NO TARGET is
+    still dropped: `_runtime_tool_summary` joins phrase and target with "：", so a summary without it
+    is a verb-only line ("执行命令") — the name pill already says `terminal`, so the phrase repeated
+    it and pushed the line's real information (status + name + ordinal) apart. Testing the separator
+    rather than a hardcoded phrase list keeps this correct as phrases change.
+    """
+    target, _ = _tool_detail_lines(tool.detail)
+    if prefer_full_target and target.endswith(("...", "…")):
+        # Hermes previews can already be shortened before reaching HFC. Once
+        # task details move into the panel, the body must still name the target.
+        for line in str(tool.detail or "").splitlines():
+            match = _TOOL_ARGUMENT_LINE_RE.match(line.strip())
+            if match:
+                full_target = next((value for key, value in _tool_argument_pairs(match.group(1))
+                                    if key.lower() in _TOOL_ARGUMENT_KEY_PRIORITY), "")
+                if full_target:
+                    target = full_target
+                    break
+    if not target:
+        return ""
+    summary = _runtime_tool_summary(tool.name, target)
+    if not summary or "：" not in summary:
+        return ""
+    return _cap_activity_text(summary, max_chars)
+
+
+def _tool_activity_params(
+    tool: ToolState, *, max_chars: int = _TOOL_ACTIVITY_TEXT_MAX_CHARS
+) -> str:
+    """The parameter row for a tool, if it has any the action line does not already carry.
+
+    Same budget as the action row (see _TOOL_ACTIVITY_TEXT_MAX_CHARS): the parameters are where a
+    long command's flags and arguments live, so capping this row shorter than the panel below would
+    hide exactly the part that explains the call.
+    """
+    _, params = _tool_detail_lines(tool.detail)
+    if not params:
+        return ""
+    return f"参数: {_cap_activity_text(params, max_chars)}"
+
+
+def _task_clarify_summary(tool: ToolState, *, max_chars: int) -> str:
+    """Name an observed clarify question; never infer a choice from another call.
+
+    Call only when the exact current parameters already fit in the process
+    panel. Unknown shapes retain the established argument fallback.
+    """
+    if str(tool.name or "").strip().lower() != "clarify":
+        return ""
+    for line in str(tool.detail or "").splitlines():
+        match = _TOOL_ARGUMENT_LINE_RE.match(line.strip())
+        if match is None:
+            continue
+        try:
+            parsed = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            return ""
+        questions = parsed.get("questions") if isinstance(parsed, dict) else None
+        if (not isinstance(questions, list) or not questions
+                or any(not isinstance(item, dict) or not isinstance(item.get("question"), str)
+                       or not item["question"].strip() for item in questions)):
+            return ""
+        question = " ".join(normalize_stream_text(questions[0]["question"]).split())
+        if not question:
+            return ""
+        label = "澄清问题" if len(questions) == 1 else f"澄清 {len(questions)} 个问题"
+        limit = min(max_chars, 180) if max_chars > 0 else 180
+        return _cap_activity_text(f"{label}：{question}", limit)
+    return ""
+
+
+def _cap_activity_text(text: str, limit: int) -> str:
+    """Sanitize then cap, so an untrusted command cannot smuggle text past the limit.
+
+    The budget is handed to the sanitizer as well: its default cap belongs to the header, and
+    leaving it in place silently held these rows to 120 chars whatever the card configured.
+    """
+    text = _sanitize_runtime_header(
+        text, max_chars=limit if limit > 0 else RUNTIME_HEADER_MAX_CHARS
+    )
+    if limit > 0 and len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _tool_activity_row(
+    tool: ToolState,
+    *,
+    index: int,
+    now: float,
+    text_size: str | None = None,
+    running: bool | None = None,
+    turn_over: bool = False,
+    max_chars: int = _TOOL_ACTIVITY_TEXT_MAX_CHARS,
+    task_layout: bool = False,
+    include_params: bool = True,
+    observation_only: bool = False,
+) -> Dict[str, Any]:
+    if running is None:
+        running = _tool_is_running(tool)
+    if running:
+        label, color = _RUNNING_TOOL_PILL
+    elif turn_over and _tool_is_running(tool):
+        # Non-terminal status on a finished turn = the turn ended mid-tool. Report that honestly
+        # instead of 已完成 (a reader checking "where did it stop" reads exactly this pill).
+        label, color = _INTERRUPTED_TOOL_PILL
+    else:
+        label, color = _tool_terminal_pill(tool)
+    # The task header owns the turn state. A live tool row names the action;
+    # terminal tool outcomes remain visible because they describe that call.
+    if task_layout and running:
+        parts = ["上次动作"] if observation_only else []
+    else:
+        parts = [_status_tag(label, color)]
+    if tool.name:
+        parts.append(_name_tag(tool.name))
+    # Maintainer note (contract change): the numbers now precede the phrase. The row used to end
+    # with the elapsed time ("… #4 · 正在执行终端：pytest -q · 12s"), which put the one thing that
+    # changes between renders furthest from the status it belongs to. The user asked for time and
+    # count ahead of the phrase: "进行中 · terminal · 12s · #4 · 读取文件：pytest -q".
+    # Maintainer note (contract change 2): the ordinal now precedes the duration, so the row reads
+    # "执行中 · terminal · #4 · 12s". The user asked for the time to sit after the number, matching
+    # the header ("工具 #N · 1m12s") — the count identifies the tool, the duration qualifies it, and
+    # keeping both in the same order across surfaces avoids re-reading the same pair twice.
+    if tool.ordinal:
+        parts.append(f"#{tool.ordinal}")
+    # Running rows count up; terminal rows retain their measured duration.
+    elapsed: float | None = None
+    if running and tool.started_at and not observation_only:
+        elapsed = max(0.0, now - float(tool.started_at))
+    elif tool.duration_ms is not None:
+        try:
+            elapsed = max(0.0, float(tool.duration_ms) / 1000.0)
+        except (TypeError, ValueError):
+            elapsed = None
+    if elapsed is not None:
+        parts.append(_format_duration(elapsed))
+    # Maintainer note (contract change): this was ONE line — status, tool name, duration, ordinal and
+    # the action all joined by " · ". The user's report was that cramming them together is confusing
+    # ("不然都挤在一行 很混乱"), and asked for three rows: status information, then the action, then
+    # the parameters. Only the first row is unconditional; the action row is dropped when the tool
+    # has no target to name, and the parameter row when its arguments carry nothing new.
+    lines = [" · ".join(parts)]
+    action = _task_clarify_summary(tool, max_chars=max_chars) if task_layout and not include_params else ""
+    action = action or _tool_activity_text(tool, max_chars=max_chars, prefer_full_target=task_layout)
+    if action:
+        lines.append(action)
+    params = _tool_activity_params(tool, max_chars=max_chars)
+    if params and include_params:
+        lines.append(params)
+    element: Dict[str, Any] = {
+        "tag": "markdown",
+        "element_id": f"tool_activity_{index}",
+        "content": "\n".join(lines),
+    }
+    _set_text_size(element, text_size)
+    return element
+
+
+def _tool_terminal_pill(tool: ToolState) -> tuple[str, str]:
+    status = str(tool.status or "").strip().lower()
+    if status in {"display_handoff", "display_receipt"}:
+        return ("已转入续答" if status == "display_handoff" else "已记录"), "neutral"
+    if status in {"blocked", "timeout", "unverified"}:
+        return {"blocked": ("已拒绝", "orange"), "timeout": ("已超时", "orange"),
+                "unverified": ("结果待核对", "neutral")}[status]
+    if status in {"failed", "error", "cancelled", "canceled"}:
+        return _FAILED_TOOL_PILL
+    if status == "interrupted":
+        return _INTERRUPTED_TOOL_PILL
+    return _FINISHED_TOOL_PILL
+
+
+_TIMELINE_WORK_KINDS = frozenset({"reasoning", "tool", "subagent"})
+_SUCCESS_TOOL_STATUSES = frozenset({"completed", "success", "succeeded", "ok", "已完成", "完成", "成功"})
+
+
+def _render_timeline_elements(
+    session: CardSession,
+    *,
+    expanded: bool,
+    max_items: int,
+    max_reasoning_chars: int,
+    max_tool_result_chars: int,
+    text_sizes: Mapping[str, Any] | None = None,
+    used_text_size_roles: set[str] | None = None,
+    reasoning_format: str = "panel",
+    live_thinking: str = "",
+    timeline_order: str = "newest_first",
+    tools_per_reasoning: int = 0,
+    rendered_tool_ids: set[str] | None = None,
+) -> list[Dict[str, Any]]:
+    if not getattr(session, "timeline", None):
+        return []
+    all_entries = session.timeline.snapshot()
+    latest_tool_entries = {
+        entry.tool_id: entry for entry in all_entries
+        if entry.kind == "tool" and entry.tool_id
+    }
+    # Raw thinking stays out of persisted timeline/history. Opting out of body streaming
+    # adds a bounded render-only preview, including for old restored checkpoints.
+    live_entry = None
+    if live_thinking.strip():
+        from .card_timeline import TimelineEntry
+
+        live_entry = TimelineEntry(
+            kind="reasoning", content=live_thinking,
+            title="结束前思考" if session.status == "failed" else "实时思考",
+            status="已停止" if session.status == "failed" else "running",
+        )
+        all_entries.append(live_entry)
+    if not all_entries:
+        return []
+    # Match the body window: an older running call and its immediate predecessor
+    # must not disappear merely because newer completed calls fill the panel.
+    live = session.status not in {"completed", "failed"}
+    running = sorted(
+        (tool for tool in session.tools.values() if live and _tool_is_running(tool)),
+        key=lambda tool: tool.ordinal, reverse=True,
+    )
+    selected_tools = _selected_tool_activity(session, turn_is_live=live) if running else []
+    priority_ids = tuple(dict.fromkeys(
+        [tool.tool_id for tool in running] + [tool.tool_id for tool in selected_tools]
+        + [entry.tool_id for entry in reversed(all_entries) if entry.kind == 'tool'
+           and (str(entry.status).strip().lower() in {'failed','error','cancelled','canceled','interrupted'}
+                or not live and str(entry.status).strip().lower()
+                not in TERMINAL_TOOL_STATUSES | {'display_handoff','display_receipt'})]
+    ))
+    entries = _select_timeline_entries(
+        _limit_tools_per_reasoning(all_entries, tools_per_reasoning, keep_tool_ids=priority_ids),
+        max_items=max_items, priority_tool_ids=priority_ids,
+    )
+    folded = max(0, len(all_entries) - len(entries))
+    panel_elements: list[Dict[str, Any]] = []
+    reasoning_elements: list[Dict[str, Any]] = []
+    # NEWEST FIRST — for the PANEL. The user asked for the panel to read in reverse order so the most
+    # recent work is the first thing they see ("Timeline 最好倒序一下 阅读上能够看最近的比较方便"). A live
+    # log's useful end is its LAST entry, and this panel is appended to the bottom of a card that is
+    # read downward — so the newest work used to be the furthest thing from the reader's eye.
+    # Only the DISPLAY order flips: _select_timeline_entries still decides which entries fit (it
+    # keeps the newest window and guarantees the latest reasoning is included).
+    #
+    # Maintainer note (contract change): the reasoning entries that render into the CARD BODY are the
+    # exception, and they keep chronological order. Body thinking is prose the reader follows
+    # FORWARD ("思考 1", then "思考 2"), not a log they scan for the latest state — newest-first made
+    # the body read bottom-up, which is what the user reported ("正文的思考应该正序"). `index` still
+    # carries each entry's original position, so element ids are unchanged and identical entries are
+    # still selected; only the order they are written in differs per surface.
+    panel_order = [(i, e) for i, e in reversed(list(enumerate(entries)))]
+    if timeline_order == "chronological":
+        panel_order.reverse()
+    if reasoning_format == "code":
+        # "code" puts reasoning in the body (see the target_elements split below) and tools in the
+        # panel, so the two orders can differ. Any other format folds reasoning into the panel,
+        # where newest-first applies to everything.
+        ordered = [(i, e) for i, e in enumerate(entries) if e.kind == "reasoning"] + [
+            (i, e) for i, e in panel_order if e.kind != "reasoning"
+        ]
+    else:
+        ordered = panel_order
+    for index, item in ordered:
+        if item.kind == "reasoning":
+            content = _limit_text(
+                item.content,
+                max_reasoning_chars,
+                overflow_label="思考内容过长，已截断",
+            )
+            lines = [f"**{item.title}** · {item.status}"]
+            if content:
+                if reasoning_format == "code" and item is not live_entry:
+                    # A longer fence preserves embedded backticks literally.
+                    fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", content)), default=0))
+                    lines.append(f"{fence}text\n{content}\n{fence}")
+                else:
+                    lines.append(content)
+            target_elements = (
+                reasoning_elements
+                if reasoning_format == "code" and item is not live_entry
+                else panel_elements
+            )
+            target_elements.extend(
+                _timeline_markdown_elements(
+                    "\n".join(lines),
+                    f"auxiliary_timeline_reasoningentry_{index}",
+                    text_size=_role_text_size(
+                        text_sizes,
+                        "reasoning",
+                        default="small",
+                        used_roles=used_text_size_roles,
+                    ),
+                )
+            )
+        elif item.kind == "tool":
+            full_detail, duration = _split_tool_timeline_detail(
+                redact_tool_detail(item.detail)
+            )
+            detail = _limit_text(
+                full_detail,
+                max_tool_result_chars,
+                overflow_label="工具详情过长，已截断",
+            )
+            # A selected tool is not proof that its parameters reached the
+            # panel: a long preview can consume the entire detail budget.
+            # Legacy producers can reuse an ID. Only the latest matching
+            # entry can prove that the current tool's full detail is present.
+            if (rendered_tool_ids is not None and item.tool_id
+                    and latest_tool_entries.get(item.tool_id) is item
+                    and detail == full_detail):
+                tool = session.tools.get(item.tool_id)
+                current_detail = _split_tool_timeline_detail(
+                    redact_tool_detail(tool.detail)
+                )[0] if tool is not None else None
+                if current_detail == full_detail:
+                    rendered_tool_ids.add(item.tool_id)
+            panel_elements.extend(
+                _timeline_markdown_elements(
+                    _render_tool_timeline_row(
+                        item.title,
+                        ("interrupted" if not live and str(item.status).strip().lower()
+                         not in TERMINAL_TOOL_STATUSES | {"display_handoff", "display_receipt"}
+                         else item.status),
+                        detail,
+                        duration,
+                        # The panel row carries the same #N tally as the content-area row, so the
+                        # two can be matched up. Resolved from the live tool state (the timeline
+                        # entry itself does not track an ordinal).
+                        ordinal=_timeline_tool_ordinal(session, item),
+                    ),
+                    f"auxiliary_timeline_toolentry_{index}",
+                    text_size=_role_text_size(
+                        text_sizes,
+                        "tool",
+                        default="x-small",
+                        used_roles=used_text_size_roles,
+                    ),
+                )
+            )
+        elif item.kind == "subagent":
+            detail = _limit_text(
+                normalize_stream_text(item.detail),
+                max_tool_result_chars,
+                overflow_label="子代理详情过长，已截断",
+            )
+            panel_elements.extend(
+                _timeline_markdown_elements(
+                    _render_subagent_timeline_row(
+                        item.title,
+                        item.status,
+                        detail,
+                    ),
+                    f"auxiliary_timeline_subagententry_{index}",
+                    text_size=_role_text_size(
+                        text_sizes,
+                        "tool",
+                        default="x-small",
+                        used_roles=used_text_size_roles,
+                    ),
+                )
+            )
+        elif item.kind == "notice":
+            content = _limit_text(
+                normalize_stream_text(item.content),
+                max_tool_result_chars,
+                overflow_label="提示内容过长，已截断",
+            )
+            lines = [f"**{item.title}** · {item.status}"]
+            if content:
+                lines.append(content)
+            panel_elements.extend(
+                _timeline_markdown_elements(
+                    _quote_markdown("\n".join(lines)),
+                    f"auxiliary_timeline_noticeentry_{index}",
+                    text_size=_role_text_size(
+                        text_sizes,
+                        "notice",
+                        default="x-small",
+                        used_roles=used_text_size_roles,
+                    ),
+                )
+            )
+    if folded:
+        # The folded entries are the EARLIEST ones, and the panel now reads newest-first — so the line
+        # that stands for them belongs at the BOTTOM, below the oldest entry still shown. Emitting it
+        # first (as it did in chronological order) would put a "here is where the history was cut"
+        # marker above the newest work, which reads as if the cut happened at the top.
+        folded_elements = _timeline_markdown_elements(
+                f"> 已折叠 {folded} 条早期思考/工具记录",
+                "auxiliary_timeline_folded",
+                text_size=_role_text_size(
+                    text_sizes,
+                    "notice",
+                    default="x-small",
+                    used_roles=used_text_size_roles,
+                ),
+            )
+        if timeline_order == "chronological":
+            panel_elements[0:0] = folded_elements
+        else:
+            panel_elements.extend(folded_elements)
+    if panel_elements:
+        # The panel is named for thinking and tool work. A timeline holding only notices (a deferred
+        # compression hint, a skill-loading note) is neither, and folding those into it produced
+        # "思考与工具 · 0 次工具调用" — a panel advertising zero of the thing it is named after while
+        # displaying unrelated content. Notices render standalone in that case, so the hint stays
+        # visible without a header that contradicts it.
+        if any(item.kind in _TIMELINE_WORK_KINDS for item in all_entries):
+            reasoning_elements.append(_timeline_panel(session, panel_elements, expanded=expanded))
+        else:
+            reasoning_elements.extend(panel_elements)
+    return reasoning_elements
+
+
+_TIMELINE_PANEL_TITLE = "思考过程（点按展开/收起）"
+
+
+def _timeline_panel(
+    session: CardSession,
+    elements: list[Dict[str, Any]],
+    *,
+    expanded: bool,
+) -> Dict[str, Any]:
+    """Keep the toggle discoverable without claiming a stale client state.
+
+    Feishu toggles the panel locally without rewriting this plain-text header.
+    A fixed directional triangle or open-only hint becomes incorrect after a
+    toggle, including when the task preset starts expanded. Preserve a neutral
+    hint in both states and the existing supported text-only header schema.
+    """
+    return {
+        "tag": "collapsible_panel",
+        "element_id": "auxiliary_timeline",
+        "expanded": expanded,
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": _TIMELINE_PANEL_TITLE,
+            },
+            "vertical_align": "center",
+        },
+        "border": {"color": "grey", "corner_radius": "8px"},
+        "padding": "8px 8px 8px 8px",
+        "elements": elements,
+    }
+
+
+def _split_tool_timeline_detail(detail: str) -> tuple[str, str]:
+    duration = ""
+    lines: list[str] = []
+    for line in str(detail or "").splitlines():
+        match = _TOOL_DURATION_LINE_RE.fullmatch(line.strip())
+        if match:
+            if not duration:
+                duration = match.group(1)
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip(), duration
+
+
+def _timeline_tool_ordinal(session: CardSession, item: Any) -> int:
+    """The ``#N`` for a 思考过程 tool row: that tool's call number within the turn.
+
+    Prefers the live tool state, which is authoritative. Falls back to the row's position among
+    the timeline's tool entries (``record_tool`` appends them in call order) for rows whose tool
+    state is no longer around.
+    """
+    tool_id = str(getattr(item, "tool_id", "") or "")
+    if tool_id:
+        tool = session.tools.get(tool_id)
+        ordinal = getattr(tool, "ordinal", 0) if tool is not None else 0
+        if ordinal:
+            return int(ordinal)
+    timeline = getattr(session, "timeline", None)
+    snapshot = timeline.snapshot() if timeline is not None else []
+    position = 0
+    seen: set[str] = set()
+    for entry in snapshot:
+        if getattr(entry, "kind", "") != "tool":
+            continue
+        entry_id = str(getattr(entry, "tool_id", "") or "")
+        if entry_id and entry_id in seen:
+            continue
+        if entry_id:
+            seen.add(entry_id)
+        position += 1
+        if entry_id and entry_id == tool_id:
+            return position
+    return 0
+
+
+def _render_tool_timeline_row(
+    title: str,
+    status: str,
+    detail: str,
+    duration: str,
+    ordinal: int = 0,
+) -> str:
+    """One row inside 思考过程. `ordinal` is the tool's call number, shown as #N.
+
+    Maintainer note: the user asked the panel's tool rows to carry the same 井号 tally the
+    content-area rows use, so a row can be matched to the "#4" it refers to. It sits right after
+    the name and ahead of the duration, mirroring the header order (name → count → time → phrase).
+    """
+    normalized_status = str(status or "running").strip().lower()
+    safe_title = html.escape(str(title or "工具"), quote=False)
+    meta = " · ".join(part for part in (f"#{ordinal}" if ordinal else "", duration) if part)
+    meta_suffix = f" · {meta}" if meta else ""
+    if normalized_status in {
+        "completed",
+        "success",
+        "succeeded",
+        "ok",
+        "已完成",
+        "完成",
+        "成功",
+    }:
+        color = "green"
+        headline = f"✓ **{safe_title}**{meta_suffix}"
+    elif normalized_status in {"blocked", "timeout", "unverified"}:
+        color = "grey" if normalized_status == "unverified" else "orange"
+        label = {"blocked": "已拒绝", "timeout": "已超时", "unverified": "结果待核对"}[normalized_status]
+        headline = f"⊘ **{safe_title}**{meta_suffix} · {label}"
+    elif normalized_status in {"failed", "error", "失败", "已失败", "错误"}:
+        color = "red"
+        headline = f"✕ **{safe_title}**{meta_suffix} · 失败"
+    elif normalized_status in {"cancelled", "canceled", "已取消", "取消"}:
+        color = "grey"
+        headline = f"⊘ **{safe_title}**{meta_suffix} · 已取消"
+    elif normalized_status == "interrupted":
+        color = "orange"
+        headline = f"⊘ **{safe_title}**{meta_suffix} · 已中断"
+    elif normalized_status in {"display_handoff", "display_receipt"}:
+        color = "grey"
+        label = "已转入续答" if normalized_status == "display_handoff" else "已记录"
+        headline = f"↪ **{safe_title}**{meta_suffix} · {label}"
+    elif normalized_status in {"queued", "waiting", "排队中", "等待中"}:
+        color = "grey"
+        headline = f"○ **{safe_title}**{meta_suffix} · 等待中"
+    else:
+        color = "blue"
+        headline = f"{_spinner_frame()} **{safe_title}**{meta_suffix} · 执行中"
+    lines = [f'<font color="{color}">{headline}</font>']
+    for line in str(detail or "").splitlines():
+        safe_line = html.escape(line, quote=False)
+        lines.append(f'<font color="grey">　{safe_line}</font>')
+    return "\n".join(lines)
+
+
+def _render_subagent_timeline_row(title: str, status: str, detail: str) -> str:
+    normalized_status = str(status or "running").strip().lower()
+    safe_title = html.escape(str(title or "子代理"), quote=False)
+    label = f"子代理：{safe_title}"
+    if normalized_status in {"completed", "success", "succeeded"}:
+        color, headline = "green", f"✓ **{label}** · 已完成"
+    elif normalized_status in {"failed", "error", "timeout", "blocked"}:
+        color, headline = "red", f"✕ **{label}** · 失败"
+    elif normalized_status in {"cancelled", "canceled"}:
+        color, headline = "grey", f"⊘ **{label}** · 已取消"
+    elif normalized_status == "interrupted":
+        color, headline = "grey", f"⊘ **{label}** · 已中断"
+    elif normalized_status in {"display_handoff", "display_receipt"}:
+        state_label = "已转入续答" if normalized_status == "display_handoff" else "已记录"
+        color, headline = "grey", f"↪ **{label}** · {state_label}"
+    elif normalized_status in {"queued", "waiting"}:
+        color, headline = "grey", f"○ **{label}** · 等待中"
+    else:
+        color, headline = "blue", f"{_spinner_frame()} **{label}** · 执行中"
+    lines = [f'<font color="{color}">{headline}</font>']
+    for line in str(detail or "").splitlines():
+        lines.append(f'<font color="grey">　{html.escape(line, quote=False)}</font>')
+    return "\n".join(lines)
+
+
+def _timeline_markdown_elements(
+    content: str, element_id_prefix: str, *, text_size: str | None
+) -> list[Dict[str, Any]]:
+    elements = [
+        {
+            "tag": "markdown",
+            "element_id": element_id_prefix
+            if index == 0
+            else f"{element_id_prefix}_{index}",
+            "content": chunk,
+        }
+        for index, chunk in enumerate(
+            split_markdown_blocks(content, MAIN_CONTENT_CHUNK_CHARS)
+        )
+        if chunk.strip()
+    ]
+    for element in elements:
+        _set_text_size(element, text_size)
+    return elements
+
+
+def _role_text_size(
+    text_sizes: Mapping[str, Any] | None,
+    role: str,
+    *,
+    default: str | None,
+    used_roles: set[str] | None = None,
+) -> str | None:
+    value = (text_sizes or {}).get(role)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        if used_roles is not None:
+            used_roles.add(role)
+        return f"hfc_{role}"
+    return default
+
+
+def _set_text_size(element: dict[str, Any], text_size: str | None) -> None:
+    if text_size is not None:
+        element["text_size"] = text_size
+
+
+def _quote_markdown(content: str) -> str:
+    return "\n".join(f"> {line}" if line else ">" for line in content.splitlines())
+
+
+def _limit_tools_per_reasoning(entries: list[Any], limit: int, *, keep_tool_ids: tuple[str, ...] = ()) -> list[Any]:
+    """Opt-in display pruning; keep failures/running work and all stored history."""
+    if type(limit) is not int or limit <= 0:
+        return entries
+    omitted = set()
+    group = []
+    for index, entry in enumerate(entries):
+        if entry.kind == "reasoning":
+            omitted.update(group[:-limit])
+            group = []
+        elif entry.kind == "tool" and str(entry.status).strip().lower() in _SUCCESS_TOOL_STATUSES:
+            group.append(index)
+    omitted.update(group[:-limit])
+    return [entry for index, entry in enumerate(entries)
+            if index not in omitted or getattr(entry, "tool_id", "") in keep_tool_ids]
+
+
+def _select_timeline_entries(entries: list[Any], *, max_items: int, priority_tool_ids: tuple[str, ...] = ()) -> list[Any]:
+    if max_items <= 0 or len(entries) <= max_items:
+        return list(entries)
+
+    if priority_tool_ids:
+        # Reserve bounded slots for live work, then its context. Retained old
+        # tools need their owning reasoning, not a newer unrelated heading.
+        chosen = []
+        owners = {}
+        owner = None
+        for index, entry in enumerate(entries):
+            if entry.kind == 'reasoning':
+                owner = index
+            elif entry.kind == 'tool' and owner is not None:
+                owners[index] = owner
+        for tool_id in priority_tool_ids:
+            index = next((i for i in range(len(entries) - 1, -1, -1)
+                          if entries[i].kind == "tool" and entries[i].tool_id == tool_id), None)
+            if index is not None and index not in chosen:
+                chosen.append(index)
+        chosen = chosen[:max_items]
+        # Newer owners first: if a tiny budget cannot fit every heading, the
+        # remaining older unheaded tools precede all selected reasoning groups.
+        for index in sorted({owners[i] for i in chosen if i in owners}, reverse=True):
+            if len(chosen) < max_items and index not in chosen:
+                chosen.append(index)
+        latest_reasoning = next((i for i in range(len(entries)-1, -1, -1)
+                                 if entries[i].kind == "reasoning"), None)
+        if len(chosen) < max_items and latest_reasoning is not None and latest_reasoning not in chosen:
+            chosen.append(latest_reasoning)
+        for index in range(len(entries)-1, -1, -1):
+            if index in chosen:
+                continue
+            additions = [index]
+            if index in owners and owners[index] not in chosen:
+                additions.append(owners[index])
+            if len(chosen) + len(additions) <= max_items:
+                chosen.extend(additions)
+        return [entries[i] for i in sorted(chosen)]
+
+    selected_indexes = list(range(len(entries) - max_items, len(entries)))
+    if max_items <= 1:
+        return [entries[index] for index in selected_indexes]
+    if any(entries[index].kind == "reasoning" for index in selected_indexes):
+        return [entries[index] for index in selected_indexes]
+
+    latest_reasoning_index = next(
+        (
+            index
+            for index in range(len(entries) - 1, -1, -1)
+            if entries[index].kind == "reasoning"
+        ),
+        None,
+    )
+    if latest_reasoning_index is None:
+        return [entries[index] for index in selected_indexes]
+
+    selected_indexes = [latest_reasoning_index] + selected_indexes[1:]
+    selected_indexes = sorted(dict.fromkeys(selected_indexes))
+    return [entries[index] for index in selected_indexes]
+
+
+def _notice_template(level: str) -> str:
+    normalized = str(level or "").strip().lower()
+    if normalized == "success":
+        return "green"
+    if normalized == "warning":
+        return "orange"
+    if normalized == "error":
+        return "red"
+    return "blue"
+
+
+def _render_attachment_summary(session: CardSession) -> str:
+    items = []
+    for item in session.attachments:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("summary") or item.get("name") or "").strip()
+        if name:
+            items.append(name)
+    if not items:
+        return ""
+    return "附件：" + "、".join(items[:8])
+
+
+def _render_footer(
+    session: CardSession,
+    footer_fields: list[str] | tuple[str, ...] | None = None,
+    *,
+    display_status: str = "",
+    compact: bool = False,
+    include_status: bool = True,
+) -> str:
+    # Maintainer note (contract change): a stopped or failed turn used to replace the WHOLE footer
+    # with just "已停止", throwing away the tool count, elapsed time, model and token counts —
+    # exactly the context someone needs to see WHERE the run stopped. The stop is now a pill on
+    # top of the same fields; the user asked for the state to survive a stop.
+    failed = session.status == "failed" or display_status == "failed"
+    if display_status == "waiting":
+        interaction = session.active_interaction
+        remaining_seconds = (
+            max(0.0, float(interaction.expires_at) - _time.time())
+            if interaction is not None
+            else 300.0
+        )
+        minutes = max(1, int(math.ceil(remaining_seconds / 60.0)))
+        # Maintainer note (contract change): the waiting footer used to show ONLY the expiry
+        # countdown, which hid how much work the paused turn had already done. The user asked for
+        # the consumption line in EVERY state — running, stopped, and waiting on a decision — so
+        # the tool count and elapsed time lead here too (matching the other two footers), and the
+        # token figures follow when the turn has already reported them (they are usually absent
+        # mid-turn: the core only sends tokens with turn.completed, so an approval that fires
+        # during the run legitimately shows no counts rather than a fake ↑0 ↓0).
+        waiting: list[str] = []
+        if session.tool_count and not compact:
+            waiting.append(f"工具 #{session.tool_count}")
+        if session.created_at:
+            # Only once there is a second to show: a freshly-armed approval would otherwise read
+            # "0s · 等待选择 · ⏳ 5 分钟后过期", which is noise, not information.
+            elapsed = max(0.0, _time.time() - float(session.created_at))
+            if elapsed >= 1.0:
+                waiting.append(_format_duration(elapsed))
+        if include_status:
+            waiting.append("等待选择")
+        waiting.append(f"⏳ {minutes} 分钟后过期")
+        tokens = session.tokens if isinstance(session.tokens, dict) else {}
+        input_tokens = _safe_int(tokens.get("input_tokens"))
+        output_tokens = _safe_int(tokens.get("output_tokens"))
+        if input_tokens or output_tokens:
+            waiting.append(f"↑{_format_count(input_tokens)} · ↓{_format_count(output_tokens)}")
+        return " · ".join(waiting)
+    if session.status != "completed" and display_status != "completed" and not failed:
+        # A live clock: elapsed since the turn started, so a long silent stretch reads as
+        # "it has been going 4 minutes" instead of an apparently frozen card. Feishu only
+        # re-renders on an event (or during the ~12s animation window), so this stills
+        # between events — each render shows the true elapsed time at that moment.
+        # Maintainer note (contract change): the tool count now leads the elapsed time, matching
+        # the title — the user asked for "工具 N · <time>" order in both places (it used to be
+        # time then count here).
+        running = [f"{_spinner_frame()} {_status_tag('执行中', 'blue')}"] if include_status else []
+        if session.tool_count and not compact:
+            # Maintainer note (contract change): hash before the count, matching the title.
+            running.append(f"工具 #{session.tool_count}")
+        running.append(_format_duration(max(0.0, _time.time() - float(session.created_at))))
+        # Maintainer note (contract change): the footer repeats the title's action phrase
+        # ("正在读取文件") so the state line reads the same wherever the eye lands — the user
+        # asked for it explicitly.
+        phrase = _latest_running_action_phrase(session)
+        if phrase and not compact:
+            running.append(phrase)
+        return " · ".join(running)
+    tokens = session.tokens if isinstance(session.tokens, dict) else {}
+    input_tokens = _safe_int(tokens.get("input_tokens"))
+    output_tokens = _safe_int(tokens.get("output_tokens"))
+    try:
+        duration = float(session.duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+    model = session.model if isinstance(session.model, str) and session.model.strip() else "Unknown"
+    provider = getattr(session, "provider", "")
+    if isinstance(provider, str) and provider.strip() and model != "Unknown":
+        provider = provider.strip()
+        if not model.startswith(provider + "/"):
+            model = f"{provider}/{model}"
+    context = session.context if isinstance(session.context, dict) else {}
+    used_context = _safe_int(context.get("used_tokens"))
+    max_context = _safe_int(context.get("max_tokens"))
+    context_percent = round(used_context / max_context * 100) if max_context > 0 else 0
+    pill = (_status_tag("已停止", "red") if failed else _status_tag("已完成", "green")) if include_status else ""
+    # Maintainer note (contract change): a card that received NO metric now shows the state pill
+    # alone — the metrics row is not rendered at all.
+    #
+    # This footer is reached by notice-only cards too ("Gateway 重启完成", "Gateway 正在重启"): they
+    # render through a CardSession that never carried a turn's metrics, so the line came out
+    # "已完成 · 0s · Unknown · ↑0 · ↓0 · ctx 0/0 0%" — five fields of pure noise that read as broken
+    # data rather than information. The user asked for that line to go ("为什么是 unknown。0。
+    # 如果这样的话感觉不需要展示这一行"). The guard must be HERE, before `values` is built: the zeroed
+    # strings ("0s", "Unknown", "↑0", "ctx 0/0 0%") are all TRUTHY, so an emptiness check on the
+    # rendered values cannot tell "no data" from "real data" — it would pass every field through.
+    # Quota is real data only for a known Codex GPT route. Cached or externally
+    # supplied values must not leak onto another provider/model's footer.
+    # A turn that reported any metric keeps its full line, so nothing real is ever hidden.
+    subscription_usage = (
+        session.subscription_usage
+        if uses_codex_subscription(session.model, session.provider) else ""
+    )
+    if not (
+        duration > 0
+        or model != "Unknown"
+        or input_tokens
+        or output_tokens
+        or max_context
+        or session.tool_count
+        or subscription_usage
+    ):
+        return pill
+    values = {
+        "duration": _format_duration(duration),
+        "model": html.escape(model, quote=True) if compact else _colored_model_label(model),
+        "input_tokens": f"↑{_format_count(input_tokens)}",
+        "output_tokens": f"↓{_format_count(output_tokens)}",
+        "context": (
+            f"ctx {_format_count(used_context)}/"
+            f"{_format_count(max_context)} {context_percent}%"
+        ),
+        "subscription_usage": subscription_usage,
+        "output_rate": _format_output_rate(tokens),
+    }
+    selected = []
+    if session.tool_count and not compact:
+        # Maintainer note (contract change): the count leads the other metrics, matching the title
+        # (it used to be appended last, after ctx); it carries a hash, per the user's request.
+        selected.append(f"工具 #{session.tool_count}")
+    fields = DEFAULT_FOOTER_FIELDS if footer_fields is None else footer_fields
+    available = {
+        "duration": duration > 0, "model": model != "Unknown",
+        "input_tokens": "input_tokens" in tokens,
+        "output_tokens": "output_tokens" in tokens,
+        "context": max_context > 0 and "used_tokens" in context,
+        "subscription_usage": bool(subscription_usage),
+        "output_rate": bool(values["output_rate"]),
+    }
+    fields = [field for field in fields if available.get(field, False)]
+    for field in fields:
+        value = values.get(field)
+        if value:
+            selected.append(value)
+    # Every configured field came back empty (or `footer_fields` is empty): the pill IS the footer.
+    if not selected:
+        return pill
+    detail = " · ".join(selected)
+    # Maintainer note (contract change): the state pill leads the footer and nothing else follows it
+    # but the metrics. The "本轮回复结束" note that used to sit here (first ahead of the pill, then
+    # behind it) is gone — the user asked for it to leave the footer, and the completed state plus
+    # the header sub-title / native completion line already carry it.
+    return f"{pill} · {detail}" if pill else detail
+
+
+def _format_output_rate(tokens: Dict[str, Any]) -> str:
+    """Validated observed-window rate with its stream or request timing label."""
+    validated = retained_output_rate(tokens)
+    if validated is None:
+        return ""
+    rate, basis = validated
+    shown = f"{rate:.2g}" if rate < 1 else str(int(round(rate)))
+    return f"~{shown} tok/s (流式)" if basis == "decode" else f"~{shown} tok/s (含TTFT)"
+
+
+def _colored_model_label(model: str) -> str:
+    text = str(model or "")
+    safe = html.escape(text, quote=True)
+    normalized = text.lower()
+    for prefixes, color in MODEL_COLOR_PREFIXES:
+        if normalized.startswith(prefixes):
+            return f'<font color="{color}">{safe}</font>'
+    return safe
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{remaining_minutes}m{remaining_seconds}s"
+    if minutes:
+        return f"{minutes}m{remaining_seconds}s"
+    return f"{remaining_seconds}s"
+
+
+def _format_count(value: int) -> str:
+    if value >= 1_000_000:
+        return _format_scaled(value, 1_000_000, "m")
+    if value >= 1_000:
+        return _format_scaled(value, 1_000, "k")
+    return str(value)
+
+
+def _format_scaled(value: int, factor: int, suffix: str) -> str:
+    scaled = value / factor
+    if scaled >= 100 or scaled.is_integer():
+        return f"{int(round(scaled))}{suffix}"
+    return f"{scaled:.1f}".rstrip("0").rstrip(".") + suffix
+
+
+def _limit_text(text: str, limit: int, *, overflow_label: str = "内容已折叠") -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    suffix = f"\n> {overflow_label}"
+    return text[: max(0, limit - len(suffix))].rstrip() + suffix

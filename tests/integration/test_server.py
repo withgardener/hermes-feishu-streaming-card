@@ -1,0 +1,14832 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import copy
+import hashlib
+import json
+import logging
+from pathlib import Path
+import re
+import secrets
+import threading
+import time
+from types import SimpleNamespace
+import warnings
+
+import pytest
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+
+from hermes_feishu_card import hook_runtime
+from hermes_feishu_card import event_auth as event_auth_module
+from hermes_feishu_card import flush as flush_module
+from hermes_feishu_card import server as sidecar_server
+from hermes_feishu_card.bots import RouteResult
+from hermes_feishu_card.card_limits import inspect_card_limits
+from hermes_feishu_card.events import SidecarEvent
+from hermes_feishu_card.metrics import SidecarMetrics
+from hermes_feishu_card.delivery_policy import ChatDeliveryPolicy
+from hermes_feishu_card.event_auth import (
+    sign_event_request,
+    sign_native_handoff_ack_request,
+    sign_native_handoff_recovery_request,
+    sign_policy_request,
+)
+from hermes_feishu_card.feishu_client import FeishuAPIError
+from hermes_feishu_card.diagnostics import DiagnosticFinding, DiagnosticReport
+from hermes_feishu_card.flush import FlushController
+from hermes_feishu_card.lifecycle import (
+    cleanup_closed_controller,
+    cleanup_orphan_message_lock,
+    cleanup_runtime_state,
+)
+from hermes_feishu_card.native_handoff import (
+    NativeHandoffStore,
+    derive_native_handoff_target_hash,
+    derive_native_handoff_uuid_seed,
+    handoff_identity_key,
+)
+from hermes_feishu_card.operations import OperationStore, sign_transport_proof
+from hermes_feishu_card.operations_transport import (
+    derive_operation_transport_secret,
+    sign_command_transport_proof,
+)
+from hermes_feishu_card.session import CardSession, InteractionState
+from hermes_feishu_card.server import (
+    CARD_SUMMARIES_KEY,
+    CARD_SUMMARY_SESSION_KEYS_KEY,
+    CLEANUP_TASK_KEY,
+    DIAGNOSTICS_KEY,
+    FEISHU_MESSAGE_IDS_KEY,
+    FLUSH_CONTROLLERS_KEY,
+    INTERACTION_RESULTS_KEY,
+    INTERACTION_RESULT_SESSION_KEYS_KEY,
+    MESSAGE_BOT_IDS_KEY,
+    MESSAGE_LOCKS_KEY,
+    MESSAGE_LOCK_USERS_KEY,
+    METRICS_KEY,
+    NATIVE_HANDOFF_STORE_KEY,
+    RUNTIME_CLEANUP_INTERVAL_SECONDS,
+    SESSION_ALIASES_KEY,
+    REDIRECT_SESSION_ALIASES_KEY,
+    SESSION_CARD_CONFIGS_KEY,
+    SESSIONS_KEY,
+    create_app as _create_app,
+)
+from hermes_feishu_card.runner import NoopFeishuClient
+from hermes_feishu_card.runtime_interaction_transport import RuntimeInteractionListener
+
+
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
+TRANSPORT_SECRET = "test-adapter-process-local-secret"
+TRANSPORT_ROOT_SECRET = b"r" * 32
+DELIVERED_RESPONSE = {
+    "ok": True,
+    "applied": True,
+    "delivery": {"outcome": "delivered"},
+}
+ACCEPTED_RESPONSE = {
+    "ok": True,
+    "applied": True,
+    "delivery": {"outcome": "accepted"},
+}
+
+
+def create_app(*args, **kwargs):
+    kwargs.setdefault(
+        "operations_transport_root_secret",
+        TRANSPORT_ROOT_SECRET,
+    )
+    return _create_app(*args, **kwargs)
+
+
+def signed_policy_request(payload):
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return body, sign_policy_request(TRANSPORT_ROOT_SECRET, body)
+
+
+def signed_operations_command(payload):
+    signed = dict(payload)
+    signed.pop("adapter_transport_secret", None)
+    signed["adapter_command_proof"] = sign_command_transport_proof(
+        TRANSPORT_ROOT_SECRET,
+        signed,
+        timestamp=int(sidecar_server.time.time()),
+        nonce=secrets.token_urlsafe(18),
+    )
+    return signed
+
+
+async def test_after_eof_runs_once_after_connection_reset_and_preserves_eof_error(
+    monkeypatch,
+):
+    callbacks = []
+
+    async def failed_write_eof(self, data=b""):
+        raise ConnectionResetError("client disconnected")
+
+    def failed_after_eof():
+        callbacks.append(True)
+        raise RuntimeError("schedule failed")
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", failed_write_eof)
+    response = sidecar_server._AfterEofJsonResponse({}, failed_after_eof)
+
+    with pytest.raises(ConnectionResetError, match="client disconnected"):
+        await response.write_eof()
+    with pytest.raises(ConnectionResetError, match="client disconnected"):
+        await response.write_eof()
+
+    assert callbacks == [True]
+
+
+async def test_after_eof_runs_once_on_successful_repeated_write_eof(monkeypatch):
+    callbacks = []
+    writes = []
+
+    async def successful_write_eof(self, data=b""):
+        writes.append(data)
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", successful_write_eof)
+    response = sidecar_server._AfterEofJsonResponse({}, lambda: callbacks.append(True))
+
+    await response.write_eof()
+    await response.write_eof(b"again")
+
+    assert callbacks == [True]
+    assert writes == [b"", b"again"]
+
+
+class FakeFeishuClient:
+    def __init__(self):
+        self.sent = []
+        self.sent_reply_in_thread = []
+        self.updated = []
+        self.deleted = []
+        self.texts = []
+        self.texts_reply_in_thread = []
+        self.operations = []
+        self.fail_send = False
+        self.fail_delete = False
+        self.fail_text = False
+        self.send_delay = 0.0
+        self.update_failures_remaining = 0
+        self.update_error_message = "update unavailable"
+        self.update_delay = 0.0
+
+    async def send_card(
+        self,
+        chat_id,
+        card,
+        thread_id=None,
+        reply_to_message_id=None,
+        reply_in_thread=False,
+    ):
+        if self.send_delay:
+            await asyncio.sleep(self.send_delay)
+        if self.fail_send:
+            raise RuntimeError("send unavailable")
+        self.sent.append((chat_id, card, thread_id, reply_to_message_id))
+        self.sent_reply_in_thread.append(reply_in_thread)
+        return f"feishu-message-{len(self.sent)}"
+
+    async def update_card_message(self, message_id, card):
+        if self.update_delay:
+            await asyncio.sleep(self.update_delay)
+        if self.update_failures_remaining > 0:
+            self.update_failures_remaining -= 1
+            raise RuntimeError(self.update_error_message)
+        self.updated.append((message_id, card))
+        self.operations.append("update")
+
+    async def delete_message(self, message_id):
+        if self.fail_delete:
+            raise RuntimeError("recall refused")
+        self.deleted.append(message_id)
+        self.operations.append("delete")
+
+    async def send_text_message(
+        self,
+        chat_id,
+        text,
+        thread_id=None,
+        reply_to_message_id=None,
+        reply_in_thread=False,
+    ):
+        if self.fail_text:
+            raise RuntimeError("text send unavailable")
+        self.texts.append((chat_id, text, thread_id, reply_to_message_id))
+        self.texts_reply_in_thread.append(reply_in_thread)
+        self.operations.append("text")
+        return f"feishu-text-{len(self.texts)}"
+
+
+class DialectAwareFeishuClient(FakeFeishuClient):
+    def __init__(self):
+        super().__init__()
+        self.dialects = {}
+
+    async def send_card(
+        self,
+        chat_id,
+        card,
+        thread_id=None,
+        reply_to_message_id=None,
+        reply_in_thread=False,
+    ):
+        message_id = await super().send_card(
+            chat_id,
+            card,
+            thread_id,
+            reply_to_message_id,
+            reply_in_thread,
+        )
+        self.dialects[message_id] = (
+            "v2" if card.get("schema") == "2.0" else "legacy"
+        )
+        return message_id
+
+    async def update_card_message(self, message_id, card):
+        dialect = "v2" if card.get("schema") == "2.0" else "legacy"
+        if self.dialects[message_id] != dialect:
+            raise FeishuAPIError(
+                "card dialect mismatch",
+                status_code=400,
+                api_code=230099,
+            )
+        await super().update_card_message(message_id, card)
+
+
+class PermanentFailureClient(FakeFeishuClient):
+    async def send_card_delivery(self, *args, **kwargs):
+        raise FeishuAPIError(
+            "permanent failure",
+            status_code=400,
+            api_code=9499,
+            retryable=False,
+            outcome="not_sent",
+        )
+
+
+class UnknownFailureClient(FakeFeishuClient):
+    async def send_card_delivery(self, *args, **kwargs):
+        raise FeishuAPIError(
+            "transient failure",
+            status_code=503,
+            api_code=9499,
+            retryable=True,
+            outcome="unknown",
+            retry_count=2,
+        )
+
+
+class UpdateFailureClient(FakeFeishuClient):
+    async def update_card_message(self, message_id, card):
+        raise FeishuAPIError(
+            "Authorization Bearer private-update-token",
+            status_code=503,
+            api_code=9499,
+            retryable=True,
+            outcome="unknown",
+        )
+
+
+class ReorderingFeishuClient(FakeFeishuClient):
+    def __init__(self):
+        super().__init__()
+        self.update_calls = 0
+
+    async def update_card_message(self, message_id, card):
+        self.update_calls += 1
+        update_call = self.update_calls
+        if update_call == 1:
+            await asyncio.sleep(0.05)
+        self.updated.append((message_id, card))
+
+
+class ControlledOperationsUpdateClient(FakeFeishuClient):
+    def __init__(self):
+        super().__init__()
+        self.update_started = asyncio.Event()
+        self.release_update = asyncio.Event()
+        self.block_first_update = True
+
+    async def update_card_message(self, message_id, card):
+        if self.block_first_update:
+            self.block_first_update = False
+            self.update_started.set()
+            await self.release_update.wait()
+        if self.update_failures_remaining > 0:
+            self.update_failures_remaining -= 1
+            raise RuntimeError(self.update_error_message)
+        self.updated.append((message_id, card))
+
+
+class FakeBotRegistry:
+    def safe_diagnostics(self):
+        return {
+            "default_bot": "default",
+            "bot_count": 2,
+            "chat_binding_count": 1,
+            "secret": "registry-secret",
+        }
+
+
+class FakeFeishuClientFactory:
+    def __init__(self, cards=None, profile_card=None):
+        self.registry = FakeBotRegistry()
+        self.clients = {
+            "default": FakeFeishuClient(),
+            "sales": FakeFeishuClient(),
+        }
+        self.cards = cards or {}
+        self.profile_card = profile_card or {}
+
+    def get_client(self, bot_id):
+        return self.clients[bot_id]
+
+    def card_config_for_bot(self, bot_id, base_card=None, profile_card=None):
+        card = dict(base_card or {})
+        card.update(profile_card or self.profile_card)
+        card.update(self.cards.get(bot_id, {}))
+        return card
+
+
+def operations_report(
+    *,
+    report_marker="report-a",
+    recovery_fingerprint="recovery-a",
+    executable=True,
+    profile_source="",
+):
+    return DiagnosticReport(
+        status="warning",
+        created_at=100.0,
+        config={"path": "/private/config.yaml", "marker": report_marker},
+        hermes={"root": "/private/hermes", "status": "supported"},
+        streaming={"status": "enabled"},
+        install_state={
+            "status": "incomplete",
+            "recovery_executable": executable,
+            "recovery_fingerprint": recovery_fingerprint,
+        },
+        routing={"profile_id": "default", "profile_source": profile_source},
+        runtime={},
+        findings=(
+            DiagnosticFinding(
+                code="owned_incomplete",
+                severity="warning",
+                message="Hook state needs repair.",
+            ),
+        ),
+    )
+
+
+async def test_operations_callbacks_keep_full_recovery_fingerprint_internal(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    full_fingerprint = "a" * 64
+    report = DiagnosticReport(
+        status="warning",
+        created_at=100.0,
+        config={"path": "/private/config.yaml", "marker": "full-fingerprint"},
+        hermes={"root": "/private/hermes", "status": "supported"},
+        streaming={"status": "enabled"},
+        install_state={
+            "status": "incomplete",
+            "recovery_executable": True,
+            "recovery_fingerprint": full_fingerprint[:12],
+        },
+        routing={"profile_id": "default"},
+        runtime={},
+        findings=(
+            DiagnosticFinding(
+                code="owned_incomplete",
+                severity="warning",
+                message="Hook state needs repair.",
+            ),
+        ),
+        internal_recovery_fingerprint=full_fingerprint,
+    )
+    calls = []
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, SimpleNamespace(root=Path("/private/hermes"))),
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: calls.append(args) or SimpleNamespace(status="repaired"),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "chat_type": "private",
+                "operator": "ou_owner",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        details = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button(card, "查看诊断"), chat_id="oc_private"
+            ),
+        )
+        details_body = await details.json()
+        repair = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button(details_body["card"], "安全修复"),
+                chat_id="oc_private",
+            ),
+        )
+        confirm = operations_button((await repair.json())["card"], "确认修复")
+        completed = await test_client.post(
+            "/card/actions", json=operations_action_payload(confirm, chat_id="oc_private")
+        )
+        completed_body = await completed.json()
+        await _wait_until(lambda: bool(calls))
+    finally:
+        await test_client.close()
+
+    assert details_body["ok"] is True
+    assert completed_body["ok"] is True
+    assert calls == [(SimpleNamespace(root=Path("/private/hermes")), full_fingerprint)]
+
+
+def operations_button(card, label):
+    def find_button(elements):
+        for element in elements:
+            if element.get("tag") == "button":
+                text = element.get("text")
+                behaviors = element.get("behaviors")
+                if (
+                    isinstance(text, dict)
+                    and text.get("content") == label
+                    and isinstance(behaviors, list)
+                    and behaviors
+                    and isinstance(behaviors[0], dict)
+                    and isinstance(behaviors[0].get("value"), dict)
+                ):
+                    return behaviors[0]["value"]
+            if element.get("tag") == "column_set":
+                for column in element.get("columns", []):
+                    value = find_button(column.get("elements", []))
+                    if value is not None:
+                        return value
+            for button in element.get("actions", []):
+                if button["text"]["content"] == label:
+                    return button["value"]
+        return None
+
+    value = find_button(card["body"]["elements"])
+    if value is not None:
+        return value
+    raise AssertionError(f"missing operations button: {label}")
+
+
+def interaction_buttons(card):
+    found = []
+
+    def walk(elements):
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            if element.get("tag") == "button" and isinstance(element.get("value"), dict):
+                found.append(element)
+            for key in ("elements", "actions"):
+                nested = element.get(key)
+                if isinstance(nested, list):
+                    walk(nested)
+            columns = element.get("columns")
+            if isinstance(columns, list):
+                for column in columns:
+                    if isinstance(column, dict) and isinstance(column.get("elements"), list):
+                        walk(column["elements"])
+
+    root_elements = card.get("elements")
+    if not isinstance(root_elements, list):
+        root_elements = card.get("body", {}).get("elements", [])
+    walk(root_elements)
+    return found
+
+
+def cards_edited_into(feishu_client, message_id):
+    """Every card pushed onto *message_id* — empty while a card still holds its first content."""
+    return [card for edited_id, card in feishu_client.updated if edited_id == message_id]
+
+
+def operations_action_payload(
+    value,
+    *,
+    chat_id="oc_group",
+    operator="ou_owner",
+    profile_id="",
+    proof_profile_id="",
+    transport_secret=None,
+):
+    context = {"open_chat_id": chat_id}
+    if profile_id:
+        context["profile_id"] = profile_id
+    proof_profile_id = proof_profile_id or profile_id or "default"
+    timestamp = int(sidecar_server.time.time())
+    token = str(value.get("token") or "")
+    encoded = token.split(".", 1)[0]
+    claims = json.loads(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
+    proof = sign_transport_proof(
+        transport_secret
+        or derive_operation_transport_secret(
+            TRANSPORT_ROOT_SECRET,
+            claims["operation_id"],
+        ),
+        token=token,
+        action=str(value.get("operation_action") or ""),
+        callback_chat_id=chat_id,
+        callback_profile_id=proof_profile_id,
+        callback_profile_scope=str(value.get("profile_scope") or ""),
+        operator_open_id=operator,
+        timestamp=timestamp,
+    )
+    return {
+        "adapter_transport_proof": {
+            "timestamp": timestamp,
+            "signature": proof,
+        },
+        "event": {
+            "action": {"value": value},
+            "context": context,
+            "operator": {"open_id": operator} if operator else {},
+        }
+    }
+
+
+def event_payload(
+    event,
+    sequence,
+    data=None,
+    *,
+    conversation_id="conversation-1",
+    message_id="hermes-message-1",
+    chat_id="oc_abc",
+    thread_id="",
+    turn_id="",
+    created_at=None,
+):
+    data = dict(data or {})
+    handoff = data.get("native_handoff")
+    if isinstance(handoff, dict) and "exact-base-delivery-v1" in set(
+        handoff.get("capabilities") or ()
+    ):
+        data.setdefault("profile_id", "default")
+        data.setdefault("profile_source", "fallback_default")
+        data.setdefault("attachments", [])
+        data.setdefault("native_delivery", "allowed")
+    payload = {
+        "schema_version": "1",
+        "event": event,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "platform": "feishu",
+        "sequence": sequence,
+        "created_at": (
+            1777017600.0 + sequence if created_at is None else created_at
+        ),
+        "data": data,
+    }
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if turn_id:
+        payload["turn_id"] = turn_id
+    return payload
+
+
+def runtime_interaction_payload(descriptor, *, event_id="patch:turn-runtime:interaction:1"):
+    payload = event_payload(
+        "interaction.requested",
+        1,
+        {
+            "interaction_id": "runtime-approval-1",
+            "kind": "approval",
+            "prompt": "允许继续吗？",
+            "description": "仅用于本次操作",
+            "allow_custom_input": False,
+            "multi_select": False,
+            "timeout_seconds": 20.0,
+            "options": [
+                {"label": "允许一次", "value": "once", "style": "primary"},
+                {"label": "拒绝", "value": "deny", "style": "danger"},
+            ],
+            "_hfc_runtime_admission": descriptor,
+        },
+        turn_id="turn-runtime",
+        created_at=time.time(),
+    )
+    payload.update(event_id=event_id, producer="patch", phase="started")
+    return payload
+
+
+def runtime_descriptor(listener):
+    return {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": listener.resolve_url,
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
+
+
+def exact_handoff_metadata(
+    generation: str,
+    obligation_key: str,
+    *,
+    answer: str = "",
+    content_hash: str | None = None,
+    plan_fingerprint: str = "d" * 64,
+    route: str = "create",
+    profile_id: str = "default",
+    chat_id: str = "oc_abc",
+    thread_id: str = "",
+):
+    if content_hash is None:
+        content_hash = exact_content_hash(answer) if answer else "c" * 64
+    target_hash = derive_native_handoff_target_hash(
+        profile_id=profile_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        route=route,
+    )
+    provisional_uuid_seed = derive_native_handoff_uuid_seed(
+        obligation_key=obligation_key,
+        content_hash=content_hash,
+        plan_fingerprint=plan_fingerprint,
+        route=route,
+        target_hash=target_hash,
+    )
+    return {
+        "generation": generation,
+        "capabilities": [
+            "native-ack-v2",
+            "stable-feishu-uuid-v2",
+            "exact-base-delivery-v1",
+        ],
+        "obligation_key": obligation_key,
+        "content_hash": content_hash,
+        "plan_fingerprint": plan_fingerprint,
+        "route": route,
+        "target_hash": target_hash,
+        "provisional_uuid_seed": provisional_uuid_seed,
+    }
+
+
+def exact_content_hash(answer: str) -> str:
+    return hashlib.sha256(
+        b"hfc-native-content-v1\0" + answer.encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "scope_mutation",
+    [
+        {"delivery_kind": "cron"},
+        {"delivery_kind": "command"},
+        {"attachments": [{"kind": "file", "name": "report.pdf"}]},
+        {"native_delivery": "required"},
+        {"attachments": None},
+        {"native_delivery": None},
+    ],
+)
+def test_sidecar_exact_ack_requires_content_bound_ordinary_text_scope(
+    scope_mutation,
+):
+    answer = "exact ordinary text"
+    metadata = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        content_hash=exact_content_hash(answer),
+    )
+    data = {
+        "answer": answer,
+        "attachments": [],
+        "native_delivery": "allowed",
+        "profile_id": "default",
+        "profile_source": "fallback_default",
+        "native_handoff": metadata,
+    }
+    for field, value in scope_mutation.items():
+        if value is None:
+            data.pop(field, None)
+        else:
+            data[field] = value
+    raw_event = event_payload("message.completed", 1, data)
+    for field, value in scope_mutation.items():
+        if value is None:
+            raw_event["data"].pop(field, None)
+    event = SidecarEvent.from_dict(raw_event)
+
+    assert sidecar_server._native_handoff_ack_capable(
+        {sidecar_server.NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY: object()},
+        metadata,
+        event,
+    ) is False
+
+
+def test_sidecar_exact_ack_recomputes_content_hash_from_answer():
+    answer = "exact ordinary text"
+    metadata = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        content_hash="e" * 64,
+    )
+    event = SidecarEvent.from_dict(
+        event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": answer,
+                "attachments": [],
+                "native_delivery": "allowed",
+                "native_handoff": metadata,
+            },
+        )
+    )
+
+    assert sidecar_server._native_handoff_ack_capable(
+        {sidecar_server.NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY: object()},
+        metadata,
+        event,
+    ) is False
+
+
+def test_sidecar_exact_ack_accepts_only_completed_canonical_text_event():
+    answer = "exact ordinary text"
+    metadata = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        answer=answer,
+    )
+    data = {
+        "answer": answer,
+        "attachments": [],
+        "native_delivery": "allowed",
+        "profile_id": "default",
+        "profile_source": "fallback_default",
+        "native_handoff": metadata,
+    }
+    app = {sidecar_server.NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY: object()}
+    completed = SidecarEvent.from_dict(
+        event_payload("message.completed", 1, data)
+    )
+    failed = SidecarEvent.from_dict(event_payload("message.failed", 1, data))
+
+    assert sidecar_server._native_handoff_ack_capable(
+        app,
+        metadata,
+        completed,
+    ) is True
+    assert sidecar_server._native_handoff_ack_capable(
+        app,
+        metadata,
+        failed,
+    ) is False
+
+
+@pytest.fixture
+async def client(tmp_path):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        yield test_client, feishu_client
+    finally:
+        await test_client.close()
+
+
+def identified(payload, event_id, *, producer="plugin", phase="started"):
+    payload = dict(payload)
+    payload.update(
+        {
+            "turn_id": payload.get("turn_id") or "turn-1",
+            "event_id": event_id,
+            "producer": producer,
+            "phase": phase,
+        }
+    )
+    return payload
+
+
+async def test_identical_event_id_replay_returns_original_response_without_second_delivery(client):
+    test_client, feishu_client = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+
+    first_response = await test_client.post("/events", json=payload)
+    first_body = await first_response.json()
+    replay_response = await test_client.post("/events", json=payload)
+    replay_body = await replay_response.json()
+
+    assert (replay_response.status, replay_body) == (first_response.status, first_body)
+    assert len(feishu_client.sent) == 1
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_received"] == 1
+    assert metrics["events_applied"] == 1
+    assert metrics["event_id_replays"] == 1
+
+
+async def test_concurrent_identical_event_id_is_single_flight(client):
+    test_client, feishu_client = client
+    feishu_client.send_delay = 0.05
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+
+    responses = await asyncio.gather(
+        test_client.post("/events", json=payload),
+        test_client.post("/events", json=payload),
+    )
+    bodies = [await response.json() for response in responses]
+
+    assert [response.status for response in responses] == [200, 200]
+    assert bodies[0] == bodies[1]
+    assert len(feishu_client.sent) == 1
+
+
+async def test_serial_and_concurrent_conflict_reject_before_session_mutation(client):
+    test_client, feishu_client = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    conflict = dict(payload)
+    conflict["data"] = {"reply_to_message_id": "om_conflict"}
+
+    first, second = await asyncio.gather(
+        test_client.post("/events", json=payload),
+        test_client.post("/events", json=conflict),
+    )
+    assert sorted([first.status, second.status]) == [200, 409]
+    rejected = second if second.status == 409 else first
+    assert await rejected.json() == {
+        "ok": False,
+        "error": "event_id payload conflict",
+    }
+    losing_payload = conflict if first.status == 200 else payload
+    winning_payload = payload if first.status == 200 else conflict
+    serial = await test_client.post("/events", json=losing_payload)
+    assert serial.status == 409
+    replay = await test_client.post("/events", json=winning_payload)
+    assert replay.status == 200
+    assert len(feishu_client.sent) == 1
+
+
+@pytest.mark.parametrize("flags", [
+    {"failed": True}, {"interrupted": True}, {"completed": False},
+])
+async def test_gateway_unsuccessful_completion_renders_terminal_without_success(client, flags):
+    test_client, feishu_client = client
+    test_client.app[sidecar_server.BASE_CARD_CONFIG_KEY]["completion_notify"] = {
+        "enabled": True, "mention": False,
+    }
+    context = {
+        "chat_id": "oc_abc", "conversation_id": "conversation-1",
+        "message_id": "hermes-message-1", "profile_id": "default",
+        "answer": "已取得部分结果", "agent_result": flags,
+    }
+    started = hook_runtime.build_event("message.started", context)
+    await test_client.post("/events", json=started)
+    payload = hook_runtime.build_event("message.completed", context)
+    response = await test_client.post("/events", json=payload)
+    assert response.status == 200
+    assert (await response.json())["applied"] is True
+    await wait_for_card_update(feishu_client, "本轮")
+    matching = [s for s in test_client.app[SESSIONS_KEY].values()
+                if "本轮" in s.answer_text]
+    assert len(matching) == 1
+    assert matching[0].status == "failed"
+    assert matching[0].completion_notify_state == "idle"
+    assert "已取得部分结果" in matching[0].answer_text
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.texts == []
+
+
+async def test_redirect_followup_aliases_interrupted_card_to_new_card(client):
+    test_client, feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_user_original"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_redirect_prompt",
+            "redirect_followup": True,
+            "redirect_from_message_id": "om_old_turn",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_original_delta = event_payload(
+        "answer.delta",
+        1,
+        {"text": "redirected answer"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    second = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_original_delta)
+
+    assert first.status == second.status == late.status == 200
+    assert test_client.app[SESSION_ALIASES_KEY]["om_old_turn"] == "om_redirect_turn"
+    old_session = test_client.app[SESSIONS_KEY]["om_old_turn"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_turn"]
+    assert old_session.status == "failed"
+    assert old_session.answer_text == "> 本轮已被新对话替代，任务尚未确认完成。"
+    assert "redirected answer" in new_session.answer_text
+    assert len(feishu_client.sent) == 2
+
+
+async def test_redirect_followup_aliases_interrupted_turn_id_stream_to_new_card(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_user_original"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_redirect_prompt",
+            "redirect_followup": True,
+            "redirect_from_turn_id": "turn-old-runtime",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_original_delta = event_payload(
+        "answer.delta",
+        1,
+        {"text": "redirected answer"},
+        conversation_id="omt_topic",
+        message_id="om_old_turn",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    second = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_original_delta)
+
+    assert first.status == second.status == late.status == 200
+    assert (
+        test_client.app[SESSION_ALIASES_KEY]["turn-old-runtime"]
+        == "om_redirect_turn"
+    )
+    assert (
+        test_client.app[REDIRECT_SESSION_ALIASES_KEY]["turn-old-runtime"]
+        == "om_redirect_turn"
+    )
+    old_session = test_client.app[SESSIONS_KEY]["turn-old-runtime"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_turn"]
+    assert old_session.status == "failed"
+    assert old_session.answer_text == "> 本轮已被新对话替代，任务尚未确认完成。"
+    assert "redirected answer" in new_session.answer_text
+
+
+async def test_redirect_followup_recovers_turn_terminalized_before_redirect(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_deep_search_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+    interrupted_terminal = event_payload(
+        "message.completed",
+        1,
+        {"answer": "partial answer", "reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_deep_search_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_deep_search_user",
+            "redirect_followup": True,
+            "redirect_from_turn_id": "turn-old-runtime",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_final = event_payload(
+        "message.completed",
+        2,
+        {"answer": "final redirected answer", "reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_deep_search_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+        turn_id="turn-old-runtime",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    terminal = await test_client.post("/events", json=interrupted_terminal)
+    redirect = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_final)
+
+    assert first.status == terminal.status == redirect.status == late.status == 200
+    assert (
+        test_client.app[REDIRECT_SESSION_ALIASES_KEY]["turn-old-runtime"]
+        == "om_redirect_user"
+    )
+    assert test_client.app[SESSION_ALIASES_KEY]["om_original_question"] == "om_redirect_user"
+    old_session = test_client.app[SESSIONS_KEY]["turn-old-runtime"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_user"]
+    assert old_session.status == "completed"
+    assert old_session.answer_text == "partial answer"
+    assert new_session.answer_text == "final redirected answer"
+
+
+async def test_redirect_followup_receives_legacy_completion_on_original_anchor(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_original_question"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    interrupted_terminal = event_payload(
+        "message.completed",
+        1,
+        {"answer": "partial answer"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    redirect_started = event_payload(
+        "message.started",
+        0,
+        {
+            "reply_to_message_id": "om_original_question",
+            "redirect_followup": True,
+            "redirect_from_message_id": "om_original_question",
+        },
+        conversation_id="omt_topic",
+        message_id="om_redirect_user",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    late_final = event_payload(
+        "message.completed",
+        2,
+        {"answer": "final redirected answer"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+
+    first = await test_client.post("/events", json=old_started)
+    terminal = await test_client.post("/events", json=interrupted_terminal)
+    redirect = await test_client.post("/events", json=redirect_started)
+    late = await test_client.post("/events", json=late_final)
+
+    assert first.status == terminal.status == redirect.status == late.status == 200
+    assert test_client.app[SESSION_ALIASES_KEY]["om_original_question"] == "om_redirect_user"
+    old_session = test_client.app[SESSIONS_KEY]["om_original_question"]
+    new_session = test_client.app[SESSIONS_KEY]["om_redirect_user"]
+    assert old_session.status == "completed"
+    assert old_session.answer_text == "partial answer"
+    assert new_session.answer_text == "final redirected answer"
+
+
+async def test_redirect_followup_hook_payload_aliases_terminalized_card(client):
+    test_client, _feishu_client = client
+    old_started = event_payload(
+        "message.started",
+        0,
+        {"reply_to_message_id": "om_original_question", "profile_id": "default"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    interrupted_terminal = event_payload(
+        "message.completed",
+        1,
+        {"answer": "partial answer", "profile_id": "default"},
+        conversation_id="omt_topic",
+        message_id="om_original_question",
+        chat_id="oc_topic",
+        thread_id="omt_topic",
+    )
+    redirect_started = hook_runtime.build_event(
+        "message.started",
+        {
+            "source": SimpleNamespace(
+                platform="feishu",
+                chat_id="oc_topic",
+                thread_id="omt_topic",
+            ),
+            "chat_id": "oc_topic",
+            "message_id": "om_redirect_user",
+            "reply_to_message_id": "om_original_question",
+            "redirect_followup": True,
+            "redirect_from_message_id": "om_original_question",
+        },
+    )
+    assert redirect_started is not None
+
+    first = await test_client.post("/events", json=old_started)
+    terminal = await test_client.post("/events", json=interrupted_terminal)
+    redirect = await test_client.post("/events", json=redirect_started)
+
+    assert first.status == terminal.status == redirect.status == 200
+    assert test_client.app[SESSION_ALIASES_KEY]["default:om_original_question"] == "default:om_redirect_user"
+    assert test_client.app[REDIRECT_SESSION_ALIASES_KEY]["default:om_original_question"] == "default:om_redirect_user"
+
+
+async def test_redirect_does_not_move_unrelated_historical_turn(client):
+    test_client, _ = client
+    common = {"chat_id": "oc_topic", "conversation_id": "omt_topic", "thread_id": "omt_topic"}
+    for message, turn in (("om_history", "turn-history"), ("om_active", "turn-active")):
+        await test_client.post("/events", json=event_payload(
+            "message.started", 0, message_id=message, turn_id=turn, **common))
+        await test_client.post("/events", json=event_payload(
+            "message.completed", 1, {"answer": message}, message_id=message, turn_id=turn, **common))
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0,
+        {"redirect_followup": True, "redirect_from_turn_id": "turn-active"},
+        message_id="om_redirect", turn_id="turn-redirect", **common))
+    await test_client.post("/events", json=event_payload(
+        "message.completed", 2, {"answer": "STALE HISTORY"},
+        message_id="om_history", turn_id="turn-history", **common))
+    assert "turn-history" not in test_client.app[REDIRECT_SESSION_ALIASES_KEY]
+    assert test_client.app[SESSIONS_KEY]["turn-redirect"].answer_text == ""
+    await test_client.post("/events", json=event_payload(
+        "message.completed", 2, {"answer": "redirect answer"},
+        message_id="om_active", turn_id="turn-active", **common))
+    assert test_client.app[SESSIONS_KEY]["turn-redirect"].answer_text == "redirect answer"
+
+
+async def test_redirect_without_source_identity_cannot_alias_explicit_turn(client):
+    test_client, _ = client
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0, message_id="om_old", turn_id="turn-old"))
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0, {"redirect_followup": True, "reply_to_message_id": "om_old"},
+        message_id="om_new", turn_id="turn-new"))
+    assert not test_client.app[REDIRECT_SESSION_ALIASES_KEY]
+    await test_client.post("/events", json=event_payload(
+        "answer.delta", 1, {"text": "late old output"}, message_id="om_old", turn_id="turn-old"))
+    assert test_client.app[SESSIONS_KEY]["turn-new"].answer_text == ""
+
+
+async def test_error_response_is_replayed_without_retrying_delivery(tmp_path):
+    feishu_client = FakeFeishuClient()
+    feishu_client.fail_send = True
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    try:
+        first = await test_client.post("/events", json=payload)
+        first_body = await first.json()
+        replay = await test_client.post("/events", json=payload)
+        replay_body = await replay.json()
+    finally:
+        await test_client.close()
+
+    assert (first.status, replay.status) == (502, 502)
+    assert replay_body == first_body
+    assert app[METRICS_KEY].feishu_send_attempts == 1
+
+
+async def test_event_fence_exception_does_not_poison_retry(client, monkeypatch):
+    test_client, _ = client
+    original = sidecar_server._apply_event_locked
+    calls = 0
+
+    async def fail_once(request, event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected apply failure")
+        return await original(request, event)
+
+    monkeypatch.setattr(sidecar_server, "_apply_event_locked", fail_once)
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    failed = await test_client.post("/events", json=payload)
+    retried = await test_client.post("/events", json=payload)
+
+    assert failed.status == 500
+    assert retried.status == 200
+    assert calls == 2
+
+
+async def test_event_fence_never_evicts_pending_and_rejects_new_id_at_capacity(client):
+    test_client, _ = client
+    fence = test_client.app[sidecar_server.EVENT_ID_FENCE_KEY]
+    fence.max_entries = 2
+    owner_one = await fence.claim("pending-1", "fp-1")
+    owner_two = await fence.claim("pending-2", "fp-2")
+
+    full = await fence.claim("new", "fp-new")
+
+    assert owner_one.kind == owner_two.kind == "owner"
+    assert full.kind == "full"
+    assert set(fence.entries) == {"pending-1", "pending-2"}
+
+
+async def test_event_fence_ttl_and_capacity_evict_oldest_completed_and_metric(client):
+    test_client, _ = client
+    fence = test_client.app[sidecar_server.EVENT_ID_FENCE_KEY]
+    fence.max_entries = 2
+    fence.ttl_seconds = 10
+    now = [100.0]
+    fence.now = lambda: now[0]
+    first = await fence.claim("first", "fp-1")
+    await fence.finalize("first", first.entry, 200, {"ok": True, "first": True})
+    now[0] = 101.0
+    second = await fence.claim("second", "fp-2")
+    await fence.finalize("second", second.entry, 200, {"ok": True, "second": True})
+    now[0] = 102.0
+    third = await fence.claim("third", "fp-3")
+    assert third.kind == "owner"
+    assert list(fence.entries) == ["second", "third"]
+    now[0] = 112.0
+    fourth = await fence.claim("fourth", "fp-4")
+    assert fourth.kind == "owner"
+    assert list(fence.entries) == ["third", "fourth"]
+    assert test_client.app[METRICS_KEY].event_id_evictions == 2
+
+
+async def test_event_id_native_terminal_replays_exact_first_disposition(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-IDENTIFIED-TERMINAL-" + ("密" * 40_000)
+    handoff = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        answer=sensitive,
+    )
+    payload = identified(
+        event_payload(
+            "message.completed",
+            0,
+            {
+                "answer": sensitive,
+                "attachments": [],
+                "native_delivery": "allowed",
+                "native_handoff": handoff,
+            },
+            turn_id="turn-native-1",
+            message_id="message-native-identified",
+        ),
+        "turn:turn-native-1:completed",
+        phase="terminal",
+    )
+
+    first = await test_client.post("/events", json=payload)
+    first_body = await first.json()
+    replay = await test_client.post("/events", json=payload)
+    replay_body = await replay.json()
+
+    assert first_body["ok"] is True
+    assert first_body["applied"] is False
+    assert first_body["disposition"] == "native"
+    assert first_body["native_handoff"]["protocol"] == "hfc-native-handoff-v2"
+    assert (replay.status, replay_body) == (first.status, first_body)
+    assert feishu_client.sent == []
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_received"] == 1
+    assert metrics["events_applied"] == 1
+    assert metrics["event_id_replays"] == 1
+
+
+async def test_owner_cancellation_after_response_keeps_canonical_replay(client, monkeypatch):
+    test_client, _ = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    finalized = asyncio.Event()
+    release = asyncio.Event()
+    original_finalize = sidecar_server.EventIdFence.finalize
+
+    async def blocked_finalize(self, *args, **kwargs):
+        await original_finalize(self, *args, **kwargs)
+        finalized.set()
+        await release.wait()
+
+    monkeypatch.setattr(sidecar_server.EventIdFence, "finalize", blocked_finalize)
+    owner = asyncio.create_task(test_client.post("/events", json=payload))
+    await asyncio.wait_for(finalized.wait(), timeout=1.0)
+    owner.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    replay = await test_client.post("/events", json=payload)
+
+    assert replay.status == 200
+    assert await replay.json() == DELIVERED_RESPONSE
+
+
+async def test_owner_cancellation_before_response_releases_pending_claim(client, monkeypatch):
+    test_client, _ = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = sidecar_server._apply_event_locked
+
+    async def blocked_apply(request, event):
+        entered.set()
+        await release.wait()
+        return await original(request, event)
+
+    class DirectRequest:
+        app = test_client.app
+
+        async def json(self):
+            return payload
+
+    monkeypatch.setattr(sidecar_server, "_apply_event_locked", blocked_apply)
+    owner = asyncio.create_task(sidecar_server._events(DirectRequest()))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    assert payload["event_id"] not in test_client.app[
+        sidecar_server.EVENT_ID_FENCE_KEY
+    ].entries
+
+    release.set()
+    retried = await sidecar_server._events(DirectRequest())
+    assert retried.status == 200
+
+
+async def test_waiter_cancellation_does_not_remove_running_owner_claim(client):
+    test_client, _ = client
+    fence = test_client.app[sidecar_server.EVENT_ID_FENCE_KEY]
+    owner = await fence.claim("pending", "same")
+    waiter_claim = await fence.claim("pending", "same")
+    waiter = asyncio.create_task(fence.wait(waiter_claim.entry))
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert fence.entries["pending"] is owner.entry
+    assert not owner.entry.future.cancelled()
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_native_handoff_state(tmp_path, monkeypatch):
+    """Keep direct create_app() calls away from the user's real state dir."""
+
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_STATE_DIR",
+        str(tmp_path / "default-handoff-state"),
+    )
+
+
+async def test_event_auth_required_rejects_unsigned_and_reports_bounded_health():
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+        response_body = await response.json()
+        health = await (await test_client.get("/health")).json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 401
+    assert response_body == {
+        "ok": False,
+        "error": "event authentication failed",
+    }
+    assert health["event_auth_required"] is True
+    assert health["metrics"]["events_received"] == 0
+    assert health["metrics"]["events_rejected"] == 1
+    assert health["metrics"]["event_auth_rejections"] == 1
+    assert "signature" not in json.dumps(health).lower()
+
+
+async def test_event_auth_required_accepts_valid_body_once_and_rejects_replay():
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload("message.started", 0)
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        **sign_event_request(
+            TRANSPORT_ROOT_SECRET,
+            body,
+            timestamp=int(sidecar_server.time.time()),
+            nonce="nonce-1234567890",
+        ),
+    }
+    try:
+        accepted = await test_client.post("/events", data=body, headers=headers)
+        accepted_body = await accepted.json()
+        replayed = await test_client.post("/events", data=body, headers=headers)
+    finally:
+        await test_client.close()
+
+    assert accepted.status == 200
+    assert accepted_body == DELIVERED_RESPONSE
+    assert replayed.status == 401
+
+
+async def test_event_auth_required_rejects_wrong_signature_without_echoing_it():
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload("message.started", 0)
+    body = json.dumps(payload).encode("utf-8")
+    wrong_signature = "f" * 64
+    headers = {
+        "Content-Type": "application/json",
+        **sign_event_request(
+            TRANSPORT_ROOT_SECRET,
+            body,
+            timestamp=int(sidecar_server.time.time()),
+            nonce="nonce-1234567890",
+        ),
+        "X-HFC-Event-Signature": wrong_signature,
+    }
+    try:
+        response = await test_client.post("/events", data=body, headers=headers)
+        response_text = await response.text()
+    finally:
+        await test_client.close()
+
+    assert response.status == 401
+    assert wrong_signature not in response_text
+
+
+def test_create_app_refuses_required_event_auth_without_private_root_secret():
+    with pytest.raises(ValueError, match="event authentication"):
+        _create_app(
+            FakeFeishuClient(),
+            operations_transport_root_secret=None,
+            event_auth_required=True,
+        )
+
+
+async def test_delivery_policy_requires_signed_fresh_request_and_never_echoes_ids():
+    raw_chat_id = "oc_private_chat_123"
+    app = create_app(
+        FakeFeishuClient(),
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = {
+        "schema_version": "1",
+        "chat_id": raw_chat_id,
+        "profile_id": "",
+        "message_id": "om_private_message_123",
+    }
+    body, headers = signed_policy_request(payload)
+    try:
+        unsigned = await test_client.post("/delivery/policy", data=body)
+        accepted = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        replayed = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        response_text = await accepted.text()
+        assert unsigned.status == 401
+        assert accepted.status == 200
+        assert json.loads(response_text) == {
+            "ok": True,
+            "disposition": "native",
+            "reason": "bindings.native_chats",
+            "ttl_ms": 1000,
+        }
+        assert replayed.status == 401
+        assert raw_chat_id not in response_text
+        assert payload["message_id"] not in response_text
+        assert app[METRICS_KEY].policy_queries == 1
+        assert app[METRICS_KEY].policy_auth_rejections == 2
+    finally:
+        await test_client.close()
+
+
+async def test_delivery_policy_rejects_malformed_payload_without_echoing_value():
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    leaked = "oc_should_not_be_echoed"
+    body, headers = signed_policy_request(
+        {"schema_version": "2", "chat_id": leaked}
+    )
+    try:
+        response = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        text = await response.text()
+        assert response.status == 400
+        assert leaked not in text
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": "1", "chat_id": "oc_bad\nchat"},
+        {
+            "schema_version": "1",
+            "chat_id": "oc_valid",
+            "profile_id": "../default",
+        },
+        {
+            "schema_version": "1",
+            "chat_id": "oc_valid",
+            "message_id": "om_bad\x7fmessage",
+        },
+    ],
+)
+async def test_delivery_policy_rejects_control_characters_and_invalid_profile(
+    payload,
+):
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body, headers = signed_policy_request(payload)
+    try:
+        response = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        assert response.status == 400
+        response_text = await response.text()
+        assert str(next(reversed(payload.values()))) not in response_text
+    finally:
+        await test_client.close()
+
+
+async def test_delivery_policy_fails_closed_when_private_root_is_missing():
+    app = _create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/delivery/policy",
+            json={"schema_version": "1", "chat_id": "oc_private"},
+        )
+        assert response.status == 503
+        assert (await response.json())["ok"] is False
+    finally:
+        await test_client.close()
+
+
+async def test_native_event_bypasses_before_any_card_state_or_feishu_send():
+    raw_chat_id = "oc_native_chat"
+    client = FakeFeishuClient()
+    app = create_app(
+        client,
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload("message.started", 0)
+    payload["chat_id"] = raw_chat_id
+    try:
+        response = await test_client.post("/events", json=payload)
+        assert response.status == 200
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert app[SESSION_ALIASES_KEY] == {}
+        assert app[FEISHU_MESSAGE_IDS_KEY] == {}
+        assert client.sent == []
+        assert app[METRICS_KEY].native_bypass_events == 1
+        assert app[METRICS_KEY].events_ignored == 0
+    finally:
+        await test_client.close()
+
+
+async def test_native_new_turn_does_not_mutate_prior_card_handoff_state(tmp_path):
+    raw_chat_id = "oc_native_handoff_chat"
+    message_id = "message-native-handoff-reuse"
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id=raw_chat_id,
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    prior, created = store.begin_no_card(
+        identity,
+        event_created_at=1777017600.0,
+    )
+    assert created is True
+
+    app = create_app(
+        FakeFeishuClient(),
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+        native_handoff_store=store,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                chat_id=raw_chat_id,
+                message_id=message_id,
+                created_at=1777017700.0,
+            ),
+        )
+
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert store.get(identity) == prior
+        assert app[SESSIONS_KEY] == {}
+    finally:
+        await test_client.close()
+
+
+async def test_existing_active_card_turn_stays_card_after_policy_changes_native():
+    class MutablePolicy:
+        def __init__(self):
+            self.native = False
+
+        def decide(self, chat_id, *, profile_id=""):
+            return ChatDeliveryPolicy(
+                native_chats=(chat_id,) if self.native else ()
+            ).decide(chat_id, profile_id=profile_id)
+
+        def safe_diagnostics(self):
+            return {"status": "ready", "native_chat_count": int(self.native)}
+
+    policy = MutablePolicy()
+    client = FakeFeishuClient()
+    app = create_app(client, delivery_policy=policy, card_config={"flush_interval_ms": 0})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events", json=event_payload("message.started", 0)
+        )
+        assert (await started.json())["applied"] is True
+        policy.native = True
+        completed_payload = event_payload("message.completed", 1)
+        completed_payload["data"] = {"answer": "done"}
+        completed = await test_client.post("/events", json=completed_payload)
+        assert (await completed.json())["applied"] is True
+        assert len(client.sent) == 1
+        assert app[METRICS_KEY].native_bypass_events == 0
+
+        next_turn = await test_client.post(
+            "/events", json=event_payload("message.started", 0)
+        )
+        assert await next_turn.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert len(client.sent) == 1
+        assert app[METRICS_KEY].native_bypass_events == 1
+    finally:
+        await test_client.close()
+
+
+async def test_reused_message_id_nonterminal_event_rechecks_policy_without_started():
+    class MutablePolicy:
+        def __init__(self):
+            self.native = False
+
+        def decide(self, chat_id, *, profile_id=""):
+            return ChatDeliveryPolicy(
+                native_chats=(chat_id,) if self.native else ()
+            ).decide(chat_id, profile_id=profile_id)
+
+        def safe_diagnostics(self):
+            return {"status": "ready", "native_chat_count": int(self.native)}
+
+    policy = MutablePolicy()
+    client = FakeFeishuClient()
+    app = create_app(
+        client,
+        delivery_policy=policy,
+        card_config={"flush_interval_ms": 0},
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 1, {"answer": "first"}),
+        )
+        policy.native = True
+
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "answer.delta",
+                0,
+                {"text": "next", "policy_new_turn": True},
+            ),
+        )
+
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert len(client.sent) == 1
+    finally:
+        await test_client.close()
+
+
+async def test_invalid_event_profile_is_native_before_default_session_creation():
+    client = FakeFeishuClient()
+    app = create_app(
+        client,
+        delivery_policy=ChatDeliveryPolicy(
+            profile_native_chats={"default": ()},
+        ),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload("message.started", 0)
+    payload["data"]["profile_id"] = "../default"
+    try:
+        response = await test_client.post("/events", json=payload)
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert client.sent == []
+    finally:
+        await test_client.close()
+
+
+async def wait_for_card_update(feishu_client, expected_text, attempts=80):
+    for _ in range(attempts):
+        for message_id, card in reversed(feishu_client.updated):
+            if expected_text in str(card):
+                return message_id, card
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    raise AssertionError(f"card update containing {expected_text!r} was not observed")
+
+
+async def wait_for_condition(predicate, attempts=80):
+    for _ in range(attempts):
+        if predicate():
+            return
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    raise AssertionError("condition was not observed")
+
+
+async def test_new_turn_abandons_interrupted_session_in_same_conversation(client):
+    test_client, _feishu_client = client
+    first = {
+        "conversation_id": "conversation-interrupt",
+        "message_id": "message-interrupted",
+    }
+    second = {
+        "conversation_id": "conversation-interrupt",
+        "message_id": "message-follow-up",
+    }
+
+    await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0, **first),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "partial"}, **first),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 0, {"text": "follow-up"}, **second),
+    )
+
+    assert test_client.app[SESSIONS_KEY]["message-interrupted"].status == "failed"
+    assert test_client.app[SESSIONS_KEY]["message-follow-up"].status == "thinking"
+
+
+async def test_interrupted_terminal_update_cannot_be_overwritten_by_stale_delta():
+    feishu_client = ReorderingFeishuClient()
+    app = create_app(feishu_client, card_config={"flush_interval_ms": 0})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    first = {
+        "conversation_id": "conversation-race",
+        "message_id": "message-race-old",
+    }
+    second = {
+        "conversation_id": "conversation-race",
+        "message_id": "message-race-new",
+    }
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, **first),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload("answer.delta", 1, {"text": "stale delta"}, **first),
+        )
+        await _wait_until(lambda: feishu_client.update_calls == 1)
+
+        await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, **second),
+        )
+        await _wait_until(
+            lambda: len(
+                [
+                    card
+                    for message_id, card in feishu_client.updated
+                    if message_id == "feishu-message-1"
+                ]
+            )
+            >= 2
+        )
+    finally:
+        await test_client.close()
+
+    old_card_updates = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-1"
+    ]
+    assert "本轮已被新对话替代" in str(old_card_updates[-1])
+    assert "已完成" not in str(old_card_updates[-1])
+
+
+async def test_interrupted_session_log_does_not_expose_chat_id(client, caplog):
+    test_client, _feishu_client = client
+    chat_id = "oc_sensitive_interrupt_chat"
+
+    with caplog.at_level(logging.INFO, logger=sidecar_server.__name__):
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                conversation_id="conversation-log",
+                message_id="message-log-old",
+                chat_id=chat_id,
+            ),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                conversation_id="conversation-log",
+                message_id="message-log-new",
+                chat_id=chat_id,
+            ),
+        )
+
+    assert chat_id not in caplog.text
+    assert sidecar_server._diagnostic_id_hash(chat_id) in caplog.text
+
+
+async def _wait_until(predicate, attempts=80):
+    for _ in range(attempts):
+        if predicate():
+            return
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    raise AssertionError("condition was not observed")
+
+
+async def wait_for_metric(test_client, metric_name, expected_value, attempts=80):
+    body = None
+    for _ in range(attempts):
+        health = await test_client.get("/health")
+        body = await health.json()
+        if body["metrics"][metric_name] == expected_value:
+            return body["metrics"]
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    raise AssertionError(
+        f"metric {metric_name!r} did not become {expected_value!r}: {body}"
+    )
+
+
+def test_create_app_does_not_require_a_current_event_loop():
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            previous_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        previous_loop = None
+    try:
+        asyncio.set_event_loop(None)
+        app = create_app(FakeFeishuClient())
+    finally:
+        asyncio.set_event_loop(previous_loop)
+
+    assert app[sidecar_server.OPERATIONS_DIAGNOSTIC_SEMAPHORE_KEY]["value"] is None
+    assert app[sidecar_server.OPERATIONS_PUBLISH_LOCKS_GUARD_KEY]["value"] is None
+
+
+async def test_health_reports_package_and_domain_separated_python_identity_without_path():
+    executable = "/private/example/hermes/.venv/bin/python"
+    identity = sidecar_server.python_executable_identity(executable)
+    app = create_app(
+        FakeFeishuClient(),
+        package_version="4.1.1",
+        python_identity=identity,
+    )
+    request = make_mocked_request("GET", "/health", app=app)
+    response = await sidecar_server._health(request)
+    body = json.loads(response.body)
+
+    assert response.status == 200
+    assert body["package_version"] == "4.1.1"
+    assert body["python_identity"] == identity
+    assert identity.startswith("python-sha256:")
+    assert len(identity.removeprefix("python-sha256:")) == 64
+    assert executable not in json.dumps(body)
+    assert identity != hashlib.sha256(executable.encode("utf-8")).hexdigest()
+
+
+async def test_health_reports_empty_process_token_hash_when_no_token():
+    app = create_app(FakeFeishuClient())
+    request = make_mocked_request("GET", "/health", app=app)
+
+    response = await sidecar_server._health(request)
+    body = json.loads(response.body)
+
+    assert response.status == 200
+    assert body["process_token_hash"] == ""
+
+
+async def test_health_reports_hashed_process_token_without_echoing_it():
+    process_token = "private-process-token"
+    app = create_app(FakeFeishuClient(), process_token=process_token)
+    request = make_mocked_request("GET", "/health", app=app)
+
+    response = await sidecar_server._health(request)
+    body = json.loads(response.body)
+
+    assert response.status == 200
+    assert body["process_token_hash"] == hashlib.sha256(
+        process_token.encode("utf-8")
+    ).hexdigest()
+    assert process_token not in json.dumps(body)
+
+
+async def test_shutdown_control_requires_matching_process_token_and_never_echoes_it(
+    monkeypatch,
+):
+    process_token = "private-process-token"
+    shutdown_requests: list[bool] = []
+    app = create_app(
+        FakeFeishuClient(),
+        process_token=process_token,
+        shutdown_callback=lambda: shutdown_requests.append(True),
+    )
+
+    def request(headers=None):
+        mocked = make_mocked_request(
+            "POST", "/control/shutdown", headers=headers, app=app
+        )
+        mocked._transport_peername = ("127.0.0.1", 43210)
+        return mocked
+
+    missing = await sidecar_server._control_shutdown(request())
+    assert missing.status == 403
+    assert process_token not in missing.text
+    assert shutdown_requests == []
+
+    wrong = await sidecar_server._control_shutdown(
+        request({"X-HFC-Process-Token": "wrong-token"})
+    )
+    assert wrong.status == 403
+    assert process_token not in wrong.text
+    assert "wrong-token" not in wrong.text
+    assert shutdown_requests == []
+
+    async def successful_write_eof(self, data=b""):
+        return None
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", successful_write_eof)
+    accepted = await sidecar_server._control_shutdown(
+        request({"X-HFC-Process-Token": process_token})
+    )
+    assert accepted.status == 202
+    assert json.loads(accepted.body) == {"ok": True, "status": "stopping"}
+    assert shutdown_requests == []
+
+    await accepted.write_eof()
+
+    assert shutdown_requests == [True]
+
+
+async def test_shutdown_control_rejects_non_loopback_peer_even_with_token():
+    app = create_app(
+        FakeFeishuClient(),
+        process_token="private-process-token",
+        shutdown_callback=lambda: pytest.fail("remote peer scheduled shutdown"),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/control/shutdown",
+        headers={"X-HFC-Process-Token": "private-process-token"},
+        app=app,
+    )
+    request._transport_peername = ("203.0.113.10", 43210)
+
+    response = await sidecar_server._control_shutdown(request)
+
+    assert response.status == 403
+    assert "private-process-token" not in response.text
+
+
+async def test_shutdown_control_does_not_stop_when_response_could_not_be_sent(
+    monkeypatch,
+):
+    shutdown_requests: list[bool] = []
+    app = create_app(
+        FakeFeishuClient(),
+        process_token="private-process-token",
+        shutdown_callback=lambda: shutdown_requests.append(True),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/control/shutdown",
+        headers={"X-HFC-Process-Token": "private-process-token"},
+        app=app,
+    )
+    request._transport_peername = ("127.0.0.1", 43210)
+
+    async def failed_write_eof(self, data=b""):
+        raise ConnectionResetError("client disconnected")
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", failed_write_eof)
+    response = await sidecar_server._control_shutdown(request)
+
+    with pytest.raises(ConnectionResetError, match="client disconnected"):
+        await response.write_eof()
+
+    assert shutdown_requests == []
+
+
+async def test_health_reports_healthy_status_and_active_sessions(client):
+    test_client, _ = client
+
+    response = await test_client.get("/health")
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["status"] == "healthy"
+    assert body["noop_mode"] is False
+    assert body["delivery"] == {"mode": "live"}
+    assert body["event_auth_required"] is False
+    assert body["active_sessions"] == 0
+    # Behavior contract, not a snapshot. This used to compare the WHOLE metrics payload against the
+    # literal below, which made every new counter a failure while catching nothing extra: the set
+    # comparison catches what matters (a counter that stops being reported), and the literal pins
+    # what this test is about — a fresh sidecar reports zero for everything it knows.
+    expected_metrics = {
+        "events_received": 0,
+        "events_applied": 0,
+        "events_ignored": 0,
+        "events_rejected": 0,
+        "event_auth_rejections": 0,
+        "event_id_replays": 0,
+        "event_id_conflicts": 0,
+        "event_id_evictions": 0,
+        "sidecar_request_auth_rejections": 0,
+        "runtime_control_events_received": 0,
+        "runtime_control_events_accepted": 0,
+        "runtime_control_auth_rejections": 0,
+        "runtime_interaction_callback_attempts": 0,
+        "runtime_interaction_callback_successes": 0,
+        "runtime_interaction_callback_failures": 0,
+        "integrity_repair_attempts": 0,
+        "integrity_repair_successes": 0,
+        "integrity_repair_refusals": 0,
+        "policy_queries": 0,
+        "policy_auth_rejections": 0,
+        "policy_invalid_requests": 0,
+        "policy_event_checks": 0,
+        "native_bypass_events": 0,
+        "native_handoff_fence_restores": 0,
+        "native_handoff_fence_restore_refusals": 0,
+        "feishu_send_attempts": 0,
+        "feishu_noop_attempts": 0,
+        "feishu_send_successes": 0,
+        "feishu_send_failures": 0,
+        "feishu_send_retries": 0,
+        "feishu_send_unknown_outcomes": 0,
+        "notice_native_fallbacks": 0,
+        "notice_uncertain_warnings": 0,
+        "notice_update_failures": 0,
+        "feishu_update_attempts": 0,
+        "feishu_update_successes": 0,
+        "feishu_update_failures": 0,
+        "feishu_update_retries": 0,
+        "update_scheduled": 0,
+        "update_coalesced": 0,
+        "update_queue_peak": 0,
+        "terminal_drains": 0,
+        "terminal_drain_timeouts": 0,
+        "terminal_drain_latency_ms": 0,
+        "feishu_update_latency_ms": 0,
+        "cron_cards_sent": 0,
+        "cron_fallbacks": 0,
+        "table_compactions": 0,
+        "table_truncations": 0,
+        "card_limit_deferrals": 0,
+        "card_native_handoffs": 0,
+        "card_limit_json_bytes": 0,
+        "card_limit_elements": 0,
+        "card_limit_tables": 0,
+        "recovery_plans_available": 0,
+        "recovery_attempts": 0,
+        "recovery_successes": 0,
+        "recovery_refusals": 0,
+        "profile_mismatches": 0,
+        "sessions_collected": 0,
+        "zombie_sessions_collected": 0,
+        "flush_controllers_collected": 0,
+        "ephemeral_recalls_scheduled": 0,
+        "ephemeral_recalls_completed": 0,
+        "ephemeral_recall_failures": 0,
+    }
+    reported_metrics = body["metrics"]
+    assert set(reported_metrics) == set(SidecarMetrics().snapshot())
+    assert {
+        key: reported_metrics[key] for key in expected_metrics
+    } == expected_metrics
+    assert body["reply_index"] == {"entries": 0, "last_lookup": {}}
+    assert body["cron"] == {"cards_sent": 0, "fallbacks": 0}
+    assert body["profile_diagnostics"] == {}
+
+
+async def test_noop_mode_reports_degraded_health_and_never_claims_delivery():
+    app = create_app(NoopFeishuClient(), noop_mode=True)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        health = await test_client.get("/health")
+        health_body = await health.json()
+        started = await test_client.post(
+            "/events", json=event_payload("message.started", 0)
+        )
+        started_body = await started.json()
+        metrics_response = await test_client.get("/health")
+        metrics = (await metrics_response.json())["metrics"]
+    finally:
+        await test_client.close()
+
+    assert health.status == 200
+    assert health_body["status"] == "degraded"
+    assert health_body["noop_mode"] is True
+    assert health_body["delivery"] == {"mode": "noop"}
+    assert started.status == 502
+    assert started_body == {
+        "ok": False,
+        "error": "feishu send failed",
+        "delivery": {"outcome": "not_sent"},
+    }
+    assert metrics["feishu_send_attempts"] == 1
+    assert metrics["feishu_noop_attempts"] == 1
+    assert metrics["feishu_send_successes"] == 0
+    assert metrics["feishu_send_failures"] == 1
+
+
+def test_cleanup_runtime_state_removes_related_state_and_counts_once():
+    app = create_app(FakeFeishuClient())
+    session_key = "profile:om_terminal"
+    alias_key = "profile:om_reply"
+    session = CardSession("oc_1", "om_terminal", "oc_1")
+    session.status = "completed"
+    session.updated_at = 100.0
+    session.answer_text = "final answer"
+    session.active_interaction = InteractionState(
+        interaction_id="approval-old",
+        kind="approval",
+        prompt="Old approval",
+        status="completed",
+    )
+    controller = FlushController(interval_seconds=0.2, metrics=app[METRICS_KEY])
+    controller.close()
+    app[SESSIONS_KEY][session_key] = session
+    app[SESSION_ALIASES_KEY][alias_key] = session_key
+    app[MESSAGE_LOCKS_KEY][session_key] = SimpleNamespace(locked=lambda: False)
+    app[MESSAGE_LOCKS_KEY][alias_key] = SimpleNamespace(locked=lambda: False)
+    app[FEISHU_MESSAGE_IDS_KEY][session_key] = "om_card"
+    app[MESSAGE_BOT_IDS_KEY][session_key] = "profile:default"
+    app[SESSION_CARD_CONFIGS_KEY][session_key] = {"title": "Card"}
+    app[FLUSH_CONTROLLERS_KEY][session_key] = controller
+    sidecar_server._store_interaction_result(app, session)
+    session.active_interaction = InteractionState(
+        interaction_id="approval-latest",
+        kind="approval",
+        prompt="Latest approval",
+        status="completed",
+    )
+    sidecar_server._store_interaction_result(app, session)
+    sidecar_server._store_card_summary(
+        app,
+        SidecarEvent.from_dict(event_payload("message.completed", 1)),
+        session,
+        "om_card_previous_turn",
+    )
+    sidecar_server._store_card_summary(
+        app,
+        SidecarEvent.from_dict(event_payload("message.completed", 1)),
+        session,
+        "om_card",
+    )
+
+    result = cleanup_runtime_state(sidecar_server._cleanup_state_for_app(app), now=3700.0)
+
+    assert result.session_keys == (session_key,)
+    assert result.reasons == ("terminal_retention_expired",)
+    assert result.controllers_collected == 1
+    for state in (
+        app[SESSIONS_KEY],
+        app[SESSION_ALIASES_KEY],
+        app[MESSAGE_LOCKS_KEY],
+        app[FEISHU_MESSAGE_IDS_KEY],
+        app[MESSAGE_BOT_IDS_KEY],
+        app[SESSION_CARD_CONFIGS_KEY],
+        app[FLUSH_CONTROLLERS_KEY],
+    ):
+        assert session_key not in state
+        assert alias_key not in state
+    assert app[CARD_SUMMARIES_KEY] == {}
+    assert app[CARD_SUMMARY_SESSION_KEYS_KEY] == {}
+    assert app[INTERACTION_RESULTS_KEY] == {}
+    assert app[INTERACTION_RESULT_SESSION_KEYS_KEY] == {}
+    assert app[METRICS_KEY].sessions_collected == 1
+    assert app[METRICS_KEY].zombie_sessions_collected == 0
+    assert app[METRICS_KEY].flush_controllers_collected == 1
+    assert session_key not in str(app[DIAGNOSTICS_KEY]["cleanup_history"])
+    assert app[DIAGNOSTICS_KEY]["cleanup_history"][-1]["session_key_hash"]
+
+    assert cleanup_runtime_state(sidecar_server._cleanup_state_for_app(app), now=9999.0).session_keys == ()
+    assert app[METRICS_KEY].sessions_collected == 1
+    assert app[METRICS_KEY].flush_controllers_collected == 1
+
+
+async def test_cleanup_reassigned_alias_keeps_new_session_routable():
+    app = create_app(FakeFeishuClient())
+    old_key = "om_old"
+    new_key = "om_new"
+    old = CardSession("conversation-1", old_key, "oc_abc")
+    old.status = "completed"
+    old.updated_at = 100.0
+    active = CardSession("conversation-1", new_key, "oc_abc")
+    active.updated_at = 3700.0
+    active.answer_text = "active"
+    app[SESSIONS_KEY][old_key] = old
+    app[SESSIONS_KEY][new_key] = active
+    app[FEISHU_MESSAGE_IDS_KEY][new_key] = "om_active_card"
+    app[MESSAGE_BOT_IDS_KEY][new_key] = "profile:default"
+    app[SESSION_CARD_CONFIGS_KEY][new_key] = {"title": "Card"}
+
+    class ReassignedAliases(dict):
+        def __init__(self):
+            super().__init__({"om_reply": new_key})
+            self._first_items_call = True
+
+        def items(self):
+            if self._first_items_call:
+                self._first_items_call = False
+                return (("om_reply", old_key),)
+            return super().items()
+
+    app[SESSION_ALIASES_KEY] = ReassignedAliases()
+    cleanup_runtime_state(sidecar_server._cleanup_state_for_app(app), now=3700.0)
+
+    assert old_key not in app[SESSIONS_KEY]
+    assert app[SESSION_ALIASES_KEY]["om_reply"] == new_key
+    assert app[FEISHU_MESSAGE_IDS_KEY][new_key] == "om_active_card"
+    assert app[MESSAGE_BOT_IDS_KEY][new_key] == "profile:default"
+    assert app[SESSION_CARD_CONFIGS_KEY][new_key] == {"title": "Card"}
+
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "answer.delta",
+                1,
+                {"text": "fresh", "reply_to_message_id": "om_reply"},
+                message_id="om_followup",
+            ),
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body == {"ok": True, "applied": True}
+    assert app[SESSIONS_KEY][new_key] is active
+    assert active.answer_text == "activefresh"
+
+
+async def test_cleanup_runtime_state_keeps_active_interactions_and_inflight_aliases():
+    app = create_app(FakeFeishuClient())
+    interaction_key = "om_interaction"
+    inflight_key = "om_inflight"
+    inflight_alias = "om_inflight_reply"
+    interaction = CardSession("oc_1", interaction_key, "oc_1")
+    interaction.updated_at = 0.0
+    interaction.active_interaction = InteractionState(
+        interaction_id="approval-1",
+        kind="approval",
+        prompt="允许吗？",
+    )
+    inflight = CardSession("oc_1", inflight_key, "oc_1")
+    inflight.status = "failed"
+    inflight.updated_at = 0.0
+    alias_lock = asyncio.Lock()
+    await alias_lock.acquire()
+    app[SESSIONS_KEY].update(
+        {interaction_key: interaction, inflight_key: inflight}
+    )
+    app[SESSION_ALIASES_KEY][inflight_alias] = inflight_key
+    app[MESSAGE_LOCKS_KEY][inflight_alias] = alias_lock
+    sidecar_server._store_interaction_result(app, interaction)
+    inflight.answer_text = "in flight"
+    app[FEISHU_MESSAGE_IDS_KEY][inflight_key] = "om_inflight_card"
+    sidecar_server._store_card_summary(
+        app,
+        SidecarEvent.from_dict(
+            event_payload(
+                "message.failed",
+                1,
+                message_id=inflight_key,
+            )
+        ),
+        inflight,
+        "om_inflight_card",
+    )
+
+    try:
+        result = cleanup_runtime_state(sidecar_server._cleanup_state_for_app(app), now=5000.0)
+    finally:
+        alias_lock.release()
+
+    assert result.session_keys == ()
+    assert set(app[SESSIONS_KEY]) == {interaction_key, inflight_key}
+    assert app[INTERACTION_RESULTS_KEY]["approval-1"]["status"] == "pending"
+    assert app[CARD_SUMMARIES_KEY]["om_inflight_card"]["summary"] == "in flight"
+    assert app[INTERACTION_RESULT_SESSION_KEYS_KEY]["approval-1"] == interaction_key
+    assert app[CARD_SUMMARY_SESSION_KEYS_KEY]["om_inflight_card"] == inflight_key
+    assert app[METRICS_KEY].sessions_collected == 0
+
+
+def test_cleanup_history_is_hashed_and_bounded_to_fifty_entries():
+    app = create_app(FakeFeishuClient())
+    raw_keys = []
+    for index in range(55):
+        session_key = f"private-session-{index}"
+        raw_keys.append(session_key)
+        session = CardSession("oc_1", session_key, "oc_1")
+        session.status = "failed"
+        session.updated_at = 0.0
+        app[SESSIONS_KEY][session_key] = session
+
+    result = cleanup_runtime_state(sidecar_server._cleanup_state_for_app(app), now=3600.0)
+
+    history = app[DIAGNOSTICS_KEY]["cleanup_history"]
+    assert len(result.session_keys) == 55
+    assert len(history) == 50
+    assert app[METRICS_KEY].sessions_collected == 55
+    assert not any(raw_key in str(history) for raw_key in raw_keys)
+
+
+def test_closed_controller_cleanup_requires_same_instance():
+    app = create_app(FakeFeishuClient())
+    session_key = "om_reused"
+    old = FlushController(interval_seconds=0.2, metrics=app[METRICS_KEY])
+    replacement = FlushController(interval_seconds=0.2, metrics=app[METRICS_KEY])
+    old.close()
+    app[FLUSH_CONTROLLERS_KEY][session_key] = replacement
+
+    assert not cleanup_closed_controller(sidecar_server._cleanup_state_for_app(app), session_key, old, now=100.0)
+    assert app[FLUSH_CONTROLLERS_KEY][session_key] is replacement
+    assert app[METRICS_KEY].flush_controllers_collected == 0
+
+
+def test_orphan_message_lock_cleanup_requires_same_instance_and_no_users():
+    app = create_app(FakeFeishuClient())
+    lock_key = "om_failed"
+    old = SimpleNamespace(locked=lambda: False)
+    replacement = SimpleNamespace(locked=lambda: False)
+    app[MESSAGE_LOCKS_KEY][lock_key] = replacement
+
+    assert not cleanup_orphan_message_lock(sidecar_server._cleanup_state_for_app(app), lock_key, old)
+    app[MESSAGE_LOCK_USERS_KEY][lock_key] = 1
+    assert not cleanup_orphan_message_lock(sidecar_server._cleanup_state_for_app(app), lock_key, replacement)
+    assert app[MESSAGE_LOCKS_KEY][lock_key] is replacement
+
+    app[MESSAGE_LOCK_USERS_KEY].pop(lock_key)
+    assert cleanup_orphan_message_lock(sidecar_server._cleanup_state_for_app(app), lock_key, replacement)
+    assert lock_key not in app[MESSAGE_LOCKS_KEY]
+
+
+async def test_terminal_update_removes_its_closed_controller(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+    await wait_for_card_update(feishu_client, "最终答案")
+    for _ in range(20):
+        if "hermes-message-1" not in test_client.app[FLUSH_CONTROLLERS_KEY]:
+            break
+        await _REAL_ASYNCIO_SLEEP(0)
+
+    assert "hermes-message-1" not in test_client.app[FLUSH_CONTROLLERS_KEY]
+    assert test_client.app[METRICS_KEY].flush_controllers_collected == 1
+
+
+@pytest.mark.parametrize("model,provider", [
+    ("openai-codex/gpt-5.5", ""),
+    ("gpt-5.5", "openai-codex"),
+])
+async def test_terminal_update_fetches_configured_subscription_usage_once(monkeypatch, model, provider):
+    feishu_client = FakeFeishuClient()
+    calls = []
+
+    async def fake_fetch(hermes_root):
+        calls.append(hermes_root)
+        return "5h 26% · weekly 89%"
+
+    monkeypatch.setattr(sidecar_server, "fetch_codex_subscription_usage", fake_fetch)
+    app = create_app(
+        feishu_client,
+        card_config={
+            "flush_interval_ms": 0,
+            "footer_fields": ["duration", "subscription_usage"],
+        },
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 1, {
+                "answer": "最终答案", "model": model, "provider": provider,
+            }),
+        )
+        _message_id, card = await wait_for_card_update(
+            feishu_client, "5h 26% · weekly 89%"
+        )
+        await test_client.post("/events", json=event_payload("message.completed", 1, {
+            "answer": "最终答案", "model": model, "provider": provider,
+        }))
+    finally:
+        await test_client.close()
+
+    assert len(calls) == 1
+    assert "最终答案" in str(card)
+
+
+@pytest.mark.parametrize("model,provider", [
+    ("MiniMax-M2.7", "minimax"),
+    ("deepseek/deepseek-v4-pro", ""),
+    ("glm-5", "zai"),
+    ("gpt-5.5", "openai"),
+    ("openrouter/openai/gpt-5.5", ""),
+    ("gpt-5.5", ""),
+    ("Unknown", ""),
+])
+async def test_terminal_update_omits_unrelated_codex_quota(monkeypatch, model, provider):
+    feishu_client = FakeFeishuClient()
+    calls = []
+
+    async def fake_fetch(hermes_root):
+        calls.append(hermes_root)
+        return "5h 26% · weekly 89%"
+
+    monkeypatch.setattr(sidecar_server, "fetch_codex_subscription_usage", fake_fetch)
+    app = create_app(feishu_client, card_config={
+        "flush_interval_ms": 0, "footer_fields": ["model", "subscription_usage"],
+    })
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        response = await test_client.post("/events", json=event_payload("message.completed", 1, {
+            "answer": "本轮完整答案", "model": model, "provider": provider,
+        }))
+        assert await response.json() == {"ok": True, "applied": True}
+        _message_id, card = await wait_for_card_update(feishu_client, "本轮完整答案")
+        assert "weekly" not in str(card)
+        assert "5h 26%" not in str(card)
+        assert calls == []
+    finally:
+        await test_client.close()
+
+
+async def test_switching_away_from_codex_does_not_carry_quota_to_next_turn(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    calls = []
+
+    async def fake_fetch(hermes_root):
+        calls.append(hermes_root)
+        return "5h 26% · weekly 89%"
+
+    monkeypatch.setattr(sidecar_server, "fetch_codex_subscription_usage", fake_fetch)
+    app = create_app(feishu_client, card_config={
+        "flush_interval_ms": 0, "footer_fields": ["model", "subscription_usage"],
+    })
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        for index, model in enumerate(("openai-codex/gpt-5.5", "deepseek/deepseek-v4-pro")):
+            message_id = f"quota-turn-{index}"
+            await test_client.post("/events", json=event_payload(
+                "message.started", 0, message_id=message_id,
+            ))
+            await test_client.post("/events", json=event_payload(
+                "message.completed", 1, {"answer": f"完整答案 {index}", "model": model},
+                message_id=message_id,
+            ))
+            _message_id, card = await wait_for_card_update(feishu_client, f"完整答案 {index}")
+            assert ("weekly 89%" in str(card)) is (index == 0)
+        assert len(calls) == 1
+        assert len(feishu_client.sent) == 2
+    finally:
+        await test_client.close()
+
+
+async def test_late_codex_quota_is_discarded_when_model_identity_changes(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_fetch(_hermes_root):
+        started.set()
+        await release.wait()
+        return "5h 26% · weekly 89%"
+
+    monkeypatch.setattr(sidecar_server, "fetch_codex_subscription_usage", delayed_fetch)
+    app = create_app(FakeFeishuClient(), card_config={"footer_fields": ["subscription_usage"]})
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    session.status = "completed"
+    session.model = "openai-codex/gpt-5.5"
+    pending = asyncio.create_task(sidecar_server._populate_subscription_usage(app, session))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        session.model = "deepseek/deepseek-v4-pro"
+    finally:
+        release.set()
+        await pending
+    assert session.subscription_usage == ""
+
+
+async def test_late_subscription_usage_cannot_change_terminal_card_disposition(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+
+    async def oversized_fetch(_hermes_root):
+        await asyncio.sleep(0.05)
+        return "SENSITIVE-USAGE-" + ("密" * 40_000)
+
+    monkeypatch.setattr(
+        sidecar_server,
+        "fetch_codex_subscription_usage",
+        oversized_fetch,
+    )
+    app = create_app(
+        feishu_client,
+        card_config={
+            "flush_interval_ms": 0,
+            "footer_fields": ["duration", "subscription_usage"],
+        },
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        started_at = asyncio.get_running_loop().time()
+        completed = await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 1, {
+                "answer": "最终答案", "model": "openai-codex/gpt-5.5",
+            }),
+        )
+        completed_body = await completed.json()
+        elapsed = asyncio.get_running_loop().time() - started_at
+        _message_id, card = await wait_for_card_update(feishu_client, "最终答案")
+    finally:
+        await test_client.close()
+
+    assert completed_body == {"ok": True, "applied": True}
+    assert elapsed < 0.04
+    assert "SENSITIVE-USAGE" not in str(card)
+    assert inspect_card_limits(card).safe is True
+
+
+async def test_terminal_update_does_not_fetch_unconfigured_subscription_usage(
+    client, monkeypatch
+):
+    test_client, feishu_client = client
+
+    async def unexpected_fetch(_hermes_root):
+        raise AssertionError("subscription usage should remain opt-in")
+
+    monkeypatch.setattr(
+        sidecar_server, "fetch_codex_subscription_usage", unexpected_fetch
+    )
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+
+    _message_id, card = await wait_for_card_update(feishu_client, "最终答案")
+
+    assert "weekly" not in str(card)
+
+
+async def test_terminal_task_exception_still_removes_closed_controller_once(caplog):
+    app = create_app(FakeFeishuClient())
+    session_key = "om_terminal_error"
+    controller = FlushController(interval_seconds=0.2, metrics=app[METRICS_KEY])
+    controller.close()
+    app[FLUSH_CONTROLLERS_KEY][session_key] = controller
+
+    async def fail_update():
+        raise RuntimeError("terminal update failed")
+
+    task = asyncio.create_task(fail_update())
+    with pytest.raises(RuntimeError, match="terminal update failed"):
+        await task
+
+    sidecar_server._post_terminal_cleanup(app, session_key, controller, task)
+    sidecar_server._post_terminal_cleanup(app, session_key, controller, task)
+
+    assert session_key not in app[FLUSH_CONTROLLERS_KEY]
+    assert app[METRICS_KEY].flush_controllers_collected == 1
+    assert "terminal card update task failed" in caplog.text
+
+
+async def test_terminal_task_cancel_preserves_replacement_controller():
+    app = create_app(FakeFeishuClient())
+    session_key = "om_terminal_reused"
+    old = FlushController(interval_seconds=0.2, metrics=app[METRICS_KEY])
+    replacement = FlushController(interval_seconds=0.2, metrics=app[METRICS_KEY])
+    old.close()
+    app[FLUSH_CONTROLLERS_KEY][session_key] = replacement
+
+    task = asyncio.create_task(asyncio.sleep(60))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    sidecar_server._post_terminal_cleanup(app, session_key, old, task)
+
+    assert app[FLUSH_CONTROLLERS_KEY][session_key] is replacement
+    assert app[METRICS_KEY].flush_controllers_collected == 0
+
+
+async def test_runtime_cleanup_starts_one_sixty_second_task_and_cancels_it(monkeypatch):
+    delays = []
+    second_sleep_started = asyncio.Event()
+
+    async def fake_cleanup_sleep(delay):
+        delays.append(delay)
+        if len(delays) == 1:
+            return
+        second_sleep_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sidecar_server, "_cleanup_sleep", fake_cleanup_sleep)
+    app = create_app(FakeFeishuClient())
+    zombie = CardSession("oc_1", "om_zombie", "oc_1")
+    zombie.updated_at = 0.0
+    app[SESSIONS_KEY]["om_zombie"] = zombie
+    test_client = TestClient(TestServer(app))
+
+    await test_client.start_server()
+    task = app[CLEANUP_TASK_KEY]
+    await asyncio.wait_for(second_sleep_started.wait(), timeout=1.0)
+    try:
+        assert delays == [
+            RUNTIME_CLEANUP_INTERVAL_SECONDS,
+            RUNTIME_CLEANUP_INTERVAL_SECONDS,
+        ]
+        assert RUNTIME_CLEANUP_INTERVAL_SECONDS == 60.0
+        assert "om_zombie" not in app[SESSIONS_KEY]
+        assert app[METRICS_KEY].zombie_sessions_collected == 1
+        assert not task.done()
+    finally:
+        await test_client.close()
+
+    assert task.cancelled()
+
+
+async def test_hfc_help_command_sends_read_only_diagnostic_card(client):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/commands",
+        json={
+            "command": "help",
+            "chat_id": "oc_secret_chat",
+            "message_id": "om_secret_message",
+            "thread_id": "omt_secret_thread",
+        },
+    )
+
+    assert response.status == 200
+    body = await response.json()
+    assert body == {"ok": True, "handled": True, "command": "help"}
+    assert len(feishu_client.sent) == 1
+    chat_id, card, thread_id, reply_to_message_id = feishu_client.sent[0]
+    assert chat_id == "oc_secret_chat"
+    assert thread_id == "omt_secret_thread"
+    assert reply_to_message_id == "om_secret_message"
+    content = str(card)
+    assert "/hfc status" in content
+    assert "/hfc doctor" in content
+    assert "/hfc monitor" in content
+    assert "oc_secret_chat" not in content
+    assert "om_secret_message" not in content
+    assert "omt_secret_thread" not in content
+
+
+async def test_private_update_command_sends_signed_confirmation_and_dispatches_once(
+    monkeypatch,
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    inspection = sidecar_server.UpdateInspection(
+        ready=True,
+        reason_code="ready",
+        current_version="0.19.1",
+        current_head="f3cda0ce",
+        target_summary="0.19.2 available",
+        target_fingerprint="a" * 64,
+        hfc_version="4.2.0",
+        artifact_sha256="b" * 64,
+        active_sessions=0,
+        requires_drain=False,
+        hook_state="installed",
+        hook_fingerprint="c" * 64,
+        maintenance_ready=True,
+        changed_paths=(),
+        created_at=100.0,
+        target_head="e" * 40,
+    )
+
+    async def inspect_for_app(app):
+        return inspection
+
+    launched = []
+    monkeypatch.setattr(
+        sidecar_server, "_inspect_update_for_app", inspect_for_app
+    )
+    def schedule_update_job(app, operation):
+        assert any(
+            "正在准备更新" in str(card)
+            for _message_id, card in feishu_client.updated
+        )
+        launched.append(operation.operation_id)
+
+    monkeypatch.setattr(
+        sidecar_server,
+        "_schedule_update_job",
+        schedule_update_job,
+    )
+    maintenance_root = tmp_path / "maintenance"
+    selected_maintenance_paths = sidecar_server.maintenance_paths(maintenance_root)
+    monkeypatch.setattr(
+        sidecar_server,
+        "maintenance_paths",
+        lambda: selected_maintenance_paths,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "_reserve_update_job_for_operation",
+        lambda app, operation, *, owner_id, paths: sidecar_server.reserve_drain_lease(
+            paths, owner_id=owner_id
+        ),
+    )
+    app = create_app(feishu_client, expected_runtime_package_version="4.2.0")
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_update",
+                    "chat_type": "private",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        body = await response.json()
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        confirmation = next(
+            column["elements"][0]["behaviors"][0]["value"]
+            for element in card["body"]["elements"]
+            if element.get("tag") == "column_set"
+            for column in element["columns"]
+            if column["elements"][0]["text"]["content"] == "确认更新"
+        )
+        action = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                confirmation,
+                chat_id="oc_private",
+                operator="ou_owner",
+            ),
+        )
+        action_body = await action.json()
+        await _wait_until(lambda: bool(launched))
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body["command"] == "update"
+    assert body["operation_id"]
+    assert "确认更新 Hermes" in str(card)
+    assert action.status == 200
+    assert action_body["toast"]["content"] == "正在准备更新"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
+    assert launched == [body["operation_id"]]
+
+
+async def test_private_update_cancel_publishes_terminal_card_after_callback_ack(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    inspection = sidecar_server.UpdateInspection(
+        ready=True,
+        reason_code="ready",
+        current_version="0.19.1",
+        current_head="f3cda0ce",
+        target_summary="0.19.2 available",
+        target_fingerprint="a" * 64,
+        hfc_version="4.2.2",
+        artifact_sha256="b" * 64,
+        active_sessions=0,
+        requires_drain=False,
+        hook_state="installed",
+        hook_fingerprint="c" * 64,
+        maintenance_ready=True,
+        changed_paths=(),
+        created_at=100.0,
+        target_head="e" * 40,
+    )
+
+    async def inspect_for_app(app):
+        return inspection
+
+    monkeypatch.setattr(
+        sidecar_server, "_inspect_update_for_app", inspect_for_app
+    )
+    app = create_app(feishu_client, expected_runtime_package_version="4.2.2")
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        command = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_update_cancel",
+                    "chat_type": "private",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        confirmation_card = feishu_client.sent[0][1]
+        cancel_value = operations_button(confirmation_card, "取消")
+
+        cancelled = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                cancel_value,
+                chat_id="oc_private",
+                operator="ou_owner",
+            ),
+        )
+        cancelled_body = await cancelled.json()
+        await _wait_until(
+            lambda: any(
+                "已取消更新" in str(card)
+                for _message_id, card in feishu_client.updated
+            )
+        )
+    finally:
+        await test_client.close()
+
+    assert command.status == 200
+    assert cancelled.status == 200
+    assert cancelled_body["toast"]["content"] == "已取消更新"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
+
+
+def test_gateway_runtime_update_evidence_requires_fresh_v2_telemetry():
+    valid = {
+        "status": "ready",
+        "runtime_id_hash": "a" * 64,
+        "last_sequence": 3,
+        "active_sessions": 0,
+        "admission_draining": False,
+        "active_work_count_complete": True,
+        "drain_home_verified": True,
+    }
+
+    assert sidecar_server._gateway_runtime_update_evidence(valid) == (True, 0)
+    for key, value in (
+        ("status", "degraded"),
+        ("runtime_id_hash", ""),
+        ("last_sequence", 0),
+        ("active_sessions", None),
+        ("admission_draining", None),
+        ("active_work_count_complete", None),
+        ("drain_home_verified", None),
+    ):
+        changed = dict(valid)
+        changed[key] = value
+        assert sidecar_server._gateway_runtime_update_evidence(changed) == (
+            False,
+            0,
+        )
+
+
+def test_update_confirmation_creates_durable_job_before_admission_fence(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    inspection = SimpleNamespace(
+        ready=True,
+        current_version="0.19.1",
+        current_head="a" * 40,
+        target_fingerprint="b" * 64,
+        target_head="c" * 40,
+    )
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        update_inspection=inspection,
+        profile_id="default",
+        chat_id="oc_private",
+        owner_open_id="ou_owner",
+    )
+    supervisor = SimpleNamespace(
+        snapshot=lambda: {
+            "status": "ready",
+            "runtime_id_hash": "d" * 64,
+            "last_sequence": 2,
+            "active_sessions": 0,
+            "admission_draining": False,
+            "active_work_count_complete": True,
+            "drain_home_verified": True,
+        }
+    )
+    app = {
+        sidecar_server.OPERATIONS_DELIVERIES_KEY: {
+            operation.operation_id: {
+                "message_id": "om_card",
+                "bot_id": "default",
+            }
+        },
+        sidecar_server.PACKAGE_VERSION_KEY: "4.2.0",
+        sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY: supervisor,
+        sidecar_server.OPERATIONS_HERMES_ROOT_KEY: tmp_path / "hermes",
+        sidecar_server.OPERATIONS_HERMES_HOME_KEY: tmp_path,
+        sidecar_server.OPERATIONS_CONFIG_PATH_KEY: tmp_path / "config.yaml",
+        sidecar_server.OPERATIONS_ENV_FILE_KEY: None,
+    }
+    artifact = SimpleNamespace(version="4.2.0")
+    job = SimpleNamespace(path=tmp_path / "job.json")
+    monkeypatch.setattr(
+        sidecar_server,
+        "load_verified_artifact",
+        lambda *_args, **_kwargs: artifact,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "create_job",
+        lambda *_args, **_kwargs: calls.append("job") or job,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "reserve_drain_lease",
+        lambda *_args, **_kwargs: calls.append("lease"),
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "set_gateway_external_drain",
+        lambda *_args, **_kwargs: calls.append("native-drain") or True,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "stage_job_credentials",
+        lambda *_args, **_kwargs: calls.append("credentials"),
+    )
+
+    sidecar_server._reserve_update_job_for_operation(
+        app,
+        operation,
+        owner_id=operation.operation_id,
+        paths=SimpleNamespace(),
+    )
+
+    assert calls == ["job", "lease", "native-drain", "credentials"]
+
+
+async def test_update_command_rejects_group_and_missing_operator():
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        group = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_group",
+                    "message_id": "om_group_update",
+                    "chat_type": "group",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        missing = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_private_update",
+                    "chat_type": "private",
+                }
+            ),
+        )
+    finally:
+        await test_client.close()
+
+    assert group.status == 403
+    assert missing.status == 403
+
+
+async def test_hfc_command_request_returns_before_slow_feishu_send():
+    class BlockingFeishuClient(FakeFeishuClient):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def send_card(
+            self,
+            chat_id,
+            card,
+            thread_id=None,
+            reply_to_message_id=None,
+            reply_in_thread=False,
+        ):
+            self.started.set()
+            await self.release.wait()
+            return await super().send_card(
+                chat_id,
+                card,
+                thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+                reply_in_thread=reply_in_thread,
+            )
+
+    feishu_client = BlockingFeishuClient()
+    app = create_app(feishu_client)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    post_task = asyncio.create_task(
+        test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "status",
+                "chat_id": "oc_secret_chat",
+                "message_id": "om_secret_message",
+            }),
+        )
+    )
+    try:
+        await asyncio.wait_for(feishu_client.started.wait(), timeout=1.0)
+        try:
+            response = await asyncio.wait_for(asyncio.shield(post_task), timeout=0.05)
+        except asyncio.TimeoutError as exc:
+            raise AssertionError("/commands waited for Feishu card delivery") from exc
+        body = await response.json()
+        assert response.status == 200
+        assert body == {"ok": True, "handled": True, "command": "status"}
+        assert feishu_client.sent == []
+
+        feishu_client.release.set()
+        for _ in range(80):
+            if feishu_client.sent:
+                break
+            await _REAL_ASYNCIO_SLEEP(0.01)
+        assert len(feishu_client.sent) == 1
+    finally:
+        feishu_client.release.set()
+        await post_task
+        await test_client.close()
+
+
+async def test_hfc_status_group_unbound_shows_binding_hint_and_slash_guidance():
+    factory = FakeFeishuClientFactory()
+
+    def bot_router(event):
+        assert event.data["chat_type"] == "group"
+        return RouteResult(
+            "default",
+            "bindings.fallback_bot",
+            metadata={
+                "group": {
+                    "is_group": True,
+                    "enabled": True,
+                    "chat_bound": False,
+                    "chat_allowed": True,
+                    "require_mention": True,
+                }
+            },
+        )
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "status",
+                "chat_id": "oc_group",
+                "message_id": "om_group_status",
+                "data": {"chat_type": "group"},
+            }),
+        )
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert len(factory.clients["default"].sent) == 1
+    card = factory.clients["default"].sent[0][1]
+    content = str(card)
+    assert "当前群未绑定" in content
+    assert "oc_group" not in content
+    assert "bots bind-chat CHAT_ID default" in content
+    assert "群内 slash command" in content
+    assert "Hermes @/白名单" in content
+    assert "所有非空文本反馈使用独立命令卡片" in content
+
+
+async def test_hfc_monitor_command_reports_safe_metrics(client):
+    test_client, feishu_client = client
+    metrics = test_client.app[sidecar_server.METRICS_KEY]
+    metrics.events_received = 3
+    metrics.update_coalesced = 2
+    metrics.update_queue_peak = 4
+    metrics.table_compactions = 2
+    metrics.card_native_handoffs = 1
+
+    response = await test_client.post(
+        "/commands",
+        json={
+            "command": "monitor",
+            "chat_id": "oc_monitor_secret",
+            "message_id": "om_monitor_secret",
+        },
+    )
+
+    assert response.status == 200
+    assert (await response.json()) == {
+        "ok": True,
+        "handled": True,
+        "command": "monitor",
+    }
+    assert len(feishu_client.sent) == 1
+    content = str(feishu_client.sent[0][1])
+    assert "events_received: 3" in content
+    assert "update_coalesced: 2" in content
+    assert "update_queue_peak: 4" in content
+    assert "table_compactions: 2" in content
+    assert "card_native_handoffs: 1" in content
+    assert "active_sessions: 0" in content
+    assert "oc_monitor_secret" not in content
+    assert "om_monitor_secret" not in content
+
+
+async def test_hfc_operational_commands_surface_native_handoff_manual_review_safely(monkeypatch):
+    # This verifies safe command delivery, not the developer's installed Hermes.
+    # Keep doctor deterministic and away from the real runtime/configuration.
+    monkeypatch.setattr(
+        sidecar_server, "_build_operations_report_sync",
+        lambda *args, **kwargs: (operations_report(), SimpleNamespace(root=Path("/fixture/hermes"))),
+    )
+    feishu_client = FakeFeishuClient()
+    native_handoff_store = SimpleNamespace(
+        safe_status=lambda: {
+            "records": 4,
+            "delivery_states": {
+                "pending": 2,
+                "acked": 1,
+                "uncertain": 1,
+            },
+            "manual_review_required": True,
+            "next_action": "review_native_delivery_before_manual_retry",
+            "raw_identifier": "oc_must_not_leak",
+        }
+    )
+    app = create_app(
+        feishu_client,
+        native_handoff_store=native_handoff_store,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+
+    try:
+        for command in ("status", "doctor", "monitor"):
+            response = await test_client.post(
+                "/commands",
+                json=signed_operations_command({
+                    "command": command,
+                    "chat_id": f"oc_{command}_secret",
+                    "message_id": f"om_{command}_secret",
+                }),
+            )
+
+            assert response.status == 200
+            async def own_card(command=command):
+                while True:
+                    for chat_id, card, _thread_id, reply_id in feishu_client.sent:
+                        if (
+                            chat_id == f"oc_{command}_secret"
+                            and reply_id == f"om_{command}_secret"
+                        ):
+                            return card
+                    await _REAL_ASYNCIO_SLEEP(0.005)
+
+            card = await asyncio.wait_for(own_card(), timeout=5)
+            content = str(card)
+            if command == "doctor":
+                assert "运行诊断" in content
+            assert inspect_card_limits(card).safe
+            assert "native_handoff.records: 4" in content
+            assert "native_handoff.pending: 2" in content
+            assert "native_handoff.uncertain: 1" in content
+            assert "native_handoff.manual_review_required: true" in content
+            assert "native_handoff.next_action:" in content
+            assert "先确认飞书原生会话是否已收到答案" in content
+            assert "oc_must_not_leak" not in content
+    finally:
+        await test_client.close()
+
+
+def test_hfc_readiness_lines_expose_sanitized_integrity_coordinator_action():
+    request = SimpleNamespace(
+        app={
+            sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY: SimpleNamespace(
+                snapshot=lambda: {
+                    "status": "ready",
+                    "reason": "runtime_ready",
+                    "integrity_mode": "notify",
+                    "restart_required": False,
+                }
+            ),
+            sidecar_server.RUNTIME_INTEGRITY_COORDINATOR_KEY: SimpleNamespace(
+                snapshot=lambda: {
+                    "mode": "notify",
+                    "last_status": "repair_available",
+                    "last_reason": "verified_git_upgrade",
+                    "repair_attempts": 0,
+                    "repair_successes": 0,
+                    "repair_refusals": 1,
+                    "private_path": "/private/secret",
+                }
+            ),
+        }
+    )
+
+    content = "\n".join(sidecar_server._hfc_readiness_lines(request))
+
+    assert "integrity.status: repair_available" in content
+    assert "integrity.reason: verified_git_upgrade" in content
+    assert "integrity.repair_refusals: 1" in content
+    assert "integrity.next_action:" in content
+    assert "integrity migrate-safe" in content
+    assert "/private/secret" not in content
+
+
+async def test_hfc_doctor_sends_group_owned_operations_card(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, detection),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_group",
+                "message_id": "om_doctor",
+                "chat_type": "group",
+                "operator": "ou_initiator",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        repair = operations_button(card, "安全修复")
+        rejected = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(repair, operator="ou_other"),
+        )
+        body = await rejected.json()
+        accepted = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(repair, operator="ou_initiator"),
+        )
+        confirm = operations_button((await accepted.json())["card"], "确认修复")
+        rejected_confirm = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(confirm, operator="ou_other"),
+        )
+        rejected_confirm_body = await rejected_confirm.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert rejected.status == 200
+    assert body["ok"] is False
+    assert rejected_confirm_body["ok"] is False
+    assert operations_button(rejected_confirm_body["card"], "确认修复")
+    assert "ou_initiator" not in str(card)
+    assert "oc_group" not in str(card)
+    assert operations_button(body["card"], "安全修复")
+
+
+async def test_operations_diagnosis_receives_sanitized_runtime_readiness(monkeypatch):
+    captured = {}
+    report = operations_report()
+
+    def build_report(*args, **_kwargs):
+        captured.update(args[4])
+        return report, SimpleNamespace(root=Path("/sanitized"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", build_report)
+    app = create_app(
+        FakeFeishuClient(),
+        operations_transport_root_secret=b"r" * 32,
+        integrity_mode="safe",
+        expected_runtime_package_version="4.1.0",
+    )
+    app[sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY].mark_manual_review_required()
+    try:
+        await sidecar_server._build_operations_report(
+            app,
+            profile_id="default",
+            profile_source="default",
+        )
+    finally:
+        await sidecar_server._stop_operations_diagnostics(app)
+
+    assert captured["readiness"]["status"] == "degraded"
+    assert captured["readiness"]["reason"] == "manual_review_required"
+    assert captured["integrity"]["mode"] == "safe"
+    assert "runtime_id" not in captured["readiness"]
+    assert isinstance(captured["readiness"]["runtime_id_hash"], str)
+    assert "fingerprint" not in json.dumps(captured)
+
+
+async def test_hfc_doctor_acknowledges_before_slow_diagnosis_and_binds_operation(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+
+    def slow_report(*args, **kwargs):
+        time.sleep(1.0)
+        return report, detection
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", slow_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = time.monotonic()
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_slow_doctor",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        elapsed = time.monotonic() - started
+        body = await response.json()
+        operation_id = body["operation_id"]
+        store = app[sidecar_server.OPERATIONS_STORE_KEY]
+        record = store._records[operation_id]
+
+        assert elapsed < 0.8
+        assert record.state == "preparing"
+        assert operation_id in store._transport_secrets
+
+        await _wait_until(lambda: bool(feishu_client.sent), attempts=160)
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body["ok"] is True
+    assert body["handled"] is True
+    assert feishu_client.sent[0][0] == "oc_private"
+
+
+async def test_hfc_doctor_reuses_preparing_operation_and_starts_one_diagnosis(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    calls = []
+
+    def build_report(*args, **kwargs):
+        calls.append(True)
+        time.sleep(0.05)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", build_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        payload = {
+            "command": "doctor",
+            "chat_id": "oc_private",
+            "message_id": "om_duplicate_doctor",
+            "chat_type": "private",
+        }
+        first = await test_client.post(
+            "/commands", json=signed_operations_command(payload)
+        )
+        second = await test_client.post(
+            "/commands", json=signed_operations_command(payload)
+        )
+        first_body = await first.json()
+        second_body = await second.json()
+        await _wait_until(lambda: bool(feishu_client.sent))
+    finally:
+        await test_client.close()
+
+    assert first_body["operation_id"] == second_body["operation_id"]
+    assert calls == [True]
+    assert len(feishu_client.sent) == 1
+
+
+async def test_hfc_doctor_marks_background_failure_without_exception_details(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+
+    def fail_report(*args, **kwargs):
+        raise RuntimeError("private-token-should-not-appear")
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", fail_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_failing_doctor",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        operation_id = (await response.json())["operation_id"]
+        await _wait_until(lambda: bool(feishu_client.sent))
+        record = app[sidecar_server.OPERATIONS_STORE_KEY]._records[operation_id]
+    finally:
+        await test_client.close()
+
+    assert record.state == "failed"
+    assert "private-token-should-not-appear" not in str(feishu_client.sent)
+    assert "诊断暂时不可用" in str(feishu_client.sent[0][1])
+
+
+async def test_hfc_doctor_timeout_marks_failed_and_releases_store_capacity(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    started = threading.Event()
+    release = threading.Event()
+    first_finished = threading.Event()
+    calls = []
+
+    def blocked_report(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            started.set()
+            release.wait(1.0)
+            first_finished.set()
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS", 0.02, raising=False)
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    app = create_app(feishu_client)
+    app[sidecar_server.OPERATIONS_STORE_KEY] = OperationStore(
+        secret=b"store", max_records=1
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        first = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_timeout_first",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        first_operation_id = (await first.json())["operation_id"]
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1.0)
+        await _wait_until(lambda: bool(feishu_client.sent), attempts=40)
+        failed = app[sidecar_server.OPERATIONS_STORE_KEY]._records[first_operation_id]
+        second = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_timeout_second",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        second_operation_id = (await second.json())["operation_id"]
+        await _wait_until(lambda: len(feishu_client.sent) == 2)
+        release.set()
+        await asyncio.wait_for(asyncio.to_thread(first_finished.wait), timeout=1.0)
+        await _wait_until(
+            lambda: not app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]
+        )
+    finally:
+        release.set()
+        await test_client.close()
+
+    assert failed.state == "failed"
+    assert "诊断暂时不可用" in str(feishu_client.sent[0][1])
+    assert second.status == 200
+    assert len(feishu_client.sent) == 2
+    assert set(app[sidecar_server.OPERATIONS_STORE_KEY]._records) == {
+        second_operation_id
+    }
+
+
+async def test_hfc_doctor_diagnostics_do_not_queue_beyond_executor_workers(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocked_report(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS:
+            started.set()
+        release.wait(1.0)
+        return operations_report(), SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        executor = app[sidecar_server.OPERATIONS_DIAGNOSTIC_EXECUTOR_KEY]
+        responses = await asyncio.gather(
+            *[
+                test_client.post(
+                    "/commands",
+                    json=signed_operations_command(
+                        {
+                            "command": "doctor",
+                            "chat_id": "oc_private",
+                            "message_id": f"om_bounded_{index}",
+                            "chat_type": "private",
+                        }
+                    ),
+                )
+                for index in range(
+                    sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS + 1
+                )
+            ]
+        )
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1.0)
+        await _wait_until(
+            lambda: len(feishu_client.sent)
+            == sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS + 1,
+            attempts=80,
+        )
+    finally:
+        release.set()
+        await test_client.close()
+
+    assert all(response.status == 200 for response in responses)
+    assert executor._max_workers == sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS
+    assert len(calls) == sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS
+
+
+async def test_hfc_doctor_timeout_includes_waiting_for_diagnostic_slot(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    monkeypatch.setattr(sidecar_server, "OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS", 0.02)
+    app = create_app(feishu_client)
+    semaphore = sidecar_server._operations_diagnostic_semaphore(app)
+    for _ in range(sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS):
+        await semaphore.acquire()
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_waiting_timeout",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        operation_id = (await response.json())["operation_id"]
+        tasks = app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]
+        await _wait_until(lambda: bool(tasks), attempts=200)
+        await asyncio.wait_for(asyncio.shield(next(iter(tasks))), timeout=2.0)
+        record = app[sidecar_server.OPERATIONS_STORE_KEY]._records[operation_id]
+    finally:
+        for _ in range(sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS):
+            semaphore.release()
+        await test_client.close()
+
+    assert response.status == 200
+    assert record.state == "failed"
+
+
+async def test_recheck_returns_immediately_when_diagnostic_executor_is_busy(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, SimpleNamespace(root=Path("/private/hermes"))),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_busy_action",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        recheck = operations_button(feishu_client.sent[0][1], "重新检测")
+        futures = app[sidecar_server.OPERATIONS_DIAGNOSTIC_FUTURES_KEY]
+        futures.update(
+            range(sidecar_server.MAX_CONCURRENT_OPERATION_DIAGNOSTICS)
+        )
+        response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(recheck, chat_id="oc_private"),
+        )
+        body = await response.json()
+        await wait_for_card_update(feishu_client, "诊断暂时不可用")
+        record = app[sidecar_server.OPERATIONS_STORE_KEY].current_successor(
+            body["operation_id"]
+        )
+    finally:
+        futures.clear()
+        await test_client.close()
+
+    assert response.status == 200
+    assert "正在重新检测" in str(body["card"])
+    assert record is not None
+    assert record.state == "failed"
+    assert operations_button(feishu_client.updated[-1][1], "重新检测")
+
+
+async def test_recheck_callback_returns_preparing_card_before_blocked_report_and_patches_same_card(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    recheck_started = threading.Event()
+    release_recheck = threading.Event()
+    calls = []
+
+    def blocked_report(*args, **kwargs):
+        calls.append(args[3])
+        if args[3] == "fallback_default":
+            recheck_started.set()
+            release_recheck.wait(2.0)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_fast_recheck",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        recheck = operations_button(feishu_client.sent[0][1], "重新检测")
+        original_id = next(iter(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]))
+        started = time.monotonic()
+        first = await asyncio.wait_for(
+            test_client.post(
+                "/card/actions",
+                json=operations_action_payload(recheck, chat_id="oc_private"),
+            ),
+            timeout=0.5,
+        )
+        elapsed = time.monotonic() - started
+        first_body = await first.json()
+        await asyncio.wait_for(asyncio.to_thread(recheck_started.wait), timeout=1.0)
+        repeated = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(recheck, chat_id="oc_private"),
+        )
+        repeated_body = await repeated.json()
+        release_recheck.set()
+        await wait_for_card_update(feishu_client, "诊断摘要")
+    finally:
+        release_recheck.set()
+        await test_client.close()
+
+    assert elapsed < 0.5
+    assert "正在重新检测" in str(first_body["card"])
+    assert first_body["operation_id"] == repeated_body["operation_id"]
+    assert first_body["operation_id"] != original_id
+    assert calls == ["", "fallback_default"]
+    assert len(feishu_client.sent) == 1
+    assert len(feishu_client.updated) == 3
+    assert "正在重新检测" in str(feishu_client.updated[0][1])
+    assert "诊断摘要" in str(feishu_client.updated[-1][1])
+
+
+async def test_same_fingerprint_slow_recheck_patch_keeps_one_worker_and_links_old_token(
+    monkeypatch,
+):
+    feishu_client = ControlledOperationsUpdateClient()
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    report = operations_report()
+    calls = []
+    unexpected_second_recheck = asyncio.Event()
+
+    def build_report(*args, **_kwargs):
+        profile_source = args[3]
+        calls.append(profile_source)
+        if profile_source == "fallback_default" and calls.count("fallback_default") > 1:
+            unexpected_second_recheck.set()
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", build_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_slow_recheck",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        recheck = operations_button(feishu_client.sent[0][1], "重新检测")
+        first = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(recheck, chat_id="oc_private"),
+        )
+        first_body = await first.json()
+        preparing_id = first_body["operation_id"]
+        old_preparing_recheck = operations_button(first_body["card"], "重新检测")
+        active_transport_secret = app[
+            sidecar_server.OPERATIONS_STORE_KEY
+        ]._transport_secrets[preparing_id]
+        await asyncio.wait_for(feishu_client.update_started.wait(), timeout=1.0)
+
+        repeated = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                old_preparing_recheck,
+                chat_id="oc_private",
+                transport_secret=active_transport_secret,
+            ),
+        )
+        repeated_body = await repeated.json()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(unexpected_second_recheck.wait(), timeout=0.1)
+
+        feishu_client.release_update.set()
+        await _wait_until(
+            lambda: not app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]
+        )
+        after_failure = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                old_preparing_recheck,
+                chat_id="oc_private",
+                transport_secret=active_transport_secret,
+            ),
+        )
+        after_failure_body = await after_failure.json()
+    finally:
+        feishu_client.release_update.set()
+        await test_client.close()
+
+    assert first.status == 200
+    assert repeated.status == 200
+    assert after_failure.status == 200
+    assert calls == ["", "fallback_default"]
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+
+    def record_for(operation_id):
+        return store._records.get(operation_id) or store._recheck_predecessors.get(
+            operation_id
+        )
+
+    preparing = record_for(preparing_id)
+    repeated_record = record_for(repeated_body["operation_id"])
+    after_failure_record = record_for(after_failure_body["operation_id"])
+    assert preparing is not None
+    assert repeated_record is not None
+    assert after_failure_record is not None
+    assert repeated_record.transport_lineage_id == preparing.transport_lineage_id
+    assert after_failure_record.transport_lineage_id == preparing.transport_lineage_id
+    assert "诊断摘要" in str(after_failure_body["card"])
+
+
+async def test_snapshot_actions_never_rebuild_a_report(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    calls = []
+
+    def build_report(*args, **kwargs):
+        calls.append(True)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", build_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_snapshot_actions",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        details = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button(card, "查看诊断"), chat_id="oc_private"
+            ),
+        )
+        repair = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button((await details.json())["card"], "安全修复"),
+                chat_id="oc_private",
+            ),
+        )
+        cancelled = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button((await repair.json())["card"], "取消"),
+                chat_id="oc_private",
+            ),
+        )
+        dismissed = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button((await cancelled.json())["card"], "暂不处理"),
+                chat_id="oc_private",
+            ),
+        )
+        assert (await dismissed.json())["ok"] is True
+    finally:
+        await test_client.close()
+
+    assert calls == [True]
+
+
+async def test_confirm_repair_returns_executing_card_before_fresh_evidence_and_runs_once(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    fresh_started = threading.Event()
+    release_fresh = threading.Event()
+    executions = []
+    calls = []
+
+    def blocked_report(*args, **kwargs):
+        calls.append(args[3])
+        if args[3] == "fallback_default":
+            fresh_started.set()
+            release_fresh.wait(2.0)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: executions.append(args) or SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda _command: None)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_fast_confirm",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        confirmation = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(repair, chat_id="oc_private"),
+        )
+        confirm = operations_button((await confirmation.json())["card"], "确认修复")
+        started = time.monotonic()
+        first = await asyncio.wait_for(
+            test_client.post(
+                "/card/actions",
+                json=operations_action_payload(confirm, chat_id="oc_private"),
+            ),
+            timeout=0.5,
+        )
+        elapsed = time.monotonic() - started
+        first_body = await first.json()
+        await asyncio.wait_for(asyncio.to_thread(fresh_started.wait), timeout=1.0)
+        repeated = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(confirm, chat_id="oc_private"),
+        )
+        repeated_body = await repeated.json()
+        release_fresh.set()
+        await wait_for_card_update(feishu_client, "安全修复已完成")
+    finally:
+        release_fresh.set()
+        await test_client.close()
+
+    assert elapsed < 0.5
+    assert "正在安全修复" in str(first_body["card"])
+    assert first_body["operation_id"] == repeated_body["operation_id"]
+    assert calls == ["", "fallback_default", "fallback_default"]
+    assert len(executions) == 1
+    assert len(feishu_client.sent) == 1
+    assert len(feishu_client.updated) == 4
+    assert "确认安全修复" in str(feishu_client.updated[0][1])
+    assert any("正在安全修复" in str(card) for _message_id, card in feishu_client.updated)
+    assert "安全修复已完成" in str(feishu_client.updated[-1][1])
+    assert not any(
+        record.state == "executing"
+        for record in app[sidecar_server.OPERATIONS_STORE_KEY]._records.values()
+    )
+
+
+async def test_repair_confirmation_step_returns_from_snapshot_without_diagnosis(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    diagnostic_started = threading.Event()
+    diagnostic_release = threading.Event()
+
+    def blocked_report(*args, **kwargs):
+        if args[3] == "callback":
+            diagnostic_started.set()
+            diagnostic_release.wait(2.0)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_timeout_action",
+                    "chat_type": "private",
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        started = time.monotonic()
+        response = await asyncio.wait_for(
+            test_client.post(
+                "/card/actions",
+                json=operations_action_payload(repair, chat_id="oc_private"),
+            ),
+            timeout=0.5,
+        )
+        elapsed = time.monotonic() - started
+        body = await response.json()
+        await asyncio.sleep(0.05)
+        record = app[sidecar_server.OPERATIONS_STORE_KEY]._records[
+            json.loads(
+                base64.urlsafe_b64decode(
+                    str(repair["token"]).split(".", 1)[0]
+                    + "=" * (-len(str(repair["token"]).split(".", 1)[0]) % 4)
+                )
+            )["operation_id"]
+        ]
+    finally:
+        diagnostic_release.set()
+        await test_client.close()
+
+    assert response.status == 200
+    assert elapsed < 0.5
+    assert not diagnostic_started.is_set()
+    assert "确认安全修复" in str(body["card"])
+    assert record.state == "confirm_repair"
+
+
+async def test_late_repair_worker_cannot_reclaim_delivery_or_inflight_capacity():
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    app = create_app(feishu_client)
+    store = OperationStore(secret=b"store", max_records=2)
+    active = store.create(
+        chat_id="oc_active",
+        profile_id="default",
+        report_fingerprint="active-report",
+        recovery_fingerprint="active-recovery",
+        group=False,
+        transport_secret=b"a" * 32,
+    )
+    active.state = "executing"
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"b" * 32,
+    )
+    operation.report = report
+    operation.state = "executing"
+    app[sidecar_server.OPERATIONS_STORE_KEY] = store
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+
+    await sidecar_server._finish_operations_repair(
+        app,
+        operation,
+        report,
+        state="repaired",
+        result={"message": "已完成安全修复并重新检测。"},
+    )
+    await sidecar_server._finish_operations_repair(
+        app,
+        operation,
+        report,
+        state="repaired",
+        result={"message": "late worker"},
+    )
+
+    assert len(feishu_client.updated) == 1
+    assert len(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == 1
+    assert operation.operation_id not in app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+    assert set(app[sidecar_server.OPERATIONS_STORE_KEY]._records) != {
+        active.operation_id,
+        operation.operation_id,
+    }
+    assert all(
+        record.state != "executing" or record.operation_id == active.operation_id
+        for record in app[sidecar_server.OPERATIONS_STORE_KEY]._records.values()
+    )
+
+
+async def test_delayed_old_confirmation_returns_current_successor_without_delivery_reversal():
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"c" * 32,
+    )
+    operation.report = report
+    operation.state = "executing"
+    old_value = {
+        "hfc_action": "operations.select",
+        "operation_action": "confirm_repair",
+        "token": store.token(operation, "confirm_repair"),
+        "profile_scope": store.scope_fingerprint(operation),
+    }
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    await sidecar_server._finish_operations_repair(
+        app,
+        operation,
+        report,
+        state="repaired",
+        result={"message": "已完成安全修复并重新检测。", "restart_available": False},
+    )
+    successor_id = next(iter(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]))
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                old_value,
+                chat_id="oc_private",
+                transport_secret=b"c" * 32,
+            ),
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert body["ok"] is True, body
+    assert body["operation_id"] == successor_id, body
+    assert set(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == {successor_id}
+    assert "安全修复已完成" in str(body["card"])
+
+
+async def test_operations_patch_failure_is_recorded_on_the_completed_card():
+    feishu_client = FakeFeishuClient()
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    report = operations_report()
+    app = create_app(feishu_client)
+    operation = app[sidecar_server.OPERATIONS_STORE_KEY].create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"p" * 32,
+    )
+    operation.report = report
+    operation.state = "failed"
+    operation.result = {"message": "诊断暂时不可用，请稍后重新检测。"}
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+
+    updated = await sidecar_server._publish_operations_card(app, report, operation)
+
+    assert updated is False
+    assert operation.result["delivery_error"] == "card update unavailable"
+    assert re.fullmatch(
+        r"bot_hash=[0-9a-f]{12} RuntimeError",
+        app[DIAGNOSTICS_KEY]["last_update_error"],
+    )
+    assert feishu_client.updated == []
+
+
+async def test_stale_operations_publisher_republishes_the_current_delivery_owner():
+    feishu_client = ControlledOperationsUpdateClient()
+    old_report = operations_report(report_marker="old-owner")
+    current_report = operations_report(report_marker="current-owner")
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    old_operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=old_report.fingerprint,
+        recovery_fingerprint=old_report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"o" * 32,
+    )
+    old_operation.report = old_report
+    old_operation.state = "failed"
+    old_operation.result = {"message": "old publisher"}
+    sidecar_server._store_operation_delivery(
+        app,
+        old_operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+
+    old_publisher = asyncio.create_task(
+        sidecar_server._publish_operations_card(app, old_report, old_operation)
+    )
+    await asyncio.wait_for(feishu_client.update_started.wait(), timeout=1.0)
+    current_operation = sidecar_server._successor_operation(
+        app,
+        old_operation,
+        current_report,
+        state="failed",
+        result={"message": "current publisher"},
+    )
+    current_publisher = asyncio.create_task(
+        sidecar_server._publish_operations_card(
+            app, current_report, current_operation
+        )
+    )
+    feishu_client.release_update.set()
+    await asyncio.gather(old_publisher, current_publisher)
+
+    assert "current publisher" in str(feishu_client.updated[-1][1])
+    assert len(feishu_client.updated) == 3
+    assert set(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == {
+        current_operation.operation_id
+    }
+    assert app[sidecar_server.OPERATIONS_PUBLISH_LOCKS_KEY] == {}
+
+
+async def test_mutation_cleanup_snapshots_three_futures_and_waits_for_running_workers():
+    app = create_app(FakeFeishuClient())
+    started = threading.Event()
+    release = threading.Event()
+    running = [0]
+
+    def blocked_mutation():
+        running[0] += 1
+        if running[0] == 2:
+            started.set()
+        release.wait(2.0)
+
+    tasks = [
+        asyncio.create_task(sidecar_server._run_operations_mutation(app, blocked_mutation))
+        for _ in range(3)
+    ]
+    for task in tasks:
+        sidecar_server._track_operations_task(app, task)
+    await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1.0)
+    cleanup = asyncio.create_task(sidecar_server._stop_operations_diagnostics(app))
+    await asyncio.sleep(0.02)
+    assert cleanup.done() is False
+    release.set()
+    await cleanup
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert running[0] == 2
+    assert app[sidecar_server.OPERATIONS_MUTATION_FUTURES_KEY] == set()
+    with pytest.raises(RuntimeError):
+        app[sidecar_server.OPERATIONS_MUTATION_EXECUTOR_KEY].submit(lambda: None)
+
+
+@pytest.mark.parametrize("state", ("preparing", "executing", "restarting"))
+async def test_inflight_recheck_returns_current_card_after_all_patch_attempts_fail(state):
+    feishu_client = FakeFeishuClient()
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    report = operations_report()
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"p" * 32,
+    )
+    operation.report = report
+    operation.state = state
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    assert await sidecar_server._publish_operations_card(app, report, operation) is False
+    card = sidecar_server._render_operations_for_app(app, report, operation)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                operations_button(card, "重新检测"),
+                chat_id="oc_private",
+                transport_secret=b"p" * 32,
+            ),
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert body["ok"] is True
+    assert body["operation_id"] == operation.operation_id
+    assert operation.state == state
+    assert set(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == {operation.operation_id}
+    assert "正在" in str(body["card"])
+
+
+async def test_repair_timeout_renders_failed_diagnostic_successor(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    diagnostic_started = threading.Event()
+    diagnostic_release = threading.Event()
+
+    def blocked_report(*args, **kwargs):
+        if args[3] == "fallback_default":
+            diagnostic_started.set()
+            diagnostic_release.wait(0.5)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args, **kwargs: SimpleNamespace(status="repaired"),
+    )
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"s" * 32,
+    )
+    operation.report = report
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        repair = operations_button(
+            sidecar_server._render_operations_for_app(app, report, operation),
+            "安全修复",
+        )
+        confirmation = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                repair, chat_id="oc_private", transport_secret=b"s" * 32
+            ),
+        )
+        confirm_repair = operations_button((await confirmation.json())["card"], "确认修复")
+        response = await asyncio.wait_for(
+            test_client.post(
+                "/card/actions",
+                json=operations_action_payload(
+                    confirm_repair,
+                    chat_id="oc_private",
+                    transport_secret=b"s" * 32,
+                ),
+            ),
+            timeout=0.5,
+        )
+        body = await response.json()
+        await asyncio.wait_for(asyncio.to_thread(diagnostic_started.wait), timeout=1.0)
+        await wait_for_card_update(feishu_client, "诊断暂时不可用")
+        successor = next(
+            record
+            for record in app[sidecar_server.OPERATIONS_STORE_KEY]._records.values()
+            if record.state == "failed"
+        )
+        diagnostic_release.set()
+    finally:
+        diagnostic_release.set()
+        await test_client.close()
+
+    assert response.status == 200
+    assert "正在安全修复" in str(body["card"])
+    assert successor.state == "failed"
+    assert operations_button(feishu_client.updated[-1][1], "重新检测")
+
+
+async def test_restart_timeout_updates_recheckable_failure_without_restarting(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    diagnostic_started = threading.Event()
+    diagnostic_release = threading.Event()
+
+    def blocked_report(*args, **kwargs):
+        diagnostic_started.set()
+        diagnostic_release.wait(2.0)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    restart_calls = []
+    monkeypatch.setattr(
+        sidecar_server.subprocess,
+        "run",
+        lambda *args, **kwargs: restart_calls.append((args, kwargs))
+        or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"s" * 32,
+    )
+    operation.state = "restarting"
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    try:
+        await sidecar_server._run_operations_restart(app, operation)
+        await asyncio.wait_for(asyncio.to_thread(diagnostic_started.wait), timeout=1.0)
+        successor = next(
+            record
+            for record in store._records.values()
+            if record.operation_id != operation.operation_id
+        )
+    finally:
+        diagnostic_release.set()
+        await sidecar_server._stop_operations_diagnostics(app)
+
+    assert successor.state == "restart_failed"
+    assert restart_calls == []
+    assert "重启前的诊断暂时不可用" in str(successor.result)
+    assert len(feishu_client.updated) == 1
+    assert operations_button(feishu_client.updated[0][1], "重新检测")
+
+
+async def test_cleanup_cancels_scheduled_restart_before_diagnostic_executor_shutdown(
+    monkeypatch,
+    caplog,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    restart_calls = []
+    diagnostic_started = threading.Event()
+    diagnostic_release = threading.Event()
+
+    def blocked_report(*args, **kwargs):
+        diagnostic_started.set()
+        diagnostic_release.wait(2.0)
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "RESTART_CALLBACK_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", blocked_report)
+    monkeypatch.setattr(
+        sidecar_server.subprocess,
+        "run",
+        lambda *args, **kwargs: restart_calls.append((args, kwargs))
+        or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False,
+        transport_secret=b"s" * 32,
+    )
+    operation.state = "restarting"
+
+    sidecar_server._schedule_operations_restart(app, operation)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(diagnostic_started.wait), timeout=1.0)
+        assert len(app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]) == 1
+
+        await sidecar_server._stop_operations_diagnostics(app)
+        await _REAL_ASYNCIO_SLEEP(0.05)
+    finally:
+        diagnostic_release.set()
+
+    assert not app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]
+    assert restart_calls == []
+    assert "cannot schedule new futures after shutdown" not in caplog.text
+
+
+async def test_hfc_doctor_shutdown_cancels_tracked_diagnosis(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    started = asyncio.Event()
+
+    async def blocked_report(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report", blocked_report)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    await test_client.post(
+        "/commands",
+        json=signed_operations_command(
+            {
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_shutdown_doctor",
+                "chat_type": "private",
+            }
+        ),
+    )
+    await started.wait()
+    tasks = app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]
+    assert len(tasks) == 1
+
+    await test_client.close()
+
+    assert not tasks
+
+
+async def test_http_operations_reject_forged_operator_without_valid_adapter_proof(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (
+            report,
+            SimpleNamespace(root=Path("/private/hermes")),
+        ),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_group",
+                "message_id": "om_doctor",
+                "chat_type": "group",
+                "operator": "ou_owner",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        forged = operations_action_payload(repair, operator="ou_owner")
+        forged["adapter_transport_proof"]["signature"] = "0" * 64
+
+        response = await test_client.post("/card/actions", json=forged)
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 403
+    assert body == {"ok": False, "error": "operation rejected"}
+
+
+async def test_doctor_rejects_caller_chosen_secret_and_forged_operator(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (
+            report,
+            SimpleNamespace(root=Path("/private/hermes")),
+        ),
+    )
+    app = create_app(
+        feishu_client,
+        operations_transport_root_secret=b"r" * 32,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json={
+                "command": "doctor",
+                "chat_id": "oc_victim",
+                "message_id": "om_forged",
+                "profile_id": "work",
+                "chat_type": "group",
+                "operator": "ou_victim",
+                "adapter_transport_secret": "attacker-chosen-secret",
+            },
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 403
+    assert body == {"ok": False, "error": "command authentication rejected"}
+    assert feishu_client.sent == []
+
+
+async def test_hfc_doctor_returns_overload_without_evicting_inflight(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (
+            report,
+            SimpleNamespace(root=Path("/private/hermes")),
+        ),
+    )
+    app = create_app(feishu_client)
+    store = OperationStore(secret=b"store", max_records=1)
+    active = store.create(
+        chat_id="oc_active",
+        profile_id="default",
+        report_fingerprint="active-report",
+        recovery_fingerprint="active-recovery",
+        group=False,
+        transport_secret=TRANSPORT_SECRET.encode("utf-8"),
+    )
+    active.state = "executing"
+    app[sidecar_server.OPERATIONS_STORE_KEY] = store
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_new",
+                "message_id": "om_new",
+                "chat_type": "private",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 503
+    assert body == {"ok": False, "error": "operations overloaded"}
+    assert store.complete(
+        active.operation_id,
+        expected_state="executing",
+        state="repaired",
+        result={},
+    ).state == "repaired"
+    assert feishu_client.sent == []
+
+
+async def test_group_operations_first_claim_missing_identity_and_read_only_matrix(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+    calls = []
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, detection),
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: calls.append(args) or SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda command: None)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_group",
+                "message_id": "om_doctor",
+                "chat_type": "group",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+
+        details = operations_button(card, "查看诊断")
+        read_only = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(details, operator="ou_reader"),
+        )
+        assert (await read_only.json())["ok"] is True
+
+        repair = operations_button(card, "安全修复")
+        missing_identity = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(repair, operator=""),
+        )
+        assert (await missing_identity.json())["ok"] is False
+
+        claimed = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(repair, operator="ou_claimant"),
+        )
+        confirm = operations_button((await claimed.json())["card"], "确认修复")
+        changed_operator = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(confirm, operator="ou_other"),
+        )
+        assert (await changed_operator.json())["ok"] is False
+
+        completed = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(confirm, operator="ou_claimant"),
+        )
+        completed_body = await completed.json()
+        await _wait_until(lambda: len(calls) == 1)
+    finally:
+        await test_client.close()
+
+    assert completed_body["ok"] is True
+    assert len(calls) == 1
+    assert calls[0][1] == "recovery-a"
+
+
+async def test_concurrent_recheck_returns_one_successor_and_moves_delivery_once(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (
+            report,
+            SimpleNamespace(root=Path("/private/hermes")),
+        ),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "chat_type": "private",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        recheck = operations_button(feishu_client.sent[0][1], "重新检测")
+        original_id = next(iter(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]))
+        payload = operations_action_payload(
+            recheck,
+            chat_id="oc_private",
+            operator="ou_owner",
+        )
+        responses = await asyncio.gather(
+            *[
+                test_client.post("/card/actions", json=payload)
+                for _ in range(8)
+            ]
+        )
+        bodies = [await response.json() for response in responses]
+    finally:
+        await test_client.close()
+
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    current = store.current_successor(original_id)
+    deliveries = app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+    assert current is not None
+    assert all(
+        store.current_successor(body["operation_id"]) is current for body in bodies
+    )
+    assert original_id not in deliveries
+    assert set(deliveries) == {current.operation_id}
+    assert all(body["ok"] is True for body in bodies)
+
+
+async def test_changed_recheck_creates_one_fresh_successor_and_moves_delivery_once(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    reports = [
+        operations_report(report_marker="report-a", recovery_fingerprint="recovery-a"),
+        operations_report(report_marker="report-b", recovery_fingerprint="recovery-b"),
+    ]
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (reports.pop(0) if reports else operations_report(
+            report_marker="report-b", recovery_fingerprint="recovery-b"
+        ), detection),
+    )
+    recheck_started = asyncio.Event()
+    release_recheck = asyncio.Event()
+    recheck_published = asyncio.Event()
+    original_report = sidecar_server._bounded_operations_report
+    report_calls = 0
+
+    async def controlled_report(*args, **kwargs):
+        nonlocal report_calls
+        report_calls += 1
+        if report_calls > 1:
+            recheck_started.set()
+            await release_recheck.wait()
+        return await original_report(*args, **kwargs)
+
+    original_publish = sidecar_server._publish_operations_card
+
+    async def track_publish(app, report, operation):
+        updated = await original_publish(app, report, operation)
+        if updated and operation.state == "diagnosed":
+            recheck_published.set()
+        return updated
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", controlled_report)
+    monkeypatch.setattr(sidecar_server, "_publish_operations_card", track_publish)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "chat_type": "private",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        recheck = operations_button(feishu_client.sent[0][1], "重新检测")
+        original_id = next(iter(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]))
+        payload = operations_action_payload(
+            recheck, chat_id="oc_private", operator="ou_owner"
+        )
+        first = await test_client.post("/card/actions", json=payload)
+        second = await test_client.post("/card/actions", json=payload)
+        first_body = await first.json()
+        second_body = await second.json()
+        await _wait_until(recheck_started.is_set)
+        store = app[sidecar_server.OPERATIONS_STORE_KEY]
+        preparing = store.current_successor(first_body["operation_id"])
+        assert preparing is not None and preparing.state == "preparing"
+        assert second_body["operation_id"] == first_body["operation_id"]
+        assert preparing.recovery_fingerprint == "recovery-a"
+        deliveries = app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+        assert original_id not in deliveries
+        assert set(deliveries) == {preparing.operation_id}
+
+        def recheck_completed():
+            current = store.current_successor(first_body["operation_id"])
+            return (
+                current is not None
+                and current.state == "diagnosed"
+                and recheck_published.is_set()
+            )
+
+        release_recheck.set()
+        await _wait_until(recheck_completed)
+    finally:
+        release_recheck.set()
+        await test_client.close()
+
+    assert first_body["ok"] is True
+    assert second_body["ok"] is True
+    assert first_body["operation_id"] != original_id
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    successor = store.current_successor(first_body["operation_id"])
+    assert successor is not None
+    assert store.current_successor(second_body["operation_id"]) is successor
+    assert successor.recovery_fingerprint == "recovery-b"
+    assert report_calls == 2
+    assert original_id not in app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+    assert set(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == {
+        successor.operation_id
+    }
+
+
+@pytest.mark.parametrize(
+    "repeat_after_completion", [False, True], ids=["preparing", "diagnosed"]
+)
+async def test_full_capacity_repeated_recheck_returns_same_successor_and_moves_delivery_once(
+    monkeypatch, repeat_after_completion,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (
+            report,
+            SimpleNamespace(root=Path("/private/hermes")),
+        ),
+    )
+    recheck_started = asyncio.Event()
+    release_recheck = asyncio.Event()
+    original_report = sidecar_server._bounded_operations_report
+    report_calls = 0
+
+    async def controlled_report(*args, **kwargs):
+        nonlocal report_calls
+        report_calls += 1
+        if report_calls > 1:
+            recheck_started.set()
+            await release_recheck.wait()
+        return await original_report(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sidecar_server, "_bounded_operations_report", controlled_report
+    )
+    app = create_app(feishu_client)
+    store = OperationStore(secret=b"store", max_records=2)
+    active = store.create(
+        chat_id="oc_active",
+        profile_id="default",
+        report_fingerprint="active-report",
+        recovery_fingerprint="active-recovery",
+        group=False,
+        transport_secret=TRANSPORT_SECRET.encode("utf-8"),
+    )
+    active.state = "executing"
+    app[sidecar_server.OPERATIONS_STORE_KEY] = store
+    transfer_calls = []
+    original_transfer = sidecar_server._transfer_operation_delivery
+
+    def track_delivery_transfer(*args):
+        transfer_calls.append(args[1:])
+        return original_transfer(*args)
+
+    monkeypatch.setattr(
+        sidecar_server, "_transfer_operation_delivery", track_delivery_transfer
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "chat_type": "private",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        recheck = operations_button(feishu_client.sent[0][1], "重新检测")
+        original_id = next(iter(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]))
+        payload = operations_action_payload(
+            recheck,
+            chat_id="oc_private",
+            operator="ou_owner",
+        )
+        first_response = await test_client.post("/card/actions", json=payload)
+        first_body = await first_response.json()
+        await asyncio.wait_for(recheck_started.wait(), timeout=5)
+
+        def recheck_completed():
+            current = store.current_successor(first_body["operation_id"])
+            return current is not None and current.state == "diagnosed"
+
+        assert transfer_calls == [(original_id, first_body["operation_id"])]
+        if repeat_after_completion:
+            release_recheck.set()
+            await _wait_until(recheck_completed, attempts=500)
+        repeated_response = await test_client.post("/card/actions", json=payload)
+        repeated_body = await repeated_response.json()
+        if not repeat_after_completion:
+            assert repeated_body["operation_id"] == first_body["operation_id"]
+            assert transfer_calls == [(original_id, first_body["operation_id"])]
+        release_recheck.set()
+        await _wait_until(recheck_completed, attempts=500)
+    finally:
+        release_recheck.set()
+        await test_client.close()
+
+    assert first_body["ok"] is True
+    assert repeated_body["ok"] is True
+    current = store.current_successor(first_body["operation_id"])
+    assert current is not None
+    assert current.state == "diagnosed"
+    assert current.operation_id != first_body["operation_id"]
+    assert report_calls == 2
+    assert store.current_successor(repeated_body["operation_id"]) is current
+    assert "正在重新检测" in str(first_body["card"])
+    assert any(
+        marker in str(repeated_body["card"])
+        for marker in ("正在重新检测", "诊断摘要")
+    )
+    assert transfer_calls == [
+        (original_id, first_body["operation_id"]),
+        (first_body["operation_id"], current.operation_id),
+    ]
+    assert original_id not in app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+    assert set(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == {
+        current.operation_id
+    }
+
+
+@pytest.mark.parametrize("after_completion", [False, True])
+async def test_private_repair_is_exactly_once_under_concurrent_confirmation(
+    monkeypatch, after_completion
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+    calls = []
+    repair_started = threading.Event()
+    release_repair = threading.Event()
+
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, detection),
+    )
+
+    def fake_execute(current_detection, expected_fingerprint=None):
+        calls.append((current_detection, expected_fingerprint))
+        repair_started.set()
+        assert release_repair.wait(10), "repair was not released by the test"
+        return SimpleNamespace(status="repaired", message="Verified recovery completed.")
+
+    monkeypatch.setattr(sidecar_server, "execute_recovery", fake_execute)
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda command: None)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "chat_type": "private",
+                "operator": "ou_first",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        first = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                repair, chat_id="oc_private", operator="ou_first"
+            ),
+        )
+        confirmation = await first.json()
+        executing_operation_id = confirmation["operation_id"]
+        confirm = operations_button(confirmation["card"], "确认修复")
+
+        async def confirm_once(index):
+            return await test_client.post(
+                "/card/actions",
+                json=operations_action_payload(
+                    confirm, chat_id="oc_private", operator=f"ou_{index}"
+                ),
+            )
+
+        responses = [await confirm_once(0)]
+        await _wait_until(repair_started.is_set)
+        first_body = await responses[0].json()
+        assert first_body["ok"] is True
+        assert "正在安全修复" in str(first_body["card"])
+        assert first_body["operation_id"] == executing_operation_id
+        if after_completion:
+            release_repair.set()
+            await wait_for_card_update(feishu_client, "安全修复已完成")
+        responses.extend(
+            await asyncio.gather(*(confirm_once(i) for i in range(1, 8)))
+        )
+        bodies = [await response.json() for response in responses]
+        if not after_completion:
+            # The worker remains behind the barrier until every duplicate has
+            # returned its exact executing owner. Fast completion cannot hide
+            # a missing in-progress assertion.
+            assert not release_repair.is_set()
+            for body in bodies:
+                assert body["ok"] is True
+                assert "正在安全修复" in str(body["card"])
+                assert body["operation_id"] == executing_operation_id
+            release_repair.set()
+        await wait_for_card_update(feishu_client, "安全修复已完成")
+        current_deliveries = app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+        assert len(current_deliveries) == 1
+        completed_operation_id = next(iter(current_deliveries))
+    finally:
+        release_repair.set()
+        await test_client.close()
+
+    assert len(calls) == 1
+    assert calls[0][1] == "recovery-a"
+    assert app[METRICS_KEY].recovery_attempts == 1
+    assert app[METRICS_KEY].recovery_successes == 1
+    assert len(feishu_client.sent) == 1
+    assert completed_operation_id != executing_operation_id
+    assert all(response.status == 200 for response in responses)
+    if after_completion:
+        for body in bodies[1:]:
+            assert body["ok"] is True
+            assert "安全修复已完成" in str(body["card"])
+            assert body["operation_id"] == completed_operation_id
+    assert "安全修复已完成" in str(feishu_client.updated[-1][1])
+
+
+async def test_changed_recovery_fingerprint_refuses_confirm_without_execution(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    current = [operations_report(recovery_fingerprint="recovery-a")]
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+    calls = []
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (current[0], detection),
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_group",
+                "message_id": "om_doctor",
+                "chat_type": "group",
+                "operator": "ou_owner",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        first = await test_client.post(
+            "/card/actions", json=operations_action_payload(repair)
+        )
+        confirm = operations_button((await first.json())["card"], "确认修复")
+        current[0] = operations_report(
+            report_marker="report-b",
+            recovery_fingerprint="recovery-b",
+        )
+        rejected = await test_client.post(
+            "/card/actions", json=operations_action_payload(confirm)
+        )
+        body = await rejected.json()
+        await wait_for_card_update(feishu_client, "诊断状态已变化")
+    finally:
+        await test_client.close()
+
+    assert rejected.status == 200
+    assert body["ok"] is True
+    assert "正在安全修复" in str(body["card"])
+    assert operations_button(feishu_client.updated[-1][1], "重新检测")
+    assert calls == []
+
+
+async def test_repair_refuses_changed_report_fingerprint_before_mutation(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(report_marker="report-a", recovery_fingerprint="recovery-a")
+    fresh = operations_report(recovery_fingerprint="recovery-a", executable=False)
+    assert fresh.fingerprint != claimed.fingerprint
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False,
+        transport_secret=b"r" * 32,
+    )
+    operation.report = claimed
+    operation.state = "executing"
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    calls = []
+
+    async def fresh_report(*_args, **_kwargs):
+        return fresh, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", fresh_report)
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: calls.append(args) or SimpleNamespace(status="repaired"),
+    )
+
+    await sidecar_server._run_operations_repair(app, operation)
+
+    successor = next(iter(store._records.values()))
+    assert calls == []
+    assert successor.state == "failed"
+    assert "诊断状态已变化" in str(successor.result)
+
+
+async def test_successful_repair_builds_successor_from_post_mutation_report(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(recovery_fingerprint="recovery-a")
+    repaired = operations_report(recovery_fingerprint="recovery-clean", executable=False)
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False,
+        transport_secret=b"r" * 32,
+    )
+    operation.report = claimed
+    operation.state = "executing"
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    calls = []
+
+    async def reports(_app, *, profile_id, profile_source, **_kwargs):
+        calls.append(profile_source)
+        report = claimed if len(calls) == 1 else repaired
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", reports)
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda _command: "/usr/bin/hermes")
+
+    await sidecar_server._run_operations_repair(app, operation)
+
+    successor = next(iter(store._records.values()))
+    assert calls == ["fallback_default", "fallback_default"]
+    assert successor.report is repaired
+    assert successor.report_fingerprint == repaired.fingerprint
+    assert successor.recovery_fingerprint == repaired.recovery_fingerprint
+    assert successor.result["restart_available"] is True
+
+
+@pytest.mark.parametrize("profile_source", ["fallback_default", "sanitized_locals", "sanitized_hermes_home"])
+async def test_background_operations_reuse_snapshot_profile_source_for_fingerprint(monkeypatch, profile_source):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(profile_source=profile_source)
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private", profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False, transport_secret=b"r" * 32,
+    )
+    operation.report = claimed
+    operation.state = "executing"
+    sidecar_server._store_operation_delivery(
+        app, operation.operation_id, {"message_id": "feishu-message", "bot_id": None}
+    )
+    sources = []
+    executed = []
+
+    async def reports(_app, *, profile_source, **_kwargs):
+        sources.append(profile_source)
+        return claimed, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", reports)
+    monkeypatch.setattr(
+        sidecar_server, "execute_recovery",
+        lambda *args: executed.append(args) or SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda _command: None)
+
+    await sidecar_server._run_operations_repair(app, operation)
+
+    recheck = store.create(
+        chat_id="oc_private", profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False, transport_secret=b"s" * 32,
+    )
+    recheck.report = claimed
+    recheck.state = "preparing"
+    sidecar_server._store_operation_delivery(
+        app, recheck.operation_id, {"message_id": "recheck-message", "bot_id": None}
+    )
+    await sidecar_server._run_operations_recheck(app, recheck)
+
+    restart = store.create(
+        chat_id="oc_private", profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False, transport_secret=b"t" * 32,
+    )
+    restart.report = claimed
+    restart.state = "restarting"
+    sidecar_server._store_operation_delivery(
+        app, restart.operation_id, {"message_id": "restart-message", "bot_id": None}
+    )
+    await sidecar_server._run_operations_restart(app, restart)
+
+    assert sources == [profile_source] * 4
+    assert len(executed) == 1
+    assert next(iter(store._records.values())).state == "repaired"
+
+
+async def test_repair_rejects_actual_profile_source_change(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(profile_source="fallback_default")
+    changed = operations_report(profile_source="env")
+    assert changed.fingerprint != claimed.fingerprint
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private", profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False, transport_secret=b"u" * 32,
+    )
+    operation.report = claimed
+    operation.state = "executing"
+    sidecar_server._store_operation_delivery(
+        app, operation.operation_id, {"message_id": "source-message", "bot_id": None}
+    )
+    executed = []
+
+    async def reports(*_args, **_kwargs):
+        return changed, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", reports)
+    monkeypatch.setattr(sidecar_server, "execute_recovery", lambda *args: executed.append(args))
+
+    await sidecar_server._run_operations_repair(app, operation)
+
+    assert executed == []
+    assert next(iter(store._records.values())).state == "failed"
+
+
+async def test_successful_repair_without_post_diagnosis_keeps_recheckable_fallback(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(recovery_fingerprint="recovery-a")
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False,
+        transport_secret=b"r" * 32,
+    )
+    operation.report = claimed
+    operation.state = "executing"
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    calls = []
+
+    async def reports(_app, *, profile_id, profile_source, **_kwargs):
+        calls.append(profile_source)
+        if len(calls) > 1:
+            raise asyncio.TimeoutError
+        return claimed, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", reports)
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda _command: "/usr/bin/hermes")
+
+    await sidecar_server._run_operations_repair(app, operation)
+
+    successor = next(iter(store._records.values()))
+    assert calls == ["fallback_default", "fallback_default"]
+    assert successor.state == "repaired"
+    assert successor.report.status == "error"
+    assert successor.result["restart_available"] is False
+    assert "重新检测暂时不可用" in str(successor.result)
+    assert operations_button(feishu_client.updated[-1][1], "重新检测")
+    assert "重启 Gateway" not in str(feishu_client.updated[-1][1])
+
+
+async def test_repair_rejects_synthetic_post_repair_failure_report(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(recovery_fingerprint="recovery-a")
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False,
+        transport_secret=b"r" * 32,
+    )
+    operation.report = claimed
+    operation.state = "executing"
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    calls = []
+
+    def swallowed_build(*args):
+        profile_source = args[3]
+        calls.append(profile_source)
+        report = (
+            sidecar_server._failed_operations_report("default")
+            if len(calls) > 1
+            else claimed
+        )
+        return report, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(
+        sidecar_server, "_build_operations_report_sync", swallowed_build
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args: SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda _command: "/usr/bin/hermes")
+
+    await sidecar_server._run_operations_repair(app, operation)
+
+    successor = next(iter(store._records.values()))
+    assert calls == ["fallback_default", "fallback_default"]
+    assert successor.report.status == "error"
+    assert successor.result["restart_available"] is False
+    assert "重新检测暂时不可用" in str(successor.result)
+    assert operations_button(feishu_client.updated[-1][1], "重新检测")
+    assert "重启 Gateway" not in str(feishu_client.updated[-1][1])
+
+
+async def test_restart_refuses_changed_report_fingerprint_before_mutation(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    claimed = operations_report(report_marker="report-a", recovery_fingerprint="recovery-a")
+    fresh = operations_report(recovery_fingerprint="recovery-a", executable=False)
+    assert fresh.fingerprint != claimed.fingerprint
+    app = create_app(feishu_client)
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private",
+        profile_id="default",
+        report_fingerprint=claimed.fingerprint,
+        recovery_fingerprint=claimed.recovery_fingerprint,
+        group=False,
+        transport_secret=b"r" * 32,
+    )
+    operation.report = claimed
+    operation.state = "restarting"
+    sidecar_server._store_operation_delivery(
+        app,
+        operation.operation_id,
+        {"message_id": "feishu-message", "bot_id": None},
+    )
+    calls = []
+
+    async def fresh_report(*_args, **_kwargs):
+        return fresh, SimpleNamespace(root=Path("/private/hermes"))
+
+    monkeypatch.setattr(sidecar_server, "_bounded_operations_report", fresh_report)
+    monkeypatch.setattr(sidecar_server.shutil, "which", lambda _command: "/usr/bin/hermes")
+    monkeypatch.setattr(sidecar_server, "RESTART_CALLBACK_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        sidecar_server.subprocess,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs))
+        or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    await sidecar_server._run_operations_restart(app, operation)
+
+    successor = next(iter(store._records.values()))
+    assert calls == []
+    assert successor.state == "restart_failed"
+    assert "诊断状态已变化" in str(successor.result)
+
+
+async def test_http_operations_reject_tampered_and_profile_mismatched_tokens(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, SimpleNamespace(root=Path("/private/hermes"))),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "profile_id": "default",
+                "chat_type": "private",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        details = operations_button(feishu_client.sent[0][1], "查看诊断")
+        tampered = dict(details)
+        tampered["token"] = details["token"][:-1] + (
+            "0" if details["token"][-1] != "0" else "1"
+        )
+        tampered_response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(tampered, chat_id="oc_private"),
+        )
+        mismatched_response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                details,
+                chat_id="oc_private",
+                profile_id="sales",
+                proof_profile_id="default",
+            ),
+        )
+        chat_mismatched_response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(details, chat_id="oc_other"),
+        )
+        tampered_body = await tampered_response.json()
+        mismatched_body = await mismatched_response.json()
+        chat_mismatched_body = await chat_mismatched_response.json()
+    finally:
+        await test_client.close()
+
+    assert tampered_response.status == 200
+    assert tampered_body == {
+        "ok": False,
+        "error": "operation rejected",
+    }
+    assert mismatched_response.status == 200
+    assert mismatched_body["ok"] is True
+    assert "card" in mismatched_body
+    assert chat_mismatched_body == {
+        "ok": False,
+        "error": "operation rejected",
+    }
+
+
+async def test_http_operations_reject_unsigned_forged_operator(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, SimpleNamespace(root=Path("/private/hermes"))),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_group",
+                "message_id": "om_doctor",
+                "chat_type": "group",
+                "operator": "ou_owner",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+
+        forged_payload = operations_action_payload(repair, operator="ou_owner")
+        forged_payload.pop("adapter_transport_proof")
+        forged = await test_client.post(
+            "/card/actions",
+            json=forged_payload,
+        )
+        body = await forged.json()
+    finally:
+        await test_client.close()
+
+    assert forged.status == 403
+    assert body == {"ok": False, "error": "operation rejected"}
+
+
+async def test_http_stale_operation_renders_recheck_only_expired_card(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, SimpleNamespace(root=Path("/private/hermes"))),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "profile_id": "default",
+                "chat_type": "private",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        repair = operations_button(card, "安全修复")
+        store = app[sidecar_server.OPERATIONS_STORE_KEY]
+        _claims, record = store.inspect(
+            repair["token"],
+            callback_chat_id="oc_private",
+            callback_profile_scope=repair["profile_scope"],
+            allow_expired=True,
+        )
+        record.expires_at = 0.0
+
+        stale_response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(repair, chat_id="oc_private"),
+        )
+        stale_body = await stale_response.json()
+    finally:
+        await test_client.close()
+
+    assert stale_response.status == 200
+    assert stale_body["ok"] is False
+    assert "诊断已过期" in str(stale_body["card"])
+    recheck = operations_button(stale_body["card"], "重新检测")
+    assert recheck["token"] != repair["token"]
+    assert "安全修复" not in str(stale_body["card"])
+    assert "oc_private" not in str(stale_body)
+    assert "profile_id" not in str(stale_body)
+
+
+def test_operation_delivery_index_is_bounded():
+    app = create_app(FakeFeishuClient())
+
+    for index in range(sidecar_server.MAX_OPERATION_DELIVERIES + 5):
+        sidecar_server._store_operation_delivery(
+            app,
+            f"operation-{index}",
+            {"message_id": f"message-{index}"},
+        )
+
+    assert len(app[sidecar_server.OPERATIONS_DELIVERIES_KEY]) == 200
+    assert "operation-0" not in app[sidecar_server.OPERATIONS_DELIVERIES_KEY]
+
+
+async def test_confirmed_restart_returns_callback_before_sanitized_background_result(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    detection = SimpleNamespace(root=Path("/private/hermes"))
+    restart_started = threading.Event()
+    restart_release = threading.Event()
+    restart_calls = []
+    ordering = []
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (report, detection),
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "execute_recovery",
+        lambda *args, **kwargs: SimpleNamespace(status="repaired"),
+    )
+    monkeypatch.setattr(
+        sidecar_server.shutil, "which", lambda command: "/usr/local/bin/hermes"
+    )
+
+    def fake_run(*args, **kwargs):
+        ordering.append("restart_started")
+        restart_calls.append((args, kwargs))
+        restart_started.set()
+        restart_release.wait(timeout=0.5)
+        return SimpleNamespace(
+            returncode=1,
+            stdout=(
+                'Authorization: Bearer bearer-secret '
+                '{"password":"json-secret","token":"json-token"} '
+                "open_id=ou_secret chat_id=oc_secret message_id=om_secret "
+                "user_id=user_secret /private/hermes/runtime.log"
+            ),
+            stderr="restart failed secret=plain-secret",
+        )
+
+    monkeypatch.setattr(sidecar_server.subprocess, "run", fake_run)
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command({
+                "command": "doctor",
+                "chat_id": "oc_private",
+                "message_id": "om_doctor",
+                "chat_type": "private",
+                "operator": "ou_first",
+                "adapter_transport_secret": TRANSPORT_SECRET,
+            }),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        repair_token = str(repair["token"])
+        repair_encoded = repair_token.split(".", 1)[0]
+        repair_claims = json.loads(
+            base64.urlsafe_b64decode(
+                repair_encoded + "=" * (-len(repair_encoded) % 4)
+            )
+        )
+        transport_secret = derive_operation_transport_secret(
+            TRANSPORT_ROOT_SECRET,
+            repair_claims["operation_id"],
+        )
+        confirm_card = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                repair,
+                chat_id="oc_private",
+                operator="ou_first",
+                transport_secret=transport_secret,
+            ),
+        )
+        confirm_repair = operations_button(
+            (await confirm_card.json())["card"], "确认修复"
+        )
+        repaired = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                confirm_repair,
+                chat_id="oc_private",
+                operator="ou_second",
+                transport_secret=transport_secret,
+            ),
+        )
+        assert "正在安全修复" in str((await repaired.json())["card"])
+        await wait_for_card_update(feishu_client, "安全修复已完成")
+        restart = operations_button(feishu_client.updated[-1][1], "重启 Gateway")
+        confirm_restart_card = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                restart,
+                chat_id="oc_private",
+                operator="ou_second",
+                transport_secret=transport_secret,
+            ),
+        )
+        confirm_restart = operations_button(
+            (await confirm_restart_card.json())["card"], "确认重启"
+        )
+        callback = await asyncio.wait_for(
+            test_client.post(
+                "/card/actions",
+                json=operations_action_payload(
+                    confirm_restart,
+                    chat_id="oc_private",
+                    operator="ou_third",
+                    transport_secret=transport_secret,
+                ),
+            ),
+            timeout=0.5,
+        )
+        callback_body = await callback.json()
+        ordering.append("client_received_response")
+        assert callback.status == 200
+        assert "正在重启 Gateway" in str(callback_body["card"])
+        await _wait_until(restart_started.is_set, attempts=150)
+
+        restart_release.set()
+        await wait_for_card_update(feishu_client, "修复完成，重启失败")
+    finally:
+        restart_release.set()
+        await test_client.close()
+
+    assert len(restart_calls) == 1
+    assert ordering[:2] == ["client_received_response", "restart_started"]
+    args, kwargs = restart_calls[0]
+    assert args == (["/usr/local/bin/hermes", "gateway", "restart"],)
+    assert kwargs == {
+        "cwd": Path("/private/hermes"),
+        "check": False,
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+    }
+    updated = str(feishu_client.updated[-1][1])
+    stored_results = [
+        record.result
+        for record in app[sidecar_server.OPERATIONS_STORE_KEY]._records.values()
+        if record.result
+    ]
+    serialized = str(stored_results)
+    for sensitive in (
+        "bearer-secret",
+        "json-secret",
+        "json-token",
+        "ou_secret",
+        "oc_secret",
+        "om_secret",
+        "user_secret",
+        "plain-secret",
+        "/private/hermes",
+    ):
+        assert sensitive not in serialized
+        assert sensitive not in updated
+
+
+async def test_operations_action_patches_same_card_to_confirmation_state_after_response(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    report = operations_report()
+    monkeypatch.setattr(
+        sidecar_server,
+        "_build_operations_report_sync",
+        lambda *args, **kwargs: (
+            report,
+            SimpleNamespace(root=Path("/private/hermes")),
+        ),
+    )
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "doctor",
+                    "chat_id": "oc_private",
+                    "message_id": "om_doctor",
+                    "chat_type": "private",
+                    "adapter_transport_secret": TRANSPORT_SECRET,
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        repair = operations_button(feishu_client.sent[0][1], "安全修复")
+        transport_secret = derive_operation_transport_secret(
+            TRANSPORT_ROOT_SECRET,
+            json.loads(
+                base64.urlsafe_b64decode(
+                    str(repair["token"]).split(".", 1)[0]
+                    + "=" * (-len(str(repair["token"]).split(".", 1)[0]) % 4)
+                )
+            )["operation_id"],
+        )
+
+        response = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                repair,
+                chat_id="oc_private",
+                transport_secret=transport_secret,
+            ),
+        )
+        body = await response.json()
+        await wait_for_card_update(feishu_client, "确认安全修复")
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert "确认安全修复" in str(body["card"])
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.updated[0][0] == "feishu-message-1"
+
+
+async def test_operations_transition_starts_follow_up_while_card_patch_is_blocked(
+    monkeypatch,
+):
+    app = create_app(FakeFeishuClient())
+    report = operations_report()
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation, _created = store.prepare(
+        chat_id="oc_private",
+        profile_id="default",
+        group=False,
+        initiator_open_id="ou_owner",
+        operation_id="operation-transition",
+        transport_secret=b"transition-secret-value",
+        idempotency_key="transition-test",
+    )
+    patch_started = asyncio.Event()
+    release_patch = asyncio.Event()
+    follow_up_started = asyncio.Event()
+
+    async def blocked_publish(*_args):
+        patch_started.set()
+        await release_patch.wait()
+        return True
+
+    monkeypatch.setattr(sidecar_server, "_publish_operations_card", blocked_publish)
+
+    def schedule_follow_up():
+        follow_up_started.set()
+
+    sidecar_server._schedule_operations_transition(
+        app, report, operation, schedule_follow_up
+    )
+    await asyncio.wait_for(patch_started.wait(), timeout=0.5)
+    await asyncio.wait_for(follow_up_started.wait(), timeout=0.5)
+    release_patch.set()
+    await _wait_until(
+        lambda: not app[sidecar_server.OPERATIONS_DIAGNOSTIC_TASKS_KEY]
+    )
+    await sidecar_server._stop_operations_diagnostics(app)
+
+
+async def test_operations_response_always_schedules_same_card_publish(monkeypatch):
+    app = create_app(FakeFeishuClient())
+    report = operations_report()
+    operation, _created = app[sidecar_server.OPERATIONS_STORE_KEY].prepare(
+        chat_id="oc_private",
+        profile_id="default",
+        group=False,
+        initiator_open_id="ou_owner",
+        operation_id="operation-response",
+        transport_secret=b"response-secret-value",
+        idempotency_key="response-test",
+    )
+    scheduled = []
+
+    async def successful_write_eof(self, data=b""):
+        return None
+
+    def capture_schedule(captured_app, captured_report, captured_operation, follow_up=None):
+        scheduled.append(
+            (captured_app, captured_report, captured_operation, follow_up)
+        )
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", successful_write_eof)
+    monkeypatch.setattr(
+        sidecar_server, "_schedule_operations_transition", capture_schedule
+    )
+
+    response = sidecar_server._operations_response(app, report, operation)
+    await response.write_eof()
+
+    assert scheduled == [(app, report, operation, None)]
+    await sidecar_server._stop_operations_diagnostics(app)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Authorization: Bearer secret.jwt.value",
+        '{"token":"secret","open_id":"ou_private"}',
+        "token=secret-value",
+        "oc_private ou_private profile=finance",
+        "failed (/Users/bailey/Private Folder/runtime.log)",
+        "gateway restarted; token=secret",
+    ],
+)
+def test_restart_output_sanitization_is_fail_closed_for_unknown_output(output):
+    assert sidecar_server._restart_output_status(output) == "suppressed"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("", "empty"),
+        ("gateway restart completed", "reported_success"),
+        ("restart successful", "reported_success"),
+    ],
+)
+def test_restart_output_sanitization_retains_only_explicit_safe_statuses(
+    output, expected
+):
+    assert sidecar_server._restart_output_status(output) == expected
+
+
+async def test_health_reports_profile_diagnostics_for_profile_events():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"profile_id": "work", "profile_source": "env"},
+            ),
+        )
+        assert response.status == 200
+        health = await test_client.get("/health")
+        body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert body["profile_diagnostics"]["work"]["events"] == 1
+    assert body["profile_diagnostics"]["work"]["last_profile_source"] == "env"
+
+
+async def test_profiled_hook_like_started_and_delta_apply_to_same_session():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    profile_data = {"profile_id": "default", "profile_source": "fallback_default"}
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, profile_data),
+        )
+        delta = await test_client.post(
+            "/events",
+            json=event_payload("answer.delta", 1, {"text": "hello", **profile_data}),
+        )
+        started_body = await started.json()
+        delta_body = await delta.json()
+    finally:
+        await test_client.close()
+
+    assert started.status == 200
+    assert started_body == DELIVERED_RESPONSE
+    assert delta.status == 200
+    assert delta_body == {"ok": True, "applied": True}
+    assert len(feishu_client.sent) == 1
+    assert len(feishu_client.updated) == 1
+
+
+async def test_invalid_profile_fails_native_without_default_profile_diagnostics():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"profile_id": "bad:profile/path", "profile_source": "env"},
+            ),
+        )
+        assert response.status == 200
+        response_body = await response.json()
+        health = await test_client.get("/health")
+        body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert response_body == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert body["profile_diagnostics"] == {}
+    assert feishu_client.sent == []
+
+
+async def test_event_lifecycle_sends_then_updates_final_card(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0),
+    )
+    thinking = await test_client.post(
+        "/events",
+        json=event_payload("thinking.delta", 1, {"text": "先分析"}),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 2, {"answer": "最终答案"}),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert thinking.status == 200
+    assert (await thinking.json())["applied"] is True
+    assert completed.status == 200
+    assert (await completed.json())["applied"] is True
+
+    await wait_for_card_update(feishu_client, "最终答案")
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][0] == "oc_abc"
+    assert len(feishu_client.updated) >= 1
+    assert all(message_id == "feishu-message-1" for message_id, _ in feishu_client.updated)
+    assert "最终答案" in str(feishu_client.updated[-1][1])
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["events_received"] == 3
+    assert metrics["events_applied"] == 3
+    assert metrics["events_ignored"] == 0
+    assert metrics["events_rejected"] == 0
+    assert metrics["feishu_send_attempts"] == 1
+    assert metrics["feishu_send_successes"] == 1
+    assert metrics["feishu_send_failures"] == 0
+    assert metrics["feishu_update_attempts"] == 2
+    assert metrics["feishu_update_successes"] == 2
+    assert metrics["feishu_update_failures"] == 0
+    assert metrics["feishu_update_retries"] == 0
+
+
+async def test_nonterminal_oversize_updates_existing_card_with_waiting_handoff(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-NONTERMINAL-" + ("密" * 40_000)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    delta = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": sensitive}),
+    )
+
+    assert await delta.json() == {"ok": True, "applied": True}
+    _, waiting_card = await wait_for_card_update(
+        feishu_client,
+        "内容较长，完成后将由 Hermes 原生消息发送",
+    )
+    assert "SENSITIVE-NONTERMINAL" not in str(waiting_card)
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["card_limit_deferrals"] == 1
+    assert metrics["card_limit_json_bytes"] == 1
+
+
+async def test_ack_capable_terminal_repeats_descriptor_until_signed_ack(tmp_path):
+    state_root = tmp_path / "handoff-state"
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(state_root, now=lambda: 100.0),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "1" * 32
+    obligation_key = "2" * 64
+    answer = "ACK-NATIVE-" + ("密" * 40_000)
+    handoff_meta = exact_handoff_metadata(
+        generation,
+        obligation_key,
+        answer=answer,
+    )
+    try:
+        started = event_payload(
+            "message.started",
+            0,
+            {"native_handoff": {"generation": generation}},
+        )
+        assert (await (await test_client.post("/events", json=started)).json())["applied"] is True
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": answer,
+                "native_handoff": handoff_meta,
+            },
+        )
+        first = await (await test_client.post("/events", json=completed_payload)).json()
+        repeated = await (await test_client.post("/events", json=completed_payload)).json()
+        higher_sequence = dict(completed_payload)
+        higher_sequence["sequence"] = 9
+        higher = await (
+            await test_client.post("/events", json=higher_sequence)
+        ).json()
+        lower_sequence = dict(completed_payload)
+        lower_sequence["sequence"] = 0
+        lower = await (
+            await test_client.post("/events", json=lower_sequence)
+        ).json()
+
+        assert first["applied"] is False
+        assert first["disposition"] == "native"
+        assert first["native_handoff"] == repeated["native_handoff"]
+        assert higher["native_handoff"] == first["native_handoff"]
+        assert lower["native_handoff"] == first["native_handoff"]
+        assert repeated["applied"] is False
+        descriptor = first["native_handoff"]
+        assert descriptor["protocol"] == "hfc-native-handoff-v2"
+        assert descriptor["expires_at"] == 3700.0
+
+        ack_body = json.dumps(descriptor, separators=(",", ":")).encode("utf-8")
+        ack_headers = sign_native_handoff_ack_request(
+            TRANSPORT_ROOT_SECRET,
+            ack_body,
+            timestamp=int(sidecar_server.time.time()),
+            nonce="native-ack-server-0001",
+        )
+        ack = await test_client.post(
+            "/native-handoff/ack",
+            data=ack_body,
+            headers=ack_headers,
+        )
+        assert ack.status == 200
+        assert await ack.json() == {"ok": True, "acknowledged": True}
+
+        ack_retry_body = json.dumps(descriptor, separators=(",", ":")).encode("utf-8")
+        ack_retry = await test_client.post(
+            "/native-handoff/ack",
+            data=ack_retry_body,
+            headers=sign_native_handoff_ack_request(
+                TRANSPORT_ROOT_SECRET,
+                ack_retry_body,
+                timestamp=int(sidecar_server.time.time()),
+                nonce="native-ack-server-0002",
+            ),
+        )
+        assert await ack_retry.json() == {"ok": True, "acknowledged": False}
+
+        after_ack_payload = dict(completed_payload)
+        after_ack_payload["sequence"] = 17
+        after_ack = await (
+            await test_client.post("/events", json=after_ack_payload)
+        ).json()
+        assert after_ack == {"ok": True, "applied": True}
+    finally:
+        await test_client.close()
+
+
+async def test_native_handoff_requires_complete_exact_base_capability_set(tmp_path):
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    metadata = exact_handoff_metadata("3" * 32, "4" * 64)
+    metadata["capabilities"].remove("exact-base-delivery-v1")
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                0,
+                {
+                    "answer": "LEGACY-NATIVE-" + ("密" * 40_000),
+                    "native_handoff": metadata,
+                },
+            ),
+        )
+        payload = await response.json()
+    finally:
+        await test_client.close()
+
+    assert payload == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id="hermes-message-1",
+    )
+    record = store.get(identity)
+    assert record.delivery_state == "legacy_consumed"
+    assert record.descriptor() is None
+
+
+async def test_native_handoff_rejects_provisional_uuid_seed_binding_drift(tmp_path):
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    metadata = exact_handoff_metadata("3" * 32, "4" * 64)
+    metadata["provisional_uuid_seed"] = "f" * 32
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                0,
+                {
+                    "answer": "MISMATCHED-SEED-NATIVE-" + ("密" * 40_000),
+                    "native_handoff": metadata,
+                },
+            ),
+        )
+        payload = await response.json()
+    finally:
+        await test_client.close()
+
+    assert payload == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    record = store.get(
+        handoff_identity_key(
+            profile_id="default",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id="hermes-message-1",
+        )
+    )
+    assert record.delivery_state == "legacy_consumed"
+    assert record.descriptor() is None
+
+
+async def test_native_handoff_rejects_target_hash_even_with_matching_wrong_seed(
+    tmp_path,
+):
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    metadata = exact_handoff_metadata("3" * 32, "4" * 64)
+    metadata["target_hash"] = "e" * 64
+    metadata["provisional_uuid_seed"] = derive_native_handoff_uuid_seed(
+        obligation_key=metadata["obligation_key"],
+        content_hash=metadata["content_hash"],
+        plan_fingerprint=metadata["plan_fingerprint"],
+        route=metadata["route"],
+        target_hash=metadata["target_hash"],
+    )
+    try:
+        payload = await (
+            await test_client.post(
+                "/events",
+                json=event_payload(
+                    "message.completed",
+                    0,
+                    {
+                        "answer": "MISMATCHED-TARGET-NATIVE-" + ("密" * 40_000),
+                        "native_handoff": metadata,
+                    },
+                ),
+            )
+        ).json()
+    finally:
+        await test_client.close()
+
+    assert payload == {"ok": True, "applied": False, "disposition": "native"}
+    record = store.get(
+        handoff_identity_key(
+            profile_id="default",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id="hermes-message-1",
+        )
+    )
+    assert record.delivery_state == "legacy_consumed"
+    assert record.descriptor() is None
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "profile_source"),
+    [("work", "locals"), ("default", "sanitized_locals")],
+)
+async def test_server_never_authorizes_exact_ack_outside_verified_default_profile(
+    tmp_path,
+    profile_id,
+    profile_source,
+):
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    metadata = exact_handoff_metadata(
+        "3" * 32,
+        "4" * 64,
+        profile_id=profile_id,
+    )
+    try:
+        payload = await (
+            await test_client.post(
+                "/events",
+                json=event_payload(
+                    "message.completed",
+                    0,
+                    {
+                        "answer": "PROFILE-GATED-NATIVE-" + ("密" * 40_000),
+                        "profile_id": profile_id,
+                        "profile_source": profile_source,
+                        "native_handoff": metadata,
+                    },
+                ),
+            )
+        ).json()
+    finally:
+        await test_client.close()
+
+    assert payload == {"ok": True, "applied": False, "disposition": "native"}
+    record = store.get(
+        handoff_identity_key(
+            profile_id=profile_id,
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id="hermes-message-1",
+        )
+    )
+    assert record.delivery_state == "legacy_consumed"
+    assert record.descriptor() is None
+
+
+async def test_old_v1_handoff_capabilities_cannot_authorize_exact_descriptor(tmp_path):
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    metadata = exact_handoff_metadata("3" * 32, "4" * 64)
+    metadata["capabilities"] = [
+        "native-ack-v1",
+        "stable-feishu-uuid-v1",
+        "exact-base-delivery-v1",
+    ]
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                0,
+                {
+                    "answer": "OLD-SIDECAR-NATIVE-" + ("密" * 40_000),
+                    "native_handoff": metadata,
+                },
+            ),
+        )
+        payload = await response.json()
+    finally:
+        await test_client.close()
+
+    assert payload == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    identity = handoff_identity_key(
+        profile_id="default",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id="hermes-message-1",
+    )
+    record = store.get(identity)
+    assert record.delivery_state == "legacy_consumed"
+    assert record.descriptor() is None
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("obligation_key", "e" * 64),
+        ("content_hash", "e" * 64),
+        ("plan_fingerprint", "e" * 64),
+        ("route", "thread-create"),
+        ("target_hash", "e" * 64),
+    ],
+)
+async def test_durable_native_terminal_refuses_delivery_binding_drift(
+    tmp_path,
+    field,
+    replacement,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root, now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    first_client = TestClient(TestServer(app))
+    await first_client.start_server()
+    generation = "4" * 32
+    answer = "DURABLE-MISMATCH-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "5" * 64,
+                answer=answer,
+            ),
+        },
+        message_id="message-durable-mismatch",
+    )
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id="message-durable-mismatch",
+            ),
+        )
+        first = await first_client.post("/events", json=completed_payload)
+        assert (await first.json())["applied"] is False
+        assert store.path.exists()
+    finally:
+        await first_client.close()
+
+    second_app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(state_root, now=lambda: 101.0),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        mismatched = dict(completed_payload)
+        mismatched["data"] = dict(completed_payload["data"])
+        mismatched["data"]["native_handoff"] = dict(
+            completed_payload["data"]["native_handoff"]
+        )
+        mismatched["data"]["native_handoff"][field] = replacement
+        repeated = await second_client.post("/events", json=mismatched)
+
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
+        metrics = (await (await second_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restore_refusals"] == 1
+    finally:
+        await second_client.close()
+
+
+async def test_exact_terminal_refuses_legacy_v2_pending_descriptor_after_restart(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root, now=lambda: 100.0)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    first_client = TestClient(TestServer(app))
+    await first_client.start_server()
+    generation = "6" * 32
+    answer = "LEGACY-FENCE-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "7" * 64,
+                answer=answer,
+            ),
+        },
+        message_id="message-legacy-fence",
+    )
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id="message-legacy-fence",
+            ),
+        )
+        first = await first_client.post("/events", json=completed_payload)
+        assert (await first.json())["applied"] is False
+    finally:
+        await first_client.close()
+
+    state_payload = json.loads(store.path.read_text(encoding="utf-8"))
+    state_payload["version"] = 2
+    store.path.write_text(json.dumps(state_payload), encoding="utf-8")
+    store.path.chmod(0o600)
+    second_app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(state_root, now=lambda: 101.0),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        repeated = await second_client.post("/events", json=completed_payload)
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
+        metrics = (await (await second_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restore_refusals"] == 1
+    finally:
+        await second_client.close()
+
+
+async def test_in_memory_native_terminal_restores_missing_handoff_fence(tmp_path):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "4" * 32
+    obligation_key = "5" * 64
+    message_id = "message-state-loss"
+    answer = "STATE-LOSS-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                obligation_key,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+    )
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await (await test_client.post("/events", json=completed_payload)).json()
+        assert first["applied"] is False
+        assert first["native_handoff"]["protocol"] == "hfc-native-handoff-v2"
+
+        store.path.unlink()
+        replay_payload = dict(completed_payload)
+        replay_payload["sequence"] = 99
+        repeated = await (
+            await test_client.post("/events", json=replay_payload)
+        ).json()
+
+        assert repeated["applied"] is False
+        assert repeated["disposition"] == "native"
+        assert repeated["native_handoff"]["protocol"] == "hfc-native-handoff-v2"
+        assert repeated["native_handoff"] == first["native_handoff"]
+        identity = handoff_identity_key(
+            profile_id="default",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id=message_id,
+        )
+        assert store.get(identity) is not None
+        serialized = store.path.read_text(encoding="utf-8")
+        assert "STATE-LOSS-NATIVE" not in serialized
+        metrics = (await (await test_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restores"] == 1
+        assert metrics["native_handoff_fence_restore_refusals"] == 0
+        assert metrics["events_ignored"] == 1
+    finally:
+        await test_client.close()
+
+
+async def test_in_memory_acked_native_terminal_restores_fence_without_resend(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "8" * 32
+    message_id = "message-acked-state-loss"
+    answer = "ACKED-STATE-LOSS-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "9" * 64,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+    )
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await (await test_client.post("/events", json=completed_payload)).json()
+        descriptor = first["native_handoff"]
+        ack_body = json.dumps(descriptor, separators=(",", ":")).encode("utf-8")
+        ack = await test_client.post(
+            "/native-handoff/ack",
+            data=ack_body,
+            headers=sign_native_handoff_ack_request(
+                TRANSPORT_ROOT_SECRET,
+                ack_body,
+                timestamp=int(sidecar_server.time.time()),
+                nonce="native-ack-state-loss-0001",
+            ),
+        )
+        assert await ack.json() == {"ok": True, "acknowledged": True}
+
+        store.path.unlink()
+        replay_payload = dict(completed_payload)
+        replay_payload["sequence"] = 0
+        repeated = await test_client.post("/events", json=replay_payload)
+
+        assert repeated.status == 200
+        assert await repeated.json() == {"ok": True, "applied": True}
+        identity = handoff_identity_key(
+            profile_id="default",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id=message_id,
+        )
+        assert store.get(identity).delivery_state == "acked"
+        metrics = (await (await test_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restores"] == 1
+        assert metrics["native_handoff_fence_restore_refusals"] == 0
+    finally:
+        await test_client.close()
+
+
+async def test_in_memory_native_terminal_fails_open_when_handoff_state_is_corrupt(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "6" * 32
+    message_id = "message-state-corrupt"
+    answer = "STATE-CORRUPT-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "7" * 64,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+    )
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        assert (await first.json())["applied"] is False
+
+        store.path.write_text("{invalid", encoding="utf-8")
+        repeated = await test_client.post("/events", json=completed_payload)
+
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
+        metrics = (await (await test_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restores"] == 0
+        assert metrics["native_handoff_fence_restore_refusals"] == 1
+    finally:
+        await test_client.close()
+
+
+async def test_restarted_native_terminal_fails_open_for_wrong_durable_uuid_seed(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root, now=lambda: 100.0)
+    first_app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    first_client = TestClient(TestServer(first_app))
+    await first_client.start_server()
+    generation = "6" * 32
+    message_id = "message-corrupt-seed"
+    answer = "CORRUPT-SEED-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "7" * 64,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+    )
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await first_client.post("/events", json=completed_payload)
+        assert (await first.json())["native_handoff"]["protocol"] == (
+            "hfc-native-handoff-v2"
+        )
+    finally:
+        await first_client.close()
+
+    identity = handoff_identity_key(
+        profile_id="default",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    state_payload = json.loads(store.path.read_text(encoding="utf-8"))
+    state_payload["records"][identity]["uuid_seed"] = "f" * 32
+    store.path.write_text(json.dumps(state_payload), encoding="utf-8")
+    store.path.chmod(0o600)
+
+    second_app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(
+            state_root,
+            now=lambda: 101.0,
+        ),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        repeated = await second_client.post("/events", json=completed_payload)
+
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
+        metrics = (await (await second_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restore_refusals"] == 1
+    finally:
+        await second_client.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("obligation_key", "e" * 64),
+        ("content_hash", "e" * 64),
+        ("plan_fingerprint", "e" * 64),
+        ("route", "thread-create"),
+        ("target_hash", "e" * 64),
+    ],
+)
+async def test_in_memory_native_terminal_refuses_mismatched_fence_restore(
+    tmp_path,
+    field,
+    replacement,
+):
+    store = NativeHandoffStore(tmp_path / "handoff-state")
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "a" * 32
+    message_id = "message-state-mismatch"
+    answer = "STATE-MISMATCH-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "b" * 64,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+    )
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        assert (await first.json())["applied"] is False
+
+        store.path.unlink()
+        mismatched = dict(completed_payload)
+        mismatched["data"] = dict(completed_payload["data"])
+        mismatched["data"]["native_handoff"] = dict(
+            completed_payload["data"]["native_handoff"]
+        )
+        mismatched["data"]["native_handoff"][field] = replacement
+        repeated = await test_client.post("/events", json=mismatched)
+
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
+        assert not store.path.exists()
+        metrics = (await (await test_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restores"] == 0
+        assert metrics["native_handoff_fence_restore_refusals"] == 1
+    finally:
+        await test_client.close()
+
+
+async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_cancel(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    feishu = FakeFeishuClient()
+    notice_started = asyncio.Event()
+    notice_cancelled = asyncio.Event()
+    async def blocked_update(*args, **kwargs):
+        notice_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            notice_cancelled.set()
+            raise
+    feishu.update_card_message = blocked_update
+    store = NativeHandoffStore(state_root)
+    app = create_app(feishu, native_handoff_store=store)
+    first_client = TestClient(TestServer(app))
+    await first_client.start_server()
+
+    generation = "7" * 32
+    obligation_key = "8" * 64
+    answer = "SLOW-NATIVE-" + ("密" * 40_000)
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id="message-slow-native-notice",
+            ),
+        )
+        response_task = asyncio.create_task(first_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {
+                    "answer": answer,
+                    "native_handoff": exact_handoff_metadata(
+                        generation,
+                        obligation_key,
+                        answer=answer,
+                    ),
+                },
+                message_id="message-slow-native-notice",
+            ),
+        )
+        )
+        # A blocking notice would time out; no absolute latency performance claim.
+        response = await asyncio.wait_for(response_task, timeout=5.0)
+        await asyncio.wait_for(notice_started.wait(), timeout=5.0)
+        payload = await response.json()
+
+        assert response.status == 200
+        assert payload["applied"] is False
+        assert payload["disposition"] == "native"
+        descriptor = payload["native_handoff"]
+        assert feishu.updated == []
+    finally:
+        # Simulate process loss while the decorative notice PATCH is still
+        # in flight. Shutdown cancels that in-memory task only.
+        await first_client.close()
+
+    assert notice_cancelled.is_set()
+    second_app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    body = json.dumps(
+        {
+            "protocol": "hfc-native-handoff-recovery-v2",
+            "obligation_key": obligation_key,
+            "content_hash": exact_content_hash(answer),
+            "plan_fingerprint": "d" * 64,
+            "route": "create",
+            "target_hash": derive_native_handoff_target_hash(
+                profile_id="default",
+                chat_id="oc_abc",
+                thread_id="",
+                route="create",
+            ),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        recovered = await second_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=sign_native_handoff_recovery_request(
+                TRANSPORT_ROOT_SECRET,
+                body,
+                timestamp=int(sidecar_server.time.time()),
+                nonce="native-recovery-slow-notice-0001",
+            ),
+        )
+        recovered_payload = await recovered.json()
+    finally:
+        await second_client.close()
+
+    assert recovered_payload == {
+        "ok": True,
+        "found": True,
+        "native_handoff": descriptor,
+    }
+    serialized = (state_root / "native-handoffs.json").read_text()
+    assert "feishu-message-1" not in serialized
+    assert "SLOW-NATIVE" not in serialized
+
+
+async def test_native_handoff_ack_endpoint_rejects_replay_and_schema_extension(tmp_path):
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body = b'{"protocol":"hfc-native-handoff-v2","id":"' + b"a" * 64 + b'","uuid_seed":"' + b"b" * 32 + b'","expires_at":100,"extra":true}'
+    headers = sign_native_handoff_ack_request(
+        TRANSPORT_ROOT_SECRET,
+        body,
+        timestamp=int(sidecar_server.time.time()),
+        nonce="native-ack-server-0003",
+    )
+    try:
+        invalid = await test_client.post(
+            "/native-handoff/ack", data=body, headers=headers
+        )
+        invalid_body = await invalid.json()
+        replay = await test_client.post(
+            "/native-handoff/ack", data=body, headers=headers
+        )
+        replay_body = await replay.json()
+    finally:
+        await test_client.close()
+
+    assert invalid.status == 400
+    assert invalid_body == {"ok": False, "error": "invalid native handoff ack"}
+    assert replay.status == 401
+    assert replay_body == {"ok": False, "error": "native handoff authentication failed"}
+
+
+async def test_signed_recovery_lookup_returns_only_pending_descriptor(tmp_path):
+    store = NativeHandoffStore(tmp_path / "handoff-state")
+    obligation_key = "d" * 64
+    target_hash = derive_native_handoff_target_hash(
+        profile_id="default",
+        chat_id="oc_private_recovery",
+        thread_id="thread-private",
+        route="thread-create",
+    )
+    record, _ = store.begin_no_card(
+        handoff_identity_key(
+            profile_id="default",
+            chat_id="oc_private_recovery",
+            conversation_id="conversation_private_recovery",
+            message_id="message_private_recovery",
+        ),
+        event_created_at=time.time(),
+        generation="e" * 32,
+        ack_capable=True,
+        obligation_key=obligation_key,
+        content_hash="a" * 64,
+        plan_fingerprint="b" * 64,
+        route="thread-create",
+        target_hash=target_hash,
+    )
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body = json.dumps(
+        {
+            "protocol": "hfc-native-handoff-recovery-v2",
+            "obligation_key": obligation_key,
+            "content_hash": "a" * 64,
+            "plan_fingerprint": "b" * 64,
+            "route": "thread-create",
+            "target_hash": target_hash,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    headers = sign_native_handoff_recovery_request(
+        TRANSPORT_ROOT_SECRET,
+        body,
+        timestamp=int(sidecar_server.time.time()),
+        nonce="native-recovery-server-0001",
+    )
+    try:
+        response = await test_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=headers,
+        )
+        payload = await response.json()
+        mismatch_payloads = []
+        for index, (field, value) in enumerate(
+            (
+                ("content_hash", "f" * 64),
+                ("plan_fingerprint", "f" * 64),
+                ("route", "create"),
+                ("target_hash", "f" * 64),
+            ),
+            start=1,
+        ):
+            mismatched = json.loads(body.decode("utf-8"))
+            mismatched[field] = value
+            mismatch_body = json.dumps(
+                mismatched, separators=(",", ":")
+            ).encode("utf-8")
+            mismatch_response = await test_client.post(
+                "/native-handoff/recover",
+                data=mismatch_body,
+                headers=sign_native_handoff_recovery_request(
+                    TRANSPORT_ROOT_SECRET,
+                    mismatch_body,
+                    timestamp=int(sidecar_server.time.time()),
+                    nonce=f"native-recovery-mismatch-000{index}",
+                ),
+            )
+            mismatch_payloads.append(
+                (mismatch_response.status, await mismatch_response.json())
+            )
+        replay = await test_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=headers,
+        )
+        replay_payload = await replay.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert payload == {
+        "ok": True,
+        "found": True,
+        "native_handoff": record.descriptor(),
+    }
+    assert mismatch_payloads == [
+        (200, {"ok": True, "found": False}),
+        (200, {"ok": True, "found": False}),
+        (200, {"ok": True, "found": False}),
+        (200, {"ok": True, "found": False}),
+    ]
+    serialized = json.dumps(payload)
+    assert "private" not in serialized
+    assert replay.status == 401
+    assert replay_payload == {
+        "ok": False,
+        "error": "native handoff authentication failed",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "protocol": "hfc-native-handoff-recovery-v1",
+            "obligation_key": "a" * 64,
+        },
+        {
+            "protocol": "hfc-native-handoff-recovery-v2",
+            "obligation_key": "a" * 64,
+            "content_hash": "not-a-hash",
+            "plan_fingerprint": "b" * 64,
+            "route": "create",
+            "target_hash": "c" * 64,
+        },
+        {
+            "protocol": "hfc-native-handoff-recovery-v2",
+            "obligation_key": "a" * 64,
+            "content_hash": "b" * 64,
+            "plan_fingerprint": "c" * 64,
+            "route": "reply",
+            "target_hash": "d" * 64,
+        },
+    ],
+)
+async def test_signed_recovery_rejects_non_exact_v2_requests(tmp_path, payload):
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    try:
+        response = await test_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=sign_native_handoff_recovery_request(
+                TRANSPORT_ROOT_SECRET,
+                body,
+                timestamp=int(sidecar_server.time.time()),
+                nonce="native-recovery-invalid-0001",
+            ),
+        )
+        response_payload = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 400
+    assert response_payload == {
+        "ok": False,
+        "error": "invalid native handoff recovery",
+    }
+
+
+async def test_native_started_generation_fence_prevents_prior_tombstone_swallow(tmp_path):
+    raw_chat_id = "oc_native_generation_fence"
+    message_id = "message-reused-generation"
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id=raw_chat_id,
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 300.0)
+    store.begin_no_card(
+        identity,
+        event_created_at=100.0,
+        generation="1" * 32,
+        ack_capable=False,
+    )
+    app = create_app(
+        FakeFeishuClient(),
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+        native_handoff_store=store,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": "2" * 32}},
+                chat_id=raw_chat_id,
+                message_id=message_id,
+                created_at=200.0,
+            ),
+        )
+        started_body = await started.json()
+        completed = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {
+                    "answer": "new native answer",
+                    "native_handoff": {"generation": "2" * 32},
+                },
+                chat_id=raw_chat_id,
+                message_id=message_id,
+                created_at=201.0,
+            ),
+        )
+        completed_body = await completed.json()
+    finally:
+        await test_client.close()
+
+    assert started_body == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert completed_body == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert store.get(identity).generation == "2" * 32
+
+
+async def test_completed_first_new_generation_rechecks_card_policy(tmp_path):
+    message_id = "message-completed-first-reuse"
+    identity = handoff_identity_key(
+        profile_id="default",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 300.0)
+    store.begin_no_card(
+        identity,
+        event_created_at=100.0,
+        generation="1" * 32,
+        ack_capable=False,
+    )
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    answer = "NEW-COMPLETED-FIRST-" + ("密" * 40_000)
+    payload = event_payload(
+        "message.completed",
+        0,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                "2" * 32,
+                "3" * 64,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+        created_at=201.0,
+    )
+    try:
+        response = await test_client.post("/events", json=payload)
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert body["applied"] is False
+    assert body["disposition"] == "native"
+    assert body["native_handoff"]["protocol"] == "hfc-native-handoff-v2"
+    assert store.get(identity).generation == "2" * 32
+
+
+@pytest.mark.parametrize("table_header", [False, True])
+async def test_existing_card_terminal_oversize_hands_off_once_and_duplicate_is_applied(client, table_header):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-TERMINAL-" + ("密" * 40_000)
+    if table_header:
+        sensitive = f"| key | {sensitive}TAIL_MUST_SURVIVE |\n| --- | --- |\n| item | data |\n"
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    _, handoff_card = await wait_for_card_update(
+        feishu_client,
+        "完整内容已切换为 Hermes 原生消息发送",
+    )
+    assert "SENSITIVE-TERMINAL" not in str(handoff_card)
+    update_count = len(feishu_client.updated)
+
+    duplicate = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+    await asyncio.sleep(0.05)
+
+    assert await duplicate.json() == {"ok": True, "applied": True}
+    assert len(feishu_client.updated) == update_count
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.answer_text == sensitive.rstrip("\n")
+    assert session.terminal_disposition == "native"
+    assert session.terminal_limit_reason == "json_bytes"
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_applied"] == 3
+    assert metrics["events_ignored"] == 0
+    assert metrics["card_native_handoffs"] == 1
+    assert metrics["card_limit_json_bytes"] == 1
+
+
+async def test_terminal_only_oversize_cron_uses_native_without_sending_handoff_card(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-CRON-" + ("密" * 40_000)
+    payload = event_payload(
+        "message.completed",
+        0,
+        {"answer": sensitive, "delivery_kind": "cron"},
+        message_id="cron_oversize",
+    )
+
+    completed = await test_client.post("/events", json=payload)
+    duplicate = await test_client.post("/events", json=payload)
+
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert await duplicate.json() == {"ok": True, "applied": True}
+    assert feishu_client.sent == []
+    assert feishu_client.updated == []
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.answer_text == sensitive
+    assert session.terminal_disposition == "native"
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_applied"] == 2
+    assert metrics["events_ignored"] == 0
+    assert metrics["cron_cards_sent"] == 0
+    assert metrics["cron_fallbacks"] == 1
+    assert metrics["card_native_handoffs"] == 1
+
+
+async def test_terminal_only_handoff_survives_restart_and_duplicate_is_applied(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    payload = event_payload(
+        "message.completed",
+        0,
+        {"answer": "SENSITIVE-QUEUED-" + ("密" * 40_000), "queue_state": "queued"},
+        message_id="message-restart-stable",
+    )
+    first_feishu = FakeFeishuClient()
+    first_app = create_app(
+        first_feishu,
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    first_client = TestClient(TestServer(first_app))
+    await first_client.start_server()
+    try:
+        first = await first_client.post("/events", json=payload)
+        assert await first.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert first_feishu.sent == []
+    finally:
+        await first_client.close()
+
+    second_feishu = FakeFeishuClient()
+    second_app = create_app(
+        second_feishu,
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        duplicate = await second_client.post("/events", json=payload)
+        assert await duplicate.json() == {"ok": True, "applied": True}
+        assert second_feishu.sent == []
+        assert second_feishu.updated == []
+    finally:
+        await second_client.close()
+
+
+async def test_pending_card_notice_does_not_persist_raw_restart_repair_locator(
+    tmp_path,
+    monkeypatch,
+):
+    state_root = tmp_path / "handoff-state"
+    payload = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-REPAIR-" + ("密" * 40_000)},
+        message_id="message-pending-stable",
+    )
+    failing_feishu = FakeFeishuClient()
+    failing_feishu.update_failures_remaining = 100
+    first_app = create_app(
+        failing_feishu,
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    first_client = TestClient(TestServer(first_app))
+
+    async def no_delayed_retry(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(sidecar_server, "_retry_terminal_update", no_delayed_retry)
+    await first_client.start_server()
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, message_id="message-pending-stable"
+            ),
+        )
+        first = await first_client.post("/events", json=payload)
+        assert await first.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        identity = handoff_identity_key(
+            profile_id="",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id="message-pending-stable",
+        )
+        await wait_for_condition(
+            lambda: first_app[NATIVE_HANDOFF_STORE_KEY].get(identity).state
+            == "pending"
+        )
+    finally:
+        await first_client.close()
+
+    repaired_feishu = FakeFeishuClient()
+    second_store = NativeHandoffStore(state_root)
+    second_app = create_app(
+        repaired_feishu,
+        native_handoff_store=second_store,
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        duplicate = await second_client.post("/events", json=payload)
+        assert await duplicate.json() == {"ok": True, "applied": True}
+        assert repaired_feishu.sent == []
+        assert repaired_feishu.updated == []
+        # The durable store intentionally has no raw Feishu locator. The
+        # decorative terminal notice is a best-effort task in the original
+        # process; native-final crash recovery belongs to Hermes' delivery
+        # ledger and its opaque obligation-key lookup.
+        serialized = (state_root / "native-handoffs.json").read_text()
+        assert "feishu-message-1" not in serialized
+        assert "SENSITIVE-REPAIR" not in serialized
+        assert second_store.get(identity).card_state == "pending"
+    finally:
+        await second_client.close()
+
+
+async def test_cleanup_does_not_remove_committed_handoff_deduplication(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-CLEANUP-" + ("密" * 40_000)
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+    assert (await completed.json())["disposition"] == "native"
+    await wait_for_card_update(
+        feishu_client,
+        "完整内容已切换为 Hermes 原生消息发送",
+    )
+    update_count = len(feishu_client.updated)
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    cleanup_runtime_state(sidecar_server._cleanup_state_for_app(test_client.app), now=session.updated_at + 3601)
+    assert test_client.app[SESSIONS_KEY] == {}
+
+    duplicate = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+    assert await duplicate.json() == {"ok": True, "applied": True}
+    await asyncio.sleep(0.05)
+    assert len(feishu_client.updated) == update_count
+
+
+async def test_new_started_lifecycle_clears_same_identity_handoff(client):
+    test_client, feishu_client = client
+    payload = event_payload(
+        "message.completed",
+        0,
+        {"answer": "SENSITIVE-FIRST-" + ("密" * 40_000)},
+        message_id="reused-message-id",
+        created_at=1777017600.0,
+    )
+    first = await test_client.post("/events", json=payload)
+    assert (await first.json())["disposition"] == "native"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id="reused-message-id",
+            created_at=1777017700.0,
+        ),
+    )
+    assert (await started.json())["applied"] is True
+    assert len(feishu_client.sent) == 1
+
+    second = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-SECOND-" + ("密" * 40_000)},
+            message_id="reused-message-id",
+            created_at=1777017701.0,
+        ),
+    )
+    assert await second.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+
+
+async def test_explicit_new_lifecycle_without_started_clears_handoff(client):
+    test_client, feishu_client = client
+    message_id = "explicit-lifecycle-id"
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            0,
+            {"answer": "SENSITIVE-OLD-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017600.0,
+        ),
+    )
+
+    fresh = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            0,
+            {"text": "fresh lifecycle", "lifecycle_start": True},
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+
+    assert (await fresh.json())["applied"] is True
+    assert len(feishu_client.sent) == 1
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.answer_text == "fresh lifecycle"
+
+
+async def test_replayed_old_started_does_not_clear_handoff_tombstone(client):
+    test_client, feishu_client = client
+    message_id = "replayed-started-id"
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-REPLAY-" + ("密" * 40_000)},
+        message_id=message_id,
+        created_at=1777017700.0,
+    )
+    first = await test_client.post("/events", json=completed_payload)
+    assert (await first.json())["disposition"] == "native"
+
+    replayed_started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017600.0,
+        ),
+    )
+    assert await replayed_started.json() == {"ok": True, "applied": False}
+    assert feishu_client.sent == []
+
+    duplicate = await test_client.post("/events", json=completed_payload)
+    assert await duplicate.json() == {"ok": True, "applied": True}
+    assert feishu_client.sent == []
+
+
+async def test_replayed_old_terminal_cannot_complete_new_lifecycle(client):
+    test_client, feishu_client = client
+    message_id = "interleaved-lifecycle-id"
+    old_completed = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-OLD-TERMINAL-" + ("密" * 40_000)},
+        message_id=message_id,
+        created_at=1777017601.0,
+    )
+    first = await test_client.post("/events", json=old_completed)
+    assert (await first.json())["disposition"] == "native"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    assert (await started.json())["applied"] is True
+
+    stale = await test_client.post("/events", json=old_completed)
+    assert await stale.json() == {"ok": True, "applied": True}
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.status == "thinking"
+    assert session.answer_text == ""
+
+    fresh = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-NEW-TERMINAL-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017701.0,
+        ),
+    )
+    assert await fresh.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert len(feishu_client.sent) == 1
+
+
+async def test_new_terminal_equal_to_lifecycle_timestamp_is_allowed(client):
+    test_client, _feishu_client = client
+    message_id = "equal-lifecycle-timestamp-id"
+    first = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-EQUAL-OLD-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017600.0,
+        ),
+    )
+    assert (await first.json())["disposition"] == "native"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    assert (await started.json())["applied"] is True
+
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-EQUAL-NEW-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+
+
+async def test_cleanup_tracks_all_repair_tasks_when_identity_is_reused(tmp_path):
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    blocker = asyncio.Event()
+
+    async def wait_forever():
+        await blocker.wait()
+
+    first = asyncio.create_task(wait_forever())
+    second = asyncio.create_task(wait_forever())
+    sidecar_server._track_native_handoff_repair_task(app, "same-identity", first)
+    sidecar_server._track_native_handoff_repair_task(app, "same-identity", second)
+    try:
+        await sidecar_server._stop_native_handoff_repairs(app)
+        assert first.done()
+        assert second.done()
+    finally:
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+
+
+async def test_new_lifecycle_cancels_previous_handoff_repair(client):
+    test_client, _feishu_client = client
+    message_id = "cancel-old-repair-id"
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    store = test_client.app[NATIVE_HANDOFF_STORE_KEY]
+    store.begin(
+        identity,
+        feishu_message_id="fake-card-old",
+        bot_id="fake-bot",
+        event_created_at=1777017600.0,
+    )
+    blocker = asyncio.Event()
+
+    async def wait_forever():
+        await blocker.wait()
+
+    old_repair = asyncio.create_task(wait_forever())
+    sidecar_server._track_native_handoff_repair_task(
+        test_client.app,
+        identity,
+        old_repair,
+    )
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    await asyncio.gather(old_repair, return_exceptions=True)
+
+    assert (await started.json())["applied"] is True
+    assert old_repair.cancelled()
+
+
+@pytest.mark.parametrize("with_existing_card", [False, True])
+async def test_handoff_store_failure_does_not_consume_terminal_session(
+    client,
+    monkeypatch,
+    with_existing_card,
+):
+    test_client, _feishu_client = client
+    if with_existing_card:
+        started = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+        assert (await started.json())["applied"] is True
+
+    store = test_client.app[NATIVE_HANDOFF_STORE_KEY]
+    real_write = store._write_records
+
+    def fail_write(*_args, **_kwargs):
+        raise sidecar_server.NativeHandoffStoreError("injected write failure")
+
+    monkeypatch.setattr(store, "_write_records", fail_write)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-STORE-FAILURE-" + ("密" * 40_000)},
+    )
+    failed = await test_client.post("/events", json=completed_payload)
+
+    assert failed.status == 503
+    if with_existing_card:
+        session = next(iter(test_client.app[SESSIONS_KEY].values()))
+        assert session.status == "thinking"
+        assert session.answer_text == ""
+    else:
+        assert test_client.app[SESSIONS_KEY] == {}
+
+    monkeypatch.setattr(store, "_write_records", real_write)
+    retried = await test_client.post("/events", json=completed_payload)
+    assert await retried.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+
+
+async def test_existing_card_oversize_cron_records_native_fallback(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"delivery_kind": "cron"},
+            message_id="cron_existing",
+        ),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "密" * 40_000, "delivery_kind": "cron"},
+            message_id="cron_existing",
+        ),
+    )
+
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    await wait_for_card_update(
+        feishu_client,
+        "完整内容已切换为 Hermes 原生消息发送",
+    )
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["cron_fallbacks"] == 1
+
+
+async def test_v4_runtime_header_and_interim_body_share_one_card(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "thinking.delta",
+            1,
+            {"text": "我先检查天气客户端。", "mode": "append_block"},
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 weather_client.py",
+            },
+        ),
+    )
+
+    _, running = await wait_for_card_update(feishu_client, "读取文件：weather_client.py")
+    # Maintainer note (contract change): was "⏳ 正在读取 · Hermes Agent". The user asked the title
+    # to lead with the session name and the running metrics; the action phrase then moved OFF the
+    # title onto the header's second row ("标题的正在使用之类的，放到第二行").
+    assert running["header"]["title"]["content"] == "⏳ Hermes Agent · 工具 #1"
+    assert running["header"]["subtitle"]["content"] == "读取文件：weather_client.py"
+    # The user asked the second row to name the concrete work, so the target IS in the header now
+    # (capped); it also still renders in the content-area tool row.
+    assert "读取文件：weather_client.py" in str(running)
+    assert "我先检查天气客户端。" in str(running)
+    assert all(
+        message_id == "feishu-message-1"
+        for message_id, _card in feishu_client.updated
+    )
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            3,
+            {
+                "answer": "广州今天有短时阵雨。",
+                "duration": 3.0,
+                "model": "gpt-5.5",
+                "tokens": {"input_tokens": 100, "output_tokens": 20},
+                "context": {"used_tokens": 120, "max_tokens": 272000},
+            },
+        ),
+    )
+
+    _, completed = await wait_for_card_update(
+        feishu_client,
+        "广州今天有短时阵雨。",
+    )
+    # Maintainer note (contract change): was "✅ Hermes Agent" — the completed title now carries
+    # duration + tool count too (duration 3.0 was posted above), phrase dropped.
+    assert completed["header"]["title"]["content"] == "✅ Hermes Agent · 工具 #1 · 3s"
+    assert "读取文件：weather_client.py" not in str(completed["header"])
+    assert "gpt-5.5" in str(completed)
+
+
+async def test_v4_interaction_restores_cached_preview_on_stable_v2_card(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 weather_client.py",
+            },
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            2,
+            {
+                "interaction_id": "approval-v4",
+                "kind": "approval",
+                "prompt": "允许读取精确位置吗？",
+                "description": "仅用于本次查询。",
+                "options": [
+                    {
+                        "label": "允许一次",
+                        "value": "once",
+                        "style": "primary",
+                    }
+                ],
+            },
+        ),
+    )
+
+    assert len(feishu_client.sent) == 2
+    waiting = feishu_client.sent[-1][1]
+    assert "允许读取精确位置吗？" in str(waiting)
+    assert waiting["header"]["title"]["content"] == "待审批：允许读取精确位置吗？"
+    button = interaction_buttons(waiting)[0]
+    action_value = button["value"]
+
+    response = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": action_value},
+            }
+        },
+    )
+
+    assert response.status == 200
+    _, resumed = await wait_for_card_update(feishu_client, "已选择：允许一次")
+    # Maintainer note (contract change): was "⏳ 正在读取 · Hermes Agent" — see the note in
+    # test_v4_runtime_header_and_interim_body_share_one_card. The phrase is the second row now.
+    assert resumed["header"]["title"]["content"] == "⏳ Hermes Agent · 工具 #1"
+    assert resumed["header"]["subtitle"]["content"] == "读取文件：weather_client.py"
+    assert "读取文件：weather_client.py" in str(resumed)
+    assert len(feishu_client.sent) == 2
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
+
+
+async def test_interaction_promotion_preserves_session_thread_placement(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_explicit_anchor",
+            },
+            message_id="om_runtime_identity",
+            turn_id="turn-placement",
+        ),
+    )
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-session-placement",
+                "kind": "approval",
+                "prompt": "是否继续？",
+                "options": [{"label": "继续", "value": "yes"}],
+            },
+            message_id="om_interaction_identity",
+            turn_id="turn-placement",
+        ),
+    )
+
+    assert started.status == 200
+    assert requested.status == 200
+    assert feishu_client.sent_reply_in_thread == [True, True]
+    assert feishu_client.sent[-1][3] == "om_explicit_anchor"
+
+
+async def test_interaction_promotion_finalizes_predecessor_snapshot(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"card": {"title": "Scoped Hermes Agent"}},
+            turn_id="turn-handoff",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "thinking.delta",
+            1,
+            {"text": "我先检查天气客户端。", "mode": "append_block"},
+            turn_id="turn-handoff",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 weather_client.py",
+            },
+            turn_id="turn-handoff",
+        ),
+    )
+
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            3,
+            {
+                "interaction_id": "approval-handoff",
+                "kind": "approval",
+                "prompt": "允许读取精确位置吗？",
+                "description": "仅用于本次查询。",
+                "options": [
+                    {
+                        "label": "允许一次",
+                        "value": "once",
+                        "style": "primary",
+                    }
+                ],
+            },
+            turn_id="turn-handoff",
+        ),
+    )
+
+    assert requested.status == 200
+    predecessor_snapshots = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-1"
+        and "已转入交互卡片" in str(card)
+    ]
+    assert len(predecessor_snapshots) == 1
+    snapshot = predecessor_snapshots[0]
+    assert snapshot["header"] == {
+        "template": "green",
+        # Maintainer note (contract change): the completed title carries the metrics too
+        # ("✅ Scoped Hermes Agent · 工具 #1"), per the user's request — see the note in
+        # test_v4_runtime_header_and_interim_body_share_one_card.
+        "title": {"tag": "plain_text", "content": "✅ Scoped Hermes Agent · 工具 #1"},
+        "subtitle": {"tag": "plain_text", "content": "已转入交互卡片"},
+    }
+    assert snapshot["config"]["summary"]["content"] == "已转入交互卡片"
+    assert "我先检查天气客户端。" in str(snapshot)
+    assert "read_file" in str(snapshot)
+    assert "读取文件：weather_client.py" not in str(snapshot["header"])
+    assert interaction_buttons(snapshot) == []
+    assert "approval-handoff" not in str(snapshot)
+
+    replacement = feishu_client.sent[-1][1]
+    assert "允许读取精确位置吗？" in str(replacement)
+    assert interaction_buttons(replacement)
+
+
+async def test_v4_preview_burst_coalesces_and_late_preview_cannot_reopen_card(
+    client,
+):
+    test_client, feishu_client = client
+    feishu_client.update_delay = 0.03
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    responses = []
+    for index in range(1, 16):
+        responses.append(
+            await test_client.post(
+                "/events",
+                json=event_payload(
+                    "tool.updated",
+                    index,
+                    {
+                        "tool_id": f"tool-{index}",
+                        "name": "read_file",
+                        "status": "running",
+                        "detail": f"读取 file-{index}.py",
+                    },
+                ),
+            )
+        )
+    assert all(response.status == 200 for response in responses)
+
+    _, running = await wait_for_card_update(feishu_client, "读取文件：file-15.py")
+    # Maintainer note (contract change): was "⏳ 正在读取 · Hermes Agent" — the title now carries the
+    # tool count (15 updates = 15 tool calls here); the action phrase is the header's second row.
+    assert running["header"]["title"]["content"] == "⏳ Hermes Agent · 工具 #15"
+    assert running["header"]["subtitle"]["content"] == "读取文件：file-15.py"
+    assert "读取文件：file-15.py" in str(running)
+
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 16, {"answer": "完成"}),
+    )
+    assert await completed.json() == {"ok": True, "applied": True}
+    await wait_for_card_update(feishu_client, "完成")
+    updates_before_late = len(feishu_client.updated)
+
+    late = await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            17,
+            {
+                "tool_id": "late",
+                "name": "terminal",
+                "status": "running",
+                "detail": "迟到命令",
+            },
+        ),
+    )
+    assert await late.json() == {"ok": True, "applied": False}
+    assert len(feishu_client.updated) == updates_before_late
+
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["update_coalesced"] > 0
+    assert metrics["update_queue_peak"] > 1
+
+
+async def test_completed_without_deltas_updates_started_card(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "DeepSeek 一次性返回的最终答案"},
+        ),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+    assert len(feishu_client.sent) == 1
+    await wait_for_card_update(feishu_client, "DeepSeek 一次性返回的最终答案")
+    assert len(feishu_client.updated) == 1
+    assert "DeepSeek 一次性返回的最终答案" in str(feishu_client.updated[-1][1])
+
+    health = await test_client.get("/health")
+    body = await health.json()
+    assert "hermes-message-1" not in body["sessions"]
+    assert len(body["sessions"]) == 1
+    session_snapshot = next(iter(body["sessions"].values()))
+    assert session_snapshot["status"] == "completed"
+    assert session_snapshot["answer_chars"] > 0
+    assert body["metrics"]["feishu_update_attempts"] == 1
+
+
+async def test_completion_notify_is_disabled_by_default(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "sender_open_id": "ou_sender-01",
+                "reply_to_message_id": "om_user_message",
+            },
+        ),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "done", "sender_open_id": "ou_sender-01"},
+        ),
+    )
+
+    assert completed.status == 200
+    assert feishu_client.texts == []
+
+
+async def test_completion_notify_updates_card_then_mentions_once_when_enabled(
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"placement": "message", "enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    "sender_open_id": "ou_sender-01",
+                    "reply_to_message_id": "om_user_message",
+                },
+                thread_id="omt_thread",
+            ),
+        )
+        feishu_client.operations.clear()
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": "done",
+                "duration": 65.0,
+                "sender_open_id": "ou_sender-01",
+            },
+            thread_id="omt_thread",
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        replay = await test_client.post("/events", json=completed_payload)
+
+        assert first.status == 200
+        assert replay.status == 200
+        assert feishu_client.operations[-2:] == ["update", "text"]
+        assert feishu_client.texts == [
+            (
+                "oc_abc",
+                '<at user_id="ou_sender-01"></at> ✅ 本轮回复结束（用时 1m5s）',
+                "omt_thread",
+                "om_user_message",
+            )
+        ]
+        session = app[SESSIONS_KEY]["hermes-message-1"]
+        assert session.completion_notify_state == "sent"
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_sends_plain_without_sender_when_mention_disabled(
+    tmp_path,
+):
+    """mention=false must send the plain completion notify even without a
+    sender_open_id (system/background turns have no requester to @)."""
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"placement": "message", "enabled": True, "mention": False}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    # No sender_open_id: system / background turn.
+                    "reply_to_message_id": "",
+                },
+                thread_id="omt_thread",
+            ),
+        )
+        feishu_client.operations.clear()
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {"answer": "done"},
+            thread_id="omt_thread",
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        replay = await test_client.post("/events", json=completed_payload)
+
+        assert first.status == 200
+        assert replay.status == 200
+        assert feishu_client.texts == [
+            ("oc_abc", "✅ 本轮回复结束", "omt_thread", None)
+        ]
+        session = app[SESSIONS_KEY]["hermes-message-1"]
+        assert session.completion_notify_state == "sent"
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_rejects_invalid_sender_when_mention_enabled(
+    tmp_path,
+):
+    """mention=true (default) still refuses to send when the sender_open_id
+    is present but invalid -- no plain fallback notification."""
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"placement": "message", "enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"sender_open_id": "user_not_an_ou", "reply_to_message_id": ""},
+                thread_id="omt_thread",
+            ),
+        )
+        feishu_client.operations.clear()
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {"answer": "done", "sender_open_id": "user_not_an_ou"},
+            thread_id="omt_thread",
+        )
+        await test_client.post("/events", json=completed_payload)
+
+        assert feishu_client.texts == []
+        session = app[SESSIONS_KEY]["hermes-message-1"]
+        assert session.completion_notify_state == "idle"
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_preserves_reply_in_thread_without_thread_id(
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"placement": "message", "enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    "sender_open_id": "ou_sender-01",
+                    "reply_in_thread": True,
+                    "reply_to_message_id": "om_user_message",
+                },
+            ),
+        )
+        completed = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {
+                    "answer": "done",
+                    "sender_open_id": "ou_sender-01",
+                },
+            ),
+        )
+
+        assert started.status == 200
+        assert completed.status == 200
+        assert feishu_client.texts == [
+            (
+                "oc_abc",
+                '<at user_id="ou_sender-01"></at> ✅ 本轮回复结束',
+                None,
+                "om_user_message",
+            )
+        ]
+        assert feishu_client.texts_reply_in_thread == [True]
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_rejects_spoofed_sender_and_failed_send_is_retryable(
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"placement": "message", "enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"sender_open_id": 'ou_bad"><at user_id="ou_other"'},
+            ),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {"answer": "done"},
+            ),
+        )
+        assert feishu_client.texts == []
+        assert app[SESSIONS_KEY]["hermes-message-1"].sender_open_id == ""
+
+        app[SESSIONS_KEY].clear()
+        app[FEISHU_MESSAGE_IDS_KEY].clear()
+        feishu_client.fail_text = True
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"sender_open_id": "ou_sender-02"},
+                message_id="hermes-message-2",
+            ),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {"answer": "done", "sender_open_id": "ou_sender-02"},
+                message_id="hermes-message-2",
+            ),
+        )
+        assert feishu_client.texts == []
+        assert app[SESSIONS_KEY]["hermes-message-2"].completion_notify_state == "idle"
+    finally:
+        await test_client.close()
+
+
+async def test_card_config_reasoning_code_reaches_live_renderer():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"reasoning_format": "code"})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post("/events", json=event_payload("answer.delta", 1, {"text": "检查参数后执行"}))
+        await test_client.post("/events", json=event_payload("tool.updated", 2, {"tool_id": "t", "name": "terminal", "status": "completed"}))
+        await test_client.post("/events", json=event_payload("message.completed", 3, {"answer": "处理完成"}))
+        await wait_for_card_update(feishu_client, "处理完成")
+        elements = feishu_client.updated[-1][1]["body"]["elements"]
+        reasoning = next(item for item in elements if "reasoningentry" in item.get("element_id", ""))
+        assert "```text\n检查参数后执行\n```" in reasoning["content"]
+        assert any(item.get("tag") == "collapsible_panel" for item in elements)
+    finally:
+        await test_client.close()
+
+
+async def test_card_config_controls_timeline_rendering():
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={
+            "timeline_expanded": True,
+            "show_reasoning": True,
+            "max_timeline_items": 1,
+            "max_reasoning_chars": 20,
+            "max_tool_result_chars": 20,
+        },
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "answer.delta", 1, {"text": "第一段很长很长很长很长很长"}
+            ),
+        )
+        await wait_for_card_update(feishu_client, "生成中")
+        await _REAL_ASYNCIO_SLEEP(0.25)
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "tool.updated",
+                2,
+                {
+                    "tool_id": "read",
+                    "name": "read_file",
+                    "status": "completed",
+                    "detail": "abcdefghijklmnopqrstuvwxyz1234567890",
+                },
+            ),
+        )
+        await wait_for_card_update(feishu_client, "read_file")
+        await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 3, {"answer": "最终回答"}),
+        )
+        await wait_for_card_update(feishu_client, "最终回答")
+    finally:
+        await test_client.close()
+
+    card = feishu_client.updated[-1][1]
+    timeline = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("element_id") == "auxiliary_timeline"
+    )
+    assert timeline["expanded"] is True
+    assert "已折叠 1 条早期思考/工具记录" in str(timeline)
+    assert "工具详情过长，已截断" in str(timeline)
+    assert "内容已折叠" not in str(timeline)
+
+
+@pytest.mark.parametrize(
+    ("card_config", "expect_timeline", "expected_expanded", "thought_text"),
+    [
+        ({"show_reasoning": 0}, False, None, "数值 0 应该隐藏"),
+        ({"show_reasoning": "0"}, False, None, "字符串 0 应该隐藏"),
+        (
+            {"show_reasoning": True, "timeline_expanded": 1},
+            True,
+            True,
+            "数值 1 应该展开",
+        ),
+        (
+            {"show_reasoning": True, "timeline_expanded": "1"},
+            True,
+            True,
+            "字符串 1 应该展开",
+        ),
+    ],
+)
+async def test_card_config_string_booleans_control_timeline_rendering(
+    card_config, expect_timeline, expected_expanded, thought_text
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config=card_config)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post(
+            "/events",
+            json=event_payload("answer.delta", 1, {"text": thought_text}),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "tool.updated",
+                2,
+                {"tool_id": "config-tool", "name": "config_tool", "status": "completed"},
+            ),
+        )
+        await wait_for_card_update(feishu_client, "config_tool")
+        await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 3, {"answer": "最终回答"}),
+        )
+        await wait_for_card_update(feishu_client, "最终回答")
+    finally:
+        await test_client.close()
+
+    card = feishu_client.updated[-1][1]
+    content = str(card)
+    if not expect_timeline:
+        assert "auxiliary_timeline" not in content
+        assert thought_text not in content
+        return
+
+    timeline = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("element_id") == "auxiliary_timeline"
+    )
+    assert timeline["expanded"] is expected_expanded
+    assert thought_text in str(timeline)
+
+
+async def test_card_config_custom_status_markers_reach_renderer():
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={
+            "status": {
+                "active_markers": ["queued"],
+                "future_markers": ["resume later"],
+            }
+        },
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {"answer": "Queued now; resume later."},
+            ),
+        )
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    card = feishu_client.sent[0][1]
+    assert card["header"]["template"] == "blue"
+    assert "subtitle" not in card["header"]
+    assert card["config"]["summary"]["content"] == "生成中"
+    session = next(iter(app[SESSIONS_KEY].values()))
+    assert session.display_status == ""
+    assert session.display_status_source == "inferred"
+
+
+async def test_message_started_sends_card_as_thread_reply(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_user_message"},
+            conversation_id="conversation-1",
+            message_id="om_user_message",
+            thread_id="omt_thread",
+        ),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][0] == "oc_abc"
+    assert feishu_client.sent[0][2] == "omt_thread"
+    assert feishu_client.sent[0][3] == "om_user_message"
+    assert feishu_client.sent_reply_in_thread == [False]
+
+
+async def test_message_started_can_create_thread_from_reply_in_thread_flag(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_explicit_anchor",
+            },
+            conversation_id="conversation-1",
+            message_id="om_runtime_identity",
+        ),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][0] == "oc_abc"
+    assert feishu_client.sent[0][2] is None
+    assert feishu_client.sent[0][3] == "om_explicit_anchor"
+    assert feishu_client.sent_reply_in_thread == [True]
+
+
+async def test_message_started_does_not_fall_back_to_top_level_without_thread_anchor(
+    client,
+):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_in_thread": True},
+            conversation_id="conversation-1",
+            message_id="runtime-identity-without-feishu-anchor",
+        ),
+    )
+
+    assert started.status == 502
+    assert len(feishu_client.sent) == 0
+
+
+async def test_message_started_uses_user_message_as_normal_chat_reply_anchor(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            conversation_id="conversation-1",
+            message_id="om_user_message",
+        ),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][2] is None
+    assert feishu_client.sent[0][3] == "om_user_message"
+
+
+async def test_initial_loading_animation_updates_same_card_until_first_activity(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        sidecar_server,
+        "CARD_ANIMATION_INTERVAL_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "CARD_ANIMATION_MAX_UPDATES",
+        50,
+        raising=False,
+    )
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"flush_interval_ms": 0})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                conversation_id="conversation-animation",
+                message_id="message-animation",
+            ),
+        )
+        assert started.status == 200
+        await _wait_until(lambda: len(feishu_client.updated) >= 1)
+        assert {
+            message_id for message_id, _card in feishu_client.updated
+        } == {"feishu-message-1"}
+        assert "正在加载上下文…" in str(feishu_client.sent[0][1])
+
+        activity = await test_client.post(
+            "/events",
+            json=event_payload(
+                "answer.delta",
+                1,
+                {"text": "首个模型输出"},
+                conversation_id="conversation-animation",
+                message_id="message-animation",
+            ),
+        )
+        assert activity.status == 200
+        await wait_for_card_update(feishu_client, "首个模型输出")
+        updates_after_activity = len(feishu_client.updated)
+        await _REAL_ASYNCIO_SLEEP(0.05)
+
+        assert len(feishu_client.updated) == updates_after_activity
+        animation_tasks = app.get(
+            getattr(sidecar_server, "CARD_ANIMATION_TASKS_KEY", object()),
+            {},
+        )
+        assert "message-animation" not in animation_tasks
+    finally:
+        await test_client.close()
+
+
+async def test_running_tool_animation_refreshes_until_tool_finishes(monkeypatch):
+    monkeypatch.setattr(
+        sidecar_server,
+        "CARD_ANIMATION_INTERVAL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(sidecar_server, "CARD_ANIMATION_MAX_UPDATES", 50)
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"flush_interval_ms": 0})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload("answer.delta", 1, {"text": "准备执行工具"}),
+        )
+        await wait_for_card_update(feishu_client, "准备执行工具")
+        await _wait_until(
+            lambda: "msg-1"
+            not in app[sidecar_server.CARD_ANIMATION_TASKS_KEY]
+        )
+
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "tool.updated",
+                2,
+                {
+                    "tool_id": "terminal",
+                    "name": "terminal",
+                    "status": "running",
+                    "detail": "sleep 15",
+                },
+            ),
+        )
+        await wait_for_card_update(feishu_client, "sleep 15")
+        updates_after_tool_started = len(feishu_client.updated)
+        await _wait_until(
+            lambda: len(feishu_client.updated) > updates_after_tool_started
+        )
+
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "tool.updated",
+                3,
+                {
+                    "tool_id": "terminal",
+                    "name": "terminal",
+                    "status": "completed",
+                    "detail": "sleep 15",
+                    "duration_ms": 15000,
+                },
+            ),
+        )
+        await wait_for_card_update(feishu_client, "15s")
+        updates_after_tool_finished = len(feishu_client.updated)
+        await _REAL_ASYNCIO_SLEEP(0.05)
+
+        assert len(feishu_client.updated) == updates_after_tool_finished
+        assert "msg-1" not in app[sidecar_server.CARD_ANIMATION_TASKS_KEY]
+    finally:
+        await test_client.close()
+
+
+async def test_card_animation_stops_after_update_failure(monkeypatch):
+    monkeypatch.setattr(sidecar_server, "CARD_ANIMATION_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(sidecar_server, "CARD_ANIMATION_MAX_UPDATES", 50)
+    feishu_client = FakeFeishuClient()
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    app = create_app(feishu_client, card_config={"flush_interval_ms": 0})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+        await _wait_until(
+            lambda: app[METRICS_KEY].feishu_update_attempts
+            >= sidecar_server.UPDATE_MAX_ATTEMPTS
+        )
+        await _REAL_ASYNCIO_SLEEP(0.08)
+
+        assert (
+            app[METRICS_KEY].feishu_update_attempts
+            == sidecar_server.UPDATE_MAX_ATTEMPTS
+        )
+        assert "msg-1" not in app[sidecar_server.CARD_ANIMATION_TASKS_KEY]
+    finally:
+        await test_client.close()
+
+
+async def test_topic_stream_event_with_reply_anchor_updates_existing_card(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][2] == "omt_topic"
+    assert feishu_client.sent[0][3] == "om_topic_user"
+
+    tool = await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            1,
+            {
+                "reply_to_message_id": "om_topic_user",
+                "tool_id": "terminal",
+                "name": "terminal",
+                "status": "running",
+                "detail": "brew install ripgrep",
+            },
+            conversation_id="omt_topic",
+            message_id="om_topic_stream_reply",
+            thread_id="omt_topic",
+        ),
+    )
+
+    assert tool.status == 200
+    assert await tool.json() == {"ok": True, "applied": True}
+    message_id, card = await wait_for_card_update(feishu_client, "brew install ripgrep")
+    assert message_id == "feishu-message-1"
+    assert "terminal" in str(card)
+    assert len(feishu_client.sent) == 1
+
+
+async def test_topic_system_notice_with_reply_anchor_updates_existing_card(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+
+    notice = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "reply_to_message_id": "om_topic_user",
+                "title": "上下文窗口提示",
+                "content": (
+                    "ℹ️ Codex gpt-5.5 caps context at 272K, "
+                    "so auto-compaction was raised to 85%."
+                ),
+                "level": "info",
+                "notice_kind": "context-cap",
+                "notice_id": "context-cap",
+                "notice_scope": "session",
+            },
+            conversation_id="omt_topic",
+            message_id="om_topic_stream_reply",
+            thread_id="omt_topic",
+        ),
+    )
+
+    assert notice.status == 200
+    assert await notice.json() == {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "accepted"},
+    }
+    message_id, card = await wait_for_card_update(feishu_client, "auto-compaction")
+    assert message_id == "feishu-message-1"
+    assert "上下文窗口提示" in str(card)
+    assert len(feishu_client.sent) == 1
+
+
+async def test_turn_system_notice_with_user_message_id_updates_existing_card(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_quote"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+            turn_id="turn-runtime-1",
+        ),
+    )
+    notice = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "reply_to_message_id": "om_topic_user",
+                "title": "运行中",
+                "content": "⏳ Working — 3 min — iteration 7/300, terminal",
+                "level": "info",
+                "notice_kind": "heartbeat",
+                "notice_id": "heartbeat",
+                "notice_scope": "session",
+                "notice_terminal": False,
+            },
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+
+    assert started.status == notice.status == 200
+    assert await notice.json() == {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "accepted"},
+    }
+    assert len(feishu_client.sent) == 1
+    _message_id, card = await wait_for_card_update(feishu_client, "Working — 3 min")
+    assert "运行中" in str(card)
+
+
+async def test_existing_session_notice_update_failure_is_observable():
+    feishu_client = UpdateFailureClient()
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+        notice = await test_client.post(
+            "/events",
+            json=event_payload(
+                "system.notice",
+                1,
+                {
+                    "title": "运行提示",
+                    "content": "后台任务正在运行",
+                    "notice_kind": "context-cap",
+                    "notice_scope": "session",
+                },
+            ),
+        )
+        notice_body = await notice.json()
+        await _wait_until(
+            lambda: app[METRICS_KEY].feishu_update_failures
+            == sidecar_server.UPDATE_MAX_ATTEMPTS
+        )
+        health = await test_client.get("/health")
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert started.status == 200
+    assert notice.status == 200
+    assert notice_body == {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "accepted"},
+    }
+    assert health_body["metrics"]["notice_update_failures"] == 1
+    last_error = health_body["diagnostics"]["last_update_error"]
+    assert "FeishuAPIError" in last_error
+    assert "status_code=503" in last_error
+    assert "api_code=9499" in last_error
+    assert "private-update-token" not in last_error
+
+
+async def test_topic_second_message_reusing_message_id_sends_new_card(client):
+    """Feishu topic groups reuse the same message_id across turns. A second
+    message.started on the same (already-completed) key must send a NEW card,
+    not be ignored, so the second turn is not left card-less."""
+    test_client, feishu_client = client
+
+    # First turn: started -> answer -> completed on message_id om_topic_user.
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": "om_topic_user", "text": "first answer"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            2,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    assert completed.status == 200
+    assert len(feishu_client.sent) == 1
+
+    # Second turn in the SAME thread reuses the SAME message_id.
+    started2 = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    assert started2.status == 200
+    assert await started2.json() == DELIVERED_RESPONSE
+    # A brand-new card must be sent for the second turn.
+    assert len(feishu_client.sent) == 2
+
+    # And the second turn's content must render on the new card.
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": "om_topic_user", "text": "second answer"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    _mid, card = await wait_for_card_update(feishu_client, "second answer")
+    assert "second answer" in str(card)
+
+
+async def test_topic_second_message_started_while_active_is_ignored(client):
+    """A duplicate message.started while the session is still streaming must
+    still be ignored (no spurious second card)."""
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    assert len(feishu_client.sent) == 1
+
+    # Session still active (no completed) -> a second started is a duplicate.
+    dup = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": "om_topic_user"},
+            conversation_id="omt_topic",
+            message_id="om_topic_user",
+            thread_id="omt_topic",
+        ),
+    )
+    assert dup.status == 200
+    assert await dup.json() == {"ok": True, "applied": False}
+    assert len(feishu_client.sent) == 1
+
+
+@pytest.mark.parametrize("preset", ["classic", "task"])
+async def test_interaction_request_renders_buttons_and_callback_resolves(client, preset):
+    test_client, feishu_client = client
+    from hermes_feishu_card.reading import expand_reading_preset
+    test_client.app[sidecar_server.BASE_CARD_CONFIG_KEY].update(expand_reading_preset({"reading_preset": preset}))
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-1",
+                "kind": "approval",
+                "prompt": "允许执行命令吗？",
+                "description": "rm -rf /tmp/demo",
+                "allow_custom_input": False,
+                "options": [
+                    {"label": "允许一次", "value": "once", "style": "primary"},
+                    {"label": "拒绝", "value": "deny", "style": "danger"},
+                ],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    assert (await requested.json()) == {
+        "ok": True,
+        "applied": True,
+        "interaction_mode": "callback",
+    }
+    assert len(feishu_client.sent) == 2
+    interaction_card = feishu_client.sent[-1][1]
+    button = interaction_buttons(interaction_card)[0]
+    action_value = button["value"]
+
+    custom = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {
+                    "name": f"hfc_other_{action_value['token']}",
+                    "form_value": {"hfc_other": "please approve"},
+                },
+            }
+        },
+    )
+
+    assert custom.status == 400
+    assert (await custom.json())["error"] == "custom input not allowed"
+
+    callback = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": action_value},
+            }
+        },
+    )
+    result = await test_client.get("/interactions/approval-1")
+
+    assert callback.status == 200
+    callback_body = await callback.json()
+    assert callback_body["ok"] is True
+    assert callback_body["toast"]["type"] == "success"
+    assert callback_body["card"].get("schema") is None
+    assert "body" not in callback_body["card"]
+    assert "已选择：允许一次" in str(callback_body["card"])
+    if preset == "task":
+        assert "选择已记录" in callback_body["card"]["header"]["title"]["content"]
+    assert result.status == 200
+    assert await result.json() == {
+        "ok": True,
+        "status": "completed",
+        "choice": "once",
+        "choice_label": "允许一次",
+        "interaction_id": "approval-1",
+    }
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
+    assert "已选择：允许一次" in str(feishu_client.updated[-1][1])
+
+
+async def test_interaction_keeps_v2_owner_and_returns_legacy_callback_card():
+    feishu_client = DialectAwareFeishuClient()
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        requested = await test_client.post(
+            "/events",
+            json=event_payload(
+                "interaction.requested",
+                1,
+                {
+                    "interaction_id": "dialect-choice",
+                    "kind": "clarify",
+                    "prompt": "请选择",
+                    "options": [
+                        {
+                            "label": "Alpha",
+                            "value": "alpha",
+                            "style": "primary",
+                        }
+                    ],
+                },
+            ),
+        )
+
+        assert requested.status == 200
+        assert app[FEISHU_MESSAGE_IDS_KEY]["hermes-message-1"] == "feishu-message-1"
+        assert feishu_client.dialects == {
+            "feishu-message-1": "v2",
+            "feishu-message-2": "legacy",
+        }
+        interaction_card = feishu_client.sent[-1][1]
+        action_value = interaction_buttons(interaction_card)[0]["value"]
+
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {"open_chat_id": "oc_abc"},
+                    "action": {"value": action_value},
+                }
+            },
+        )
+        callback_body = await callback.json()
+
+        assert callback.status == 200
+        assert callback_body["card"].get("schema") is None
+        assert "body" not in callback_body["card"]
+        assert "已选择：Alpha" in str(callback_body["card"])
+        assert any(
+            message_id == "feishu-message-1" and "已选择：Alpha" in str(card)
+            for message_id, card in feishu_client.updated
+        )
+        assert all(
+            message_id != "feishu-message-2"
+            for message_id, _card in feishu_client.updated
+        )
+    finally:
+        await test_client.close()
+
+
+async def test_runtime_interaction_admission_requires_actual_delivery_and_canonical_replay(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        admitted = await test_client.post("/events", json=payload)
+
+        assert admitted.status == 200
+        assert await admitted.json() == {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "runtime_admission": True,
+        }
+        assert len(feishu_client.sent) == 2
+        replay = await test_client.post("/events", json=payload)
+        assert await replay.json() == await admitted.json()
+        assert len(feishu_client.sent) == 2
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_keeps_v2_owner_and_never_patches_legacy_card():
+    feishu_client = DialectAwareFeishuClient()
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    "reply_in_thread": True,
+                    "reply_to_message_id": "om_user_message",
+                },
+                turn_id="turn-runtime",
+                created_at=time.time(),
+            ),
+        )
+        admitted = await test_client.post(
+            "/events",
+            json=runtime_interaction_payload(runtime_descriptor(listener)),
+        )
+
+        assert admitted.status == 200
+        assert app[FEISHU_MESSAGE_IDS_KEY]["turn-runtime"] == "feishu-message-1"
+        assert feishu_client.dialects == {
+            "feishu-message-1": "v2",
+            "feishu-message-2": "legacy",
+        }
+        assert feishu_client.sent_reply_in_thread == [True, True]
+        action_value = interaction_buttons(feishu_client.sent[-1][1])[0]["value"]
+
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {
+                        "open_chat_id": "oc_abc",
+                        "profile_id": "default",
+                    },
+                    "action": {"value": action_value},
+                }
+            },
+        )
+        callback_body = await callback.json()
+
+        assert callback.status == 200
+        assert callback_body["card"].get("schema") is None
+        assert "body" not in callback_body["card"]
+        assert any(
+            message_id == "feishu-message-1" and "已选择：允许一次" in str(card)
+            for message_id, card in feishu_client.updated
+        )
+        assert all(
+            message_id != "feishu-message-2"
+            for message_id, _card in feishu_client.updated
+        )
+    finally:
+        listener.close()
+        await test_client.close()
+
+
+async def test_runtime_interaction_delivery_failure_rolls_back_fence_for_exact_retry(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        feishu_client.fail_send = True
+        failed = await test_client.post("/events", json=payload)
+        assert failed.status == 502
+        assert len(feishu_client.sent) == 1
+
+        feishu_client.fail_send = False
+        retried = await test_client.post("/events", json=payload)
+        assert retried.status == 200
+        assert (await retried.json())["runtime_admission"] is True
+        assert len(feishu_client.sent) == 2
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_action_resolves_listener_before_terminal_mutation(client):
+    test_client, feishu_client = client
+    observed = []
+
+    def resolve(payload):
+        session = test_client.app[SESSIONS_KEY]["turn-runtime"]
+        observed.append((payload, session.active_interaction.status))
+        return True
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        requested = await test_client.post(
+            "/events", json=runtime_interaction_payload(runtime_descriptor(listener))
+        )
+        assert requested.status == 200
+        card = feishu_client.sent[-1][1]
+        action_value = interaction_buttons(card)[0]["value"]
+
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                    "action": {"value": action_value},
+                }
+            },
+        )
+
+        assert callback.status == 200
+        callback_body = await callback.json()
+        assert observed and observed[0][1] == "pending"
+        callback_payload = observed[0][0]
+        assert set(callback_payload) == {
+            "protocol", "runtime_id", "interaction_key", "token", "choice", "expires_at"
+        }
+        assert callback_payload["choice"] == "once"
+        assert test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction.status == "completed", callback_body
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_callback_failure_keeps_pending_and_hides_descriptor(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: False)
+    listener.start()
+    descriptor = runtime_descriptor(listener)
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        requested = await test_client.post(
+            "/events", json=runtime_interaction_payload(descriptor)
+        )
+        assert requested.status == 200
+        card = feishu_client.sent[-1][1]
+        action_value = interaction_buttons(card)[0]["value"]
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                    "action": {"value": action_value},
+                }
+            },
+        )
+
+        assert callback.status == 503
+        result = await test_client.get("/interactions/runtime-approval-1")
+        assert (await result.json())["status"] == "pending"
+        health_response = await test_client.get("/health")
+        health_body = await health_response.json()
+        assert health_body["metrics"]["runtime_interaction_callback_attempts"] == 1
+        assert health_body["metrics"]["runtime_interaction_callback_successes"] == 0
+        assert health_body["metrics"]["runtime_interaction_callback_failures"] == 1
+        assert health_body["diagnostics"]["last_runtime_interaction_callback"] == "http_409"
+        health = json.dumps(health_body, ensure_ascii=False)
+        result_text = await result.text()
+        rendered = json.dumps(card, ensure_ascii=False)
+        for canary in (descriptor["runtime_id"], descriptor["interaction_key"], descriptor["token"], descriptor["resolve_url"]):
+            assert canary not in health
+            assert canary not in result_text
+            assert canary not in rendered
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_feishu_delivery_holds_no_message_lock(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        original_send = feishu_client.send_card
+        observed = []
+
+        async def probe_send(*args, **kwargs):
+            lock = test_client.app[MESSAGE_LOCKS_KEY]["turn-runtime"]
+            observed.append(lock.locked())
+            return await original_send(*args, **kwargs)
+
+        feishu_client.send_card = probe_send
+        requested = await test_client.post(
+            "/events", json=runtime_interaction_payload(runtime_descriptor(listener))
+        )
+
+        assert requested.status == 200
+        assert observed == [False]
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_owner_cancellation_keeps_delivery_and_canonical_replay(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        original_send = feishu_client.send_card
+
+        async def blocked_send(*args, **kwargs):
+            delivery_started.set()
+            await release_delivery.wait()
+            return await original_send(*args, **kwargs)
+
+        feishu_client.send_card = blocked_send
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        owner = asyncio.create_task(test_client.post("/events", json=payload))
+        await asyncio.wait_for(delivery_started.wait(), timeout=1.0)
+        owner.cancel()
+        release_delivery.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+
+        deadline = time.monotonic() + 1.0
+        while len(feishu_client.sent) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(feishu_client.sent) == 2
+
+        replay = await test_client.post("/events", json=payload)
+        assert await replay.json() == {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "runtime_admission": True,
+        }
+        assert len(feishu_client.sent) == 2
+    finally:
+        release_delivery.set()
+        listener.close()
+
+
+async def test_runtime_interaction_expiry_during_blocked_callback_erases_admission(client, monkeypatch):
+    test_client, feishu_client = client
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    entered = threading.Event()
+    release = threading.Event()
+
+    def resolve(payload):
+        entered.set()
+        release.wait(timeout=5.0)
+        return True
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    descriptor = runtime_descriptor(listener)
+    descriptor["expires_at"] = clock[0] + 1.0
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events", json=runtime_interaction_payload(descriptor)
+            )
+        ).status == 200
+        card = feishu_client.sent[-1][1]
+        action_value = interaction_buttons(card)[0]["value"]
+        action = asyncio.create_task(
+            test_client.post(
+                "/card/actions",
+                json={
+                    "event": {
+                        "operator": {"open_id": "ou_bailey"},
+                        "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                        "action": {"value": action_value},
+                    }
+                },
+            )
+        )
+        deadline = time.monotonic() + 5.0
+        while not entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        # Expire only after the callback has entered, independent of host speed.
+        clock[0] += 2.0
+        release.set()
+        response = await action
+        assert response.status in {409, 503}
+        interaction = test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction
+        assert interaction.status == "failed"
+        assert interaction.runtime_admission is None
+    finally:
+        release.set()
+        listener.close()
+
+
+async def test_runtime_interaction_session_replacement_during_callback_clears_old_admission(client):
+    test_client, feishu_client = client
+    entered = threading.Event()
+    release = threading.Event()
+
+    def resolve(payload):
+        entered.set()
+        release.wait(timeout=1.0)
+        return True
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events",
+                json=runtime_interaction_payload(runtime_descriptor(listener)),
+            )
+        ).status == 200
+        old_session = test_client.app[SESSIONS_KEY]["turn-runtime"]
+        card = feishu_client.sent[-1][1]
+        action_value = interaction_buttons(card)[0]["value"]
+        action = asyncio.create_task(
+            test_client.post(
+                "/card/actions",
+                json={
+                    "event": {
+                        "operator": {"open_id": "ou_bailey"},
+                        "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                        "action": {"value": action_value},
+                    }
+                },
+            )
+        )
+        deadline = time.monotonic() + 1.0
+        while not entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        replacement = copy.copy(old_session)
+        test_client.app[SESSIONS_KEY]["turn-runtime"] = replacement
+        release.set()
+        response = await action
+
+        assert response.status == 409
+        assert replacement.active_interaction.status == "pending"
+        assert old_session.active_interaction.runtime_admission is None
+    finally:
+        release.set()
+        listener.close()
+
+
+async def test_runtime_interaction_app_cleanup_erases_hidden_admission(client):
+    test_client, _feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events",
+                json=runtime_interaction_payload(runtime_descriptor(listener)),
+            )
+        ).status == 200
+        interaction = test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction
+        assert interaction.runtime_admission is not None
+
+        await test_client.close()
+
+        assert interaction.runtime_admission is None
+        assert test_client.app[
+            sidecar_server.RUNTIME_INTERACTION_RESERVATIONS_KEY
+        ] == {}
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_concurrent_same_and_conflicting_actions_complete_once_without_lock(client):
+    test_client, feishu_client = client
+    selected = []
+    observed_locks = []
+    selected_lock = threading.Lock()
+
+    def resolve(payload):
+        observed_locks.append(
+            test_client.app[MESSAGE_LOCKS_KEY]["turn-runtime"].locked()
+        )
+        with selected_lock:
+            if not selected:
+                selected.append(payload["choice"])
+                return True
+            return selected[0] == payload["choice"]
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events",
+                json=runtime_interaction_payload(runtime_descriptor(listener)),
+            )
+        ).status == 200
+        card = feishu_client.sent[-1][1]
+        values = [item["value"] for item in interaction_buttons(card)]
+        once = next(value for value in values if value["choice"] == "once")
+        deny = next(value for value in values if value["choice"] == "deny")
+
+        async def act(value):
+            return await test_client.post(
+                "/card/actions",
+                json={
+                    "event": {
+                        "operator": {"open_id": "ou_bailey"},
+                        "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                        "action": {"value": value},
+                    }
+                },
+            )
+
+        responses = await asyncio.gather(act(once), act(once), act(deny))
+        statuses = [response.status for response in responses]
+        interaction = test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction
+
+        assert statuses.count(200) == 1
+        assert all(status in {200, 409, 503} for status in statuses)
+        assert interaction.status == "completed"
+        assert interaction.choice == selected[0]
+        assert interaction.runtime_admission is None
+        assert observed_locks and observed_locks == [False] * len(observed_locks)
+    finally:
+        listener.close()
+
+
+async def test_repeated_interactions_keep_one_v2_owner_and_fresh_legacy_cards(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_user_message",
+            },
+        ),
+    )
+    for sequence, interaction_id in ((1, "choice-1"), (2, "choice-2")):
+        requested = await test_client.post(
+            "/events",
+            json=event_payload(
+                "interaction.requested",
+                sequence,
+                {
+                    "interaction_id": interaction_id,
+                    "prompt": f"第 {sequence} 轮请选择",
+                    "options": [
+                        {"label": "继续", "value": "continue", "style": "primary"}
+                    ],
+                },
+            ),
+        )
+
+        assert requested.status == 200
+        assert len(feishu_client.sent) == sequence + 1
+        newest_card = feishu_client.sent[-1][1]
+        assert f"第 {sequence} 轮请选择" in str(newest_card)
+        assert interaction_buttons(newest_card)
+
+    assert feishu_client.sent[1][1] != feishu_client.sent[2][1]
+    assert feishu_client.sent_reply_in_thread == [True, True, True]
+    snapshots = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-1"
+        and "已转入交互卡片" in str(card)
+    ]
+    assert len(snapshots) == 2
+    for snapshot in snapshots:
+        assert interaction_buttons(snapshot) == []
+        assert "choice-1" not in str(snapshot)
+        assert "choice-2" not in str(snapshot)
+    assert all(
+        message_id == "feishu-message-1"
+        for message_id, _card in feishu_client.updated
+    )
+    assert test_client.app[FEISHU_MESSAGE_IDS_KEY][
+        "hermes-message-1"
+    ] == "feishu-message-1"
+
+    latest_card = feishu_client.sent[-1][1]
+    assert "第 2 轮请选择" in str(latest_card)
+    assert interaction_buttons(latest_card)
+
+
+async def test_batch_clarify_accepts_next_request_while_first_action_finishes(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    first = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "clarify-batch-first",
+                "kind": "clarify",
+                "prompt": "第一个问题",
+                "options": [{"label": "A", "value": "a"}],
+            },
+        ),
+    )
+    assert first.status == 200
+    first_action = interaction_buttons(feishu_client.sent[-1][1])[0]["value"]
+
+    feishu_client.update_delay = 0.2
+    action_task = asyncio.create_task(
+        test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey"},
+                    "context": {
+                        "open_chat_id": "oc_abc",
+                        "profile_id": "default",
+                    },
+                    "action": {"value": first_action},
+                }
+            },
+        )
+    )
+
+    session = test_client.app[SESSIONS_KEY]["hermes-message-1"]
+    for _ in range(100):
+        if (
+            session.active_interaction is not None
+            and session.active_interaction.status == "completed"
+        ):
+            break
+        await asyncio.sleep(0.005)
+    assert session.active_interaction is not None
+    assert session.active_interaction.status == "completed"
+    assert not action_task.done()
+
+    second = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            2,
+            {
+                "interaction_id": "clarify-batch-second",
+                "kind": "clarify",
+                "prompt": "第二个问题",
+                "options": [{"label": "B", "value": "b"}],
+            },
+        ),
+    )
+    second_body = await second.json()
+    action_response = await action_task
+    action_body = await action_response.json()
+
+    assert second.status == 200
+    assert second_body["applied"] is True
+    assert "第二个问题" in str(feishu_client.sent[-1][1])
+    assert action_response.status == 200
+    assert "第二个问题" not in str(action_body["card"])
+    assert session.active_interaction is not None
+    assert session.active_interaction.interaction_id == "clarify-batch-second"
+    assert session.active_interaction.status == "pending"
+
+
+async def test_completed_previous_interaction_choice_never_leaks_into_next_snapshot(
+    client,
+):
+    test_client, feishu_client = client
+    old_label = "保存为 skill（含重装流程与坑位清单）"
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "clarify-first",
+                "kind": "clarify",
+                "prompt": "第 1 轮请选择",
+                "allow_custom_input": True,
+                "options": [
+                    {"label": old_label, "value": "save", "style": "primary"},
+                    {"label": "不保存", "value": "skip", "style": "default"},
+                ],
+            },
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.completed",
+            2,
+            {
+                "interaction_id": "clarify-first",
+                "choice": "save",
+                "choice_label": old_label,
+            },
+        ),
+    )
+
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            3,
+            {
+                "interaction_id": "clarify-second",
+                "kind": "clarify",
+                "prompt": "第 2 轮请选择",
+                "allow_custom_input": True,
+                "options": [
+                    {"label": "A", "value": "a", "style": "primary"},
+                    {"label": "B", "value": "b", "style": "default"},
+                ],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    predecessor_snapshots = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-1"
+        and "已转入交互卡片" in str(card)
+    ]
+    assert len(predecessor_snapshots) == 2
+    snapshot_text = str(predecessor_snapshots[-1])
+    assert old_label not in snapshot_text
+    assert "已选择：" not in snapshot_text
+
+
+async def test_interaction_predecessor_update_failure_keeps_stable_owner(
+    client,
+):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "fail-open-choice",
+                "prompt": "请选择",
+                "options": [
+                    {"label": "继续", "value": "continue", "style": "primary"}
+                ],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    assert test_client.app[sidecar_server.FEISHU_MESSAGE_IDS_KEY][
+        "hermes-message-1"
+    ] == "feishu-message-1"
+    result = await test_client.get("/interactions/fail-open-choice")
+    assert await result.json() == {
+        "ok": True,
+        "interaction_id": "fail-open-choice",
+        "status": "pending",
+        "choice": "",
+        "choice_label": "",
+    }
+    metrics = test_client.app[METRICS_KEY]
+    assert metrics.feishu_update_failures == sidecar_server.UPDATE_MAX_ATTEMPTS
+    assert metrics.feishu_update_attempts == sidecar_server.UPDATE_MAX_ATTEMPTS
+
+    replacement = feishu_client.sent[-1][1]
+    button = interaction_buttons(replacement)[0]
+    callback = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": button["value"]},
+            }
+        },
+    )
+
+    assert callback.status == 200
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
+    assert "已选择：继续" in str(feishu_client.updated[-1][1])
+
+
+async def test_interaction_predecessor_animation_cancels_before_final_patch(client):
+    test_client, feishu_client = client
+    session_key = "hermes-message-1"
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    original_animation = test_client.app[sidecar_server.CARD_ANIMATION_TASKS_KEY].pop(
+        session_key
+    )
+    original_animation.cancel()
+    await asyncio.gather(original_animation, return_exceptions=True)
+
+    observed = []
+    animation_started = asyncio.Event()
+
+    async def controlled_animation():
+        animation_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            observed.append("animation_cancelled")
+            raise
+
+    animation_task = asyncio.create_task(controlled_animation())
+    await animation_started.wait()
+    test_client.app[sidecar_server.CARD_ANIMATION_TASKS_KEY][session_key] = (
+        animation_task
+    )
+
+    original_update = feishu_client.update_card_message
+
+    async def record_update(message_id, card):
+        if message_id == "feishu-message-1" and "已转入交互卡片" in str(card):
+            observed.append("predecessor_patched")
+        await original_update(message_id, card)
+
+    feishu_client.update_card_message = record_update
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "ordered-choice",
+                "prompt": "请选择",
+                "options": [{"label": "继续", "value": "continue"}],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    assert observed[:2] == ["animation_cancelled", "predecessor_patched"]
+
+
+async def test_interaction_promotion_failure_restores_session_for_retry(client):
+    test_client, feishu_client = client
+    payload = event_payload(
+        "interaction.requested",
+        1,
+        {
+            "interaction_id": "retry-choice",
+            "prompt": "请选择",
+            "options": [{"label": "继续", "value": "continue"}],
+        },
+    )
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_user_message",
+            },
+        ),
+    )
+    feishu_client.fail_send = True
+    failed = await test_client.post("/events", json=payload)
+
+    assert failed.status == 502
+    assert len(feishu_client.sent) == 1
+    assert test_client.app[sidecar_server.SESSIONS_KEY][
+        "hermes-message-1"
+    ].reply_in_thread is True
+
+    feishu_client.fail_send = False
+    retried = await test_client.post("/events", json=payload)
+
+    assert retried.status == 200
+    assert (await retried.json())["applied"] is True
+    assert len(feishu_client.sent) == 2
+    assert feishu_client.sent_reply_in_thread == [True, True]
+
+
+def test_interaction_operator_name_never_falls_back_to_feishu_ids():
+    assert sidecar_server._extract_operator_name(
+        {"event": {"operator": {"open_id": "ou_private", "user_id": "on_private"}}}
+    ) == ""
+    assert sidecar_server._extract_operator_name(
+        {"event": {"operator": {"open_id": "ou_private", "name": "Bailey"}}}
+    ) == "Bailey"
+
+
+async def test_interaction_request_uses_text_fallback_when_configured():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"interaction_mode": "text"})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        requested = await test_client.post(
+            "/events",
+            json=event_payload(
+                "interaction.requested",
+                1,
+                {
+                    "interaction_id": "clarify-1",
+                    "kind": "clarify",
+                    "prompt": "请选择处理方式",
+                    "options": [
+                        {"label": "删除空文件", "value": "delete"},
+                        {"label": "保留并补索引", "value": "keep"},
+                    ],
+                },
+            ),
+        )
+
+        assert requested.status == 200
+        assert (await requested.json())["interaction_mode"] == "text"
+        assert len(feishu_client.sent) == 2
+        interaction_card = feishu_client.sent[-1][1]
+        content = str(interaction_card)
+        assert interaction_buttons(interaction_card) == []
+        assert "1. 删除空文件" in content
+        assert "2. 保留并补索引" in content
+    finally:
+        await test_client.close()
+
+
+async def test_runtime_interaction_text_mode_declines_callback_ownership_without_mutation():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"interaction_mode": "text"})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert started.status == 200
+        assert len(feishu_client.sent) == 1
+
+        listener = SimpleNamespace(
+            resolve_url="http://127.0.0.1:54321/runtime/interactions/resolve"
+        )
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        declined = await test_client.post("/events", json=payload)
+
+        assert declined.status == 200
+        assert await declined.json() == {
+            "ok": True,
+            "applied": False,
+            "interaction_mode": "text",
+        }
+        session = test_client.app[SESSIONS_KEY]["turn-runtime"]
+        assert session.active_interaction is None
+        assert session.last_sequence == 0
+        assert len(feishu_client.sent) == 1
+
+        replay = await test_client.post("/events", json=payload)
+        assert replay.status == 200
+        assert await replay.json() == await declined.json()
+        assert session.active_interaction is None
+        assert session.last_sequence == 0
+        assert len(feishu_client.sent) == 1
+    finally:
+        await test_client.close()
+
+
+async def test_native_text_fallback_interaction_is_not_applied_in_text_mode():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"interaction_mode": "text"})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        requested = await test_client.post(
+            "/events",
+            json=event_payload(
+                "interaction.requested",
+                1,
+                {
+                    "interaction_id": "slash-new-1",
+                    "kind": "slash_confirm",
+                    "prompt": "Confirm /new",
+                    "fallback_policy": "native_text",
+                    "options": [
+                        {"label": "Approve Once", "value": "once"},
+                        {"label": "Always Approve", "value": "always"},
+                        {"label": "Cancel", "value": "cancel"},
+                    ],
+                },
+            ),
+        )
+
+        assert requested.status == 200
+        assert await requested.json() == {
+            "ok": True,
+            "applied": False,
+            "interaction_mode": "text",
+        }
+        assert feishu_client.sent == []
+        assert feishu_client.updated == []
+    finally:
+        await test_client.close()
+
+
+async def test_completed_card_summary_can_be_looked_up_by_feishu_message_id(client):
+    test_client, _ = client
+    long_answer = "最终答案" * 1000
+
+    missing = await test_client.get("/messages/feishu-message-1/summary")
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"profile_id": "work"},
+        ),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": long_answer, "profile_id": "work"},
+        ),
+    )
+    found = await test_client.get("/messages/feishu-message-1/summary")
+
+    assert missing.status == 404
+    assert await missing.json() == {"ok": False, "error": "not found"}
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+    assert found.status == 200
+    body = await found.json()
+    assert body["ok"] is True
+    assert body["profile_id"] == "work"
+    assert body["chat_id_hash"] == sidecar_server._diagnostic_id_hash("oc_abc")
+    assert body["message_id_hash"] == sidecar_server._diagnostic_id_hash(
+        "feishu-message-1"
+    )
+    assert body["source_message_id_hash"] == sidecar_server._diagnostic_id_hash(
+        "hermes-message-1"
+    )
+    assert "chat_id" not in body
+    assert "message_id" not in body
+    assert "source_message_id" not in body
+    assert body["summary"] == long_answer[:4000]
+    assert len(body["summary"]) == 4000
+
+
+async def test_required_transport_auth_rejects_unsigned_sensitive_routes_before_use():
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    app[CARD_SUMMARIES_KEY]["message-1"] = {"summary": "private summary"}
+    app[INTERACTION_RESULTS_KEY]["approval-1"] = {
+        "interaction_id": "approval-1",
+        "status": "completed",
+        "choice": "once",
+        "choice_label": "允许一次",
+    }
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        summary = await test_client.get("/messages/message-1/summary")
+        interaction = await test_client.get("/interactions/approval-1")
+        action = await test_client.post(
+            "/card/actions",
+            data=b"{not-json",
+            headers={"Content-Type": "application/json"},
+        )
+        health = await test_client.get("/health")
+        summary_body = await summary.json()
+        interaction_body = await interaction.json()
+        action_body = await action.json()
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert summary.status == 401
+    assert interaction.status == 401
+    assert action.status == 401
+    assert summary_body == {
+        "ok": False,
+        "error": "sidecar request authentication failed",
+    }
+    assert interaction_body == {
+        "ok": False,
+        "error": "sidecar request authentication failed",
+    }
+    assert action_body == {
+        "ok": False,
+        "error": "sidecar request authentication failed",
+    }
+    assert health_body["metrics"]["sidecar_request_auth_rejections"] == 3
+
+
+async def test_required_transport_auth_accepts_signed_sensitive_routes():
+    signer = getattr(event_auth_module, "sign_sidecar_request", None)
+    assert callable(signer)
+
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    app[CARD_SUMMARIES_KEY]["message-1"] = {"summary": "private summary"}
+    app[INTERACTION_RESULTS_KEY]["approval-1"] = {
+        "interaction_id": "approval-1",
+        "status": "completed",
+        "choice": "once",
+        "choice_label": "允许一次",
+    }
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        summary_path = "/messages/message-1/summary"
+        summary = await test_client.get(
+            summary_path,
+            headers=signer(TRANSPORT_ROOT_SECRET, "GET", summary_path, b""),
+        )
+        interaction_path = "/interactions/approval-1"
+        interaction = await test_client.get(
+            interaction_path,
+            headers=signer(
+                TRANSPORT_ROOT_SECRET,
+                "GET",
+                interaction_path,
+                b"",
+            ),
+        )
+        action_path = "/card/actions"
+        action_body = json.dumps(
+            {"event": {"action": {"value": {"hfc_action": "interaction.noop"}}}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        action = await test_client.post(
+            action_path,
+            data=action_body,
+            headers={
+                "Content-Type": "application/json",
+                **signer(
+                    TRANSPORT_ROOT_SECRET,
+                    "POST",
+                    action_path,
+                    action_body,
+                ),
+            },
+        )
+        summary_body = await summary.json()
+        interaction_body = await interaction.json()
+        action_response_body = await action.json()
+    finally:
+        await test_client.close()
+
+    assert summary.status == 200
+    assert summary_body["summary"] == "private summary"
+    assert interaction.status == 200
+    assert interaction_body["choice"] == "once"
+    assert action.status == 200
+    assert action_response_body == {"ok": True}
+
+
+async def test_signed_sensitive_route_uses_raw_encoded_path_for_proof():
+    signer = getattr(event_auth_module, "sign_sidecar_request", None)
+    assert callable(signer)
+
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    app[CARD_SUMMARIES_KEY]["message one"] = {"summary": "encoded path"}
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        raw_path = "/messages/message%20one/summary"
+        response = await test_client.get(
+            raw_path,
+            headers=signer(TRANSPORT_ROOT_SECRET, "GET", raw_path, b""),
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body == {"ok": True, "summary": "encoded path"}
+
+
+async def test_zero_timeout_approval_explains_expiry_without_reissuing_or_consenting(client):
+    """An expired non-pausable request stays expired and explains how to retry."""
+
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-expired",
+                "kind": "approval",
+                "prompt": "允许执行吗？",
+                "options": [{"label": "允许一次", "value": "once"}],
+                "timeout_seconds": 0,
+            },
+        ),
+    )
+    assert requested.status == 200
+    waiting_card = feishu_client.sent[-1][1]
+    button = interaction_buttons(waiting_card)[0]
+    action_value = button["value"]
+    cards_before = len(feishu_client.sent)
+
+    callback = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": action_value},
+            }
+        },
+    )
+    callback_body = await callback.json()
+    session = test_client.app[SESSIONS_KEY]["hermes-message-1"]
+    interaction = session.active_interaction
+    result = await test_client.get("/interactions/approval-expired")
+    result_body = await result.json()
+
+    assert callback.status == 409
+    assert "重新发送原请求" in callback_body["toast"]["content"]
+    assert interaction.choice == "" and result_body["choice"] == ""
+    assert len(feishu_client.sent) == cards_before
+    assert not interaction_buttons(callback_body['card'])
+    assert (await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": action_value},
+            }
+        },
+    )).status == 404
+
+
+async def test_periodic_expiry_marks_pending_result_and_patches_existing_card(client):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-periodic-expiry",
+                "kind": "approval",
+                "prompt": "允许执行吗？",
+                "options": [{"label": "允许一次", "value": "once"}],
+                "timeout_seconds": 300,
+            },
+        ),
+    )
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.active_interaction is not None
+    session.active_interaction.requested_at = 100.0
+
+    expired = await sidecar_server._expire_pending_interactions(
+        test_client.app,
+        now=400.0,
+    )
+    result = await test_client.get("/interactions/approval-periodic-expiry")
+    result_body = await result.json()
+    _message_id, card = await wait_for_card_update(feishu_client, "交互已过期")
+
+    assert expired == 1
+    assert result_body["status"] == "failed"
+    assert result_body["error"] == "交互已过期"
+    assert "交互已过期" in str(card)
+
+
+async def test_blank_completed_card_summary_is_not_indexed(client):
+    test_client, _ = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "   "}),
+    )
+    found = await test_client.get("/messages/feishu-message-1/summary")
+
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+    assert found.status == 404
+    assert await found.json() == {"ok": False, "error": "not found"}
+
+
+async def test_card_config_customizes_header_title():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"title": "研发助手"})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert feishu_client.sent[0][1]["header"]["title"]["content"] == "⏳ 执行中 · 研发助手"
+
+
+async def test_invalid_event_returns_400_json(client):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload("bad.event", 1),
+    )
+
+    assert response.status == 400
+    body = await response.json()
+    assert body["ok"] is False
+    assert "error" in body
+    assert feishu_client.sent == []
+    assert feishu_client.updated == []
+    health = await test_client.get("/health")
+    assert (await health.json())["metrics"]["events_rejected"] == 1
+
+
+async def test_malformed_json_returns_400_json(client):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        data="{bad json",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status == 400
+    body = await response.json()
+    assert body["ok"] is False
+    assert "error" in body
+    assert feishu_client.sent == []
+    assert feishu_client.updated == []
+
+
+async def test_non_object_json_payload_returns_400_json(client):
+    test_client, feishu_client = client
+
+    response = await test_client.post("/events", json=["not", "an", "object"])
+
+    assert response.status == 400
+    body = await response.json()
+    assert body["ok"] is False
+    assert "error" in body
+    assert feishu_client.sent == []
+    assert feishu_client.updated == []
+
+
+@pytest.mark.parametrize(
+    ("event_name", "data", "expected_text"),
+    [
+        ("answer.delta", {"text": "提前到达的回答"}, "提前到达的回答"),
+        ("thinking.delta", {"text": "提前到达的思考"}, "Hermes Agent"),
+        (
+            "tool.updated",
+            {
+                "tool_id": "tool-1",
+                "name": "search",
+                "status": "running",
+                "detail": "提前到达的工具",
+            },
+            "search",
+        ),
+        ("message.completed", {"answer": "提前完成的回答"}, "提前完成的回答"),
+    ],
+)
+async def test_message_event_without_started_creates_initial_card(
+    client, event_name, data, expected_text
+):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(event_name, 1, data),
+    )
+
+    assert response.status == 200
+    assert await response.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert expected_text in str(feishu_client.sent[0][1])
+    assert feishu_client.updated == []
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["events_received"] == 1
+    assert metrics["events_applied"] == 1
+    assert metrics["events_ignored"] == 0
+
+
+async def test_independent_system_notice_without_started_sends_notice_card(client):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "title": "上下文窗口提示",
+                "content": "Codex gpt-5.5 caps context at 272K.",
+                "notice_scope": "independent",
+                "level": "info",
+            },
+            message_id="notice_context_cap",
+        ),
+    )
+
+    assert response.status == 200
+    assert await response.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    card = feishu_client.sent[0][1]
+    assert card["header"]["title"]["content"] == "上下文窗口提示"
+    assert card["header"]["template"] == "blue"
+    assert "Codex gpt-5.5 caps context at 272K." in str(card)
+    assert "生成中" not in str(card)
+    assert feishu_client.updated == []
+
+
+def _retained_heartbeat_notice(text: str) -> dict:
+    """The heartbeat notice shape the SIDECAR still understands.
+
+    Maintainer note (contract change): ``hook_runtime._hfc_classify_system_notice`` no longer
+    returns a notice for any ⏳ status line — the whole family goes out as plain text now (see
+    tests/unit/test_hook_runtime.py::test_status_notice_family_is_plain_text_but_other_notices_still_are_cards),
+    so real traffic never sends this event any more. These sidecar tests keep exercising the
+    heartbeat branch of the notice-card machinery on purpose: that code still ships (it is upstream
+    code, and upstream's own classifier still emits this kind), and any caller that posts this shape
+    still gets a recallable heartbeat notice out of it.
+    """
+    assert text.startswith("⏳ Working — "), text
+    return {
+        "title": "运行中",
+        "level": "info",
+        "notice_kind": "heartbeat",
+        "notice_id": "heartbeat",
+        "notice_terminal": False,
+    }
+
+
+async def test_orphaned_heartbeats_update_one_running_notice_card(client):
+    test_client, feishu_client = client
+    texts = (
+        "⏳ Working — 6 min — iteration 10/90, terminal",
+        "⏳ Working — 9 min — iteration 14/90, terminal",
+    )
+    responses = []
+    message_ids = []
+
+    for sequence, text in enumerate(texts, start=1):
+        notice = _retained_heartbeat_notice(text)
+        message_id = hook_runtime._hfc_independent_notice_message_id(
+            "oc_1", text, notice, anchor="om_user_task"
+        )
+        message_ids.append(message_id)
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "system.notice",
+                sequence,
+                {
+                    **notice,
+                    "content": text,
+                    "notice_scope": "independent",
+                    "delivery_kind": "notice",
+                    "reply_to_message_id": "om_user_task",
+                },
+                message_id=message_id,
+            ),
+        )
+        responses.append(await response.json())
+
+    assert responses == [DELIVERED_RESPONSE, ACCEPTED_RESPONSE]
+    assert message_ids[0] == message_ids[1]
+    assert len(feishu_client.sent) == 1
+    await _wait_until(lambda: len(feishu_client.updated) == 1)
+    session = test_client.app[SESSIONS_KEY][message_ids[0]]
+    assert session.status == "running"
+    assert "subtitle" not in feishu_client.sent[0][1]["header"]
+    updated_card = feishu_client.updated[0][1]
+    assert updated_card["header"]["title"]["content"] == "运行中"
+    assert "subtitle" not in updated_card["header"]
+    assert "Working — 9 min" in str(updated_card)
+
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            3,
+            {
+                "answer": "长任务已完成",
+                "reply_to_message_id": "om_user_task",
+            },
+            message_id="om_user_task",
+        ),
+    )
+
+    assert completed.status == 200
+    assert (await completed.json())["applied"] is True
+    await _wait_until(lambda: len(feishu_client.updated) == 2)
+    assert session.status == "completed"
+    assert session.answer_text == "长任务已完成"
+    assert len(feishu_client.sent) == 1
+
+
+def compaction_notice_data(**overrides):
+    data = {
+        "title": "正在压缩上下文",
+        "content": "正在总结较早的对话，完成后会继续当前任务。",
+        "level": "info",
+        "notice_kind": "context-compaction",
+        "notice_id": "context-compaction:active",
+        "notice_scope": "session",
+        "phase": "started",
+        "create_session": True,
+        "display_status": "in_progress",
+    }
+    data.update(overrides)
+    return data
+
+
+async def test_compaction_notice_updates_existing_primary_card(client):
+    test_client, feishu_client = client
+    started = await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0),
+    )
+    assert started.status == 200
+
+    compacting = await test_client.post(
+        "/events",
+        json=event_payload("system.notice", 1, compaction_notice_data()),
+    )
+
+    assert compacting.status == 200
+    assert (await compacting.json())["applied"] is True
+    assert len(feishu_client.sent) == 1
+    await _wait_until(lambda: len(feishu_client.updated) == 1)
+    updated_card = feishu_client.updated[0][1]
+    # The phase no longer replaces the session title: the title still answers "is it still
+    # working?", and the phase renders beneath it.
+    assert updated_card["header"]["title"]["content"] == "⏳ 执行中 · Hermes Agent"
+    assert updated_card["header"]["subtitle"]["content"] == "正在压缩上下文"
+
+
+async def test_compaction_first_creates_topic_primary_card_and_continues_stream(client):
+    test_client, feishu_client = client
+    conversation_id = "omt_compaction_topic"
+    message_id = "om_compaction_user"
+    first = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            0,
+            compaction_notice_data(reply_to_message_id=message_id),
+            conversation_id=conversation_id,
+            message_id=message_id,
+            thread_id=conversation_id,
+        ),
+    )
+
+    assert first.status == 200
+    assert await first.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][2] == conversation_id
+    assert feishu_client.sent[0][3] == message_id
+    assert feishu_client.sent[0][1]["header"]["title"]["content"] == "⏳ 执行中 · Hermes Agent"
+    assert message_id in test_client.app[SESSIONS_KEY]
+
+    continued = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"text": "压缩完成后继续回答"},
+            conversation_id=conversation_id,
+            message_id=message_id,
+            thread_id=conversation_id,
+        ),
+    )
+
+    assert continued.status == 200
+    assert (await continued.json())["applied"] is True
+    await _wait_until(lambda: len(feishu_client.updated) == 1)
+    assert "压缩完成后继续回答" in str(feishu_client.updated[0][1])
+    assert "正在压缩上下文" not in str(feishu_client.updated[0][1]["header"])
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        compaction_notice_data(notice_kind="system"),
+        compaction_notice_data(phase="completed"),
+        compaction_notice_data(create_session=False),
+        {key: value for key, value in compaction_notice_data().items() if key != "create_session"},
+        compaction_notice_data(notice_scope="independent"),
+    ],
+)
+async def test_only_exact_compaction_start_can_create_primary_card(client, data):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload("system.notice", 0, data),
+    )
+
+    assert response.status == 200
+    body = await response.json()
+    if data.get("notice_scope") == "independent":
+        assert body == DELIVERED_RESPONSE
+        assert len(feishu_client.sent) == 1
+        assert test_client.app[SESSIONS_KEY]["hermes-message-1"].delivery_kind == "notice"
+    else:
+        assert body == {"ok": True, "applied": False}
+        assert feishu_client.sent == []
+        assert test_client.app[SESSIONS_KEY] == {}
+
+
+async def test_stale_compaction_cannot_override_newer_answer(client):
+    test_client, feishu_client = client
+    first = await test_client.post(
+        "/events",
+        json=event_payload("system.notice", 0, compaction_notice_data()),
+    )
+    assert first.status == 200
+
+    answer = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 2, {"text": "较新的回答"}),
+    )
+    assert answer.status == 200
+    await _wait_until(lambda: len(feishu_client.updated) == 1)
+
+    stale = await test_client.post(
+        "/events",
+        json=event_payload("system.notice", 1, compaction_notice_data()),
+    )
+
+    assert stale.status == 200
+    assert await stale.json() == {"ok": True, "applied": False}
+    await _REAL_ASYNCIO_SLEEP(0.02)
+    assert len(feishu_client.updated) == 1
+    session = test_client.app[SESSIONS_KEY]["hermes-message-1"]
+    assert session.runtime_phase_text == ""
+    assert session.answer_text == "较新的回答"
+
+
+async def test_terminal_after_compaction_clears_runtime_phase(client):
+    test_client, feishu_client = client
+    first = await test_client.post(
+        "/events",
+        json=event_payload("system.notice", 0, compaction_notice_data()),
+    )
+    assert first.status == 200
+
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+
+    assert completed.status == 200
+    await _wait_until(lambda: len(feishu_client.updated) == 1)
+    session = test_client.app[SESSIONS_KEY]["hermes-message-1"]
+    assert session.status == "completed"
+    assert session.runtime_phase_text == ""
+    assert "正在压缩上下文" not in str(feishu_client.updated[0][1])
+
+
+async def test_system_notice_delivery_outcome_is_delivered_for_legacy_client(client):
+    test_client, _feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "title": "运行提示",
+                "content": "notice delivered",
+                "notice_scope": "independent",
+                "delivery_kind": "notice",
+            },
+            message_id="notice_delivery_success",
+        ),
+    )
+
+    assert response.status == 200
+    assert await response.json() == {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "delivered"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("client_type", "outcome", "retry_count", "fallback_metric"),
+    [
+        (PermanentFailureClient, "not_sent", 0, "notice_native_fallbacks"),
+        (UnknownFailureClient, "unknown", 2, "notice_uncertain_warnings"),
+    ],
+)
+async def test_system_notice_delivery_outcome_and_send_error_diagnostics(
+    client_type,
+    outcome,
+    retry_count,
+    fallback_metric,
+):
+    app = create_app(client_type())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "system.notice",
+                1,
+                {
+                    "title": "private title",
+                    "content": "private notice body",
+                    "notice_scope": "independent",
+                    "delivery_kind": "notice",
+                },
+                message_id="notice_private_identifier",
+            ),
+        )
+        response_body = await response.json()
+        health = await test_client.get("/health")
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 502
+    assert response_body == {
+        "ok": False,
+        "error": "feishu send failed",
+        "delivery": {"outcome": outcome},
+    }
+    metrics = health_body["metrics"]
+    assert metrics["feishu_send_attempts"] == 1
+    assert metrics["feishu_send_successes"] == 0
+    assert metrics["feishu_send_failures"] == 1
+    assert metrics["feishu_send_retries"] == retry_count
+    assert metrics["feishu_send_unknown_outcomes"] == (1 if outcome == "unknown" else 0)
+    assert metrics[fallback_metric] == 1
+
+    diagnostic = health_body["diagnostics"]["last_send_error"]
+    assert diagnostic == {
+        "outcome": outcome,
+        "error_kind": "FeishuAPIError",
+        "bot_hash": sidecar_server._diagnostic_id_hash("default"),
+        "status_code": 400 if outcome == "not_sent" else 503,
+        "api_code": 9499,
+    }
+    serialized = json.dumps(diagnostic)
+    assert "private" not in serialized
+    assert "notice_private_identifier" not in serialized
+
+
+async def test_orphaned_self_improvement_notice_does_not_claim_next_turn(client):
+    test_client, feishu_client = client
+    conversation_id = "omt_self_improvement"
+    reply_anchor = "om_topic_root"
+    notice_data = {
+        "reply_to_message_id": reply_anchor,
+        "title": "自我改进",
+        "content": "💾 Self-improvement review: Memory updated",
+        "level": "info",
+        "notice_kind": "self-improvement",
+        "notice_id": "self-improvement:review-1",
+    }
+
+    orphaned = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {**notice_data, "notice_scope": "session"},
+            conversation_id=conversation_id,
+            message_id=reply_anchor,
+            thread_id=conversation_id,
+        ),
+    )
+
+    assert orphaned.status == 200
+    assert await orphaned.json() == {"ok": True, "applied": False}
+    assert reply_anchor not in test_client.app[SESSIONS_KEY]
+    assert reply_anchor not in test_client.app[SESSION_ALIASES_KEY]
+    assert feishu_client.sent == []
+
+    independent = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            2,
+            {**notice_data, "notice_scope": "independent"},
+            conversation_id=conversation_id,
+            message_id="notice_self_improvement",
+            thread_id=conversation_id,
+        ),
+    )
+
+    assert independent.status == 200
+    assert await independent.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert "生成中" not in str(feishu_client.sent[0][1])
+    assert test_client.app[SESSIONS_KEY]["notice_self_improvement"].status == "completed"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": reply_anchor},
+            conversation_id=conversation_id,
+            message_id=reply_anchor,
+            thread_id=conversation_id,
+        ),
+    )
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 2
+
+    followup = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {
+                "reply_to_message_id": reply_anchor,
+                "text": "后续对话应更新自己的卡片",
+            },
+            conversation_id=conversation_id,
+            message_id="om_followup_delta",
+            thread_id=conversation_id,
+        ),
+    )
+    assert followup.status == 200
+    assert await followup.json() == {"ok": True, "applied": True}
+    updated_message_id, _card = await wait_for_card_update(
+        feishu_client,
+        "后续对话应更新自己的卡片",
+    )
+    assert updated_message_id == "feishu-message-2"
+    assert test_client.app[SESSIONS_KEY]["notice_self_improvement"].status == "completed"
+    assert test_client.app[SESSIONS_KEY][reply_anchor].status == "thinking"
+
+
+async def test_independent_background_process_notice_updates_same_card(client):
+    test_client, feishu_client = client
+    message_id = "notice_background_process_proc_109e6dc419af"
+
+    running_response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            100,
+            {
+                "title": "后台进程运行中",
+                "content": "Updating files: 76%",
+                "notice_scope": "independent",
+                "notice_kind": "background-process",
+                "notice_id": "background-process:proc_109e6dc419af",
+                "notice_terminal": False,
+                "level": "info",
+            },
+            message_id=message_id,
+        ),
+    )
+
+    assert running_response.status == 200
+    assert await running_response.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][1]["header"]["title"]["content"] == "后台进程运行中"
+    assert feishu_client.updated == []
+
+    completed_response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "title": "后台进程已完成",
+                "content": "Updating files: 100%, done.",
+                "notice_scope": "independent",
+                "notice_kind": "background-process",
+                "notice_id": "background-process:proc_109e6dc419af",
+                "notice_terminal": True,
+                "level": "success",
+            },
+            message_id=message_id,
+        ),
+    )
+
+    assert completed_response.status == 200
+    assert await completed_response.json() == ACCEPTED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert len(feishu_client.updated) == 1
+    card = feishu_client.updated[0][1]
+    assert card["header"]["title"]["content"] == "后台进程已完成"
+    assert card["header"]["template"] == "green"
+    assert "Updating files: 100%, done." in str(card)
+
+
+async def test_independent_background_notices_do_not_abandon_active_cards(client):
+    test_client, _feishu_client = client
+    conversation_id = "conversation-background-concurrency"
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            conversation_id=conversation_id,
+            message_id="main-turn-1",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            100,
+            {
+                "title": "后台进程运行中",
+                "content": "process one: 50%",
+                "notice_scope": "independent",
+                "notice_kind": "background-process",
+                "notice_id": "background-process:proc_111111111111",
+                "notice_terminal": False,
+                "level": "info",
+            },
+            conversation_id=conversation_id,
+            message_id="notice-process-one",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            100,
+            {
+                "title": "后台进程运行中",
+                "content": "process two: 50%",
+                "notice_scope": "independent",
+                "notice_kind": "background-process",
+                "notice_id": "background-process:proc_222222222222",
+                "notice_terminal": False,
+                "level": "info",
+            },
+            conversation_id=conversation_id,
+            message_id="notice-process-two",
+        ),
+    )
+
+    sessions = test_client.app[SESSIONS_KEY]
+    assert sessions["main-turn-1"].status == "thinking"
+    assert sessions["notice-process-one"].status == "running"
+    assert sessions["notice-process-two"].status == "running"
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            conversation_id=conversation_id,
+            message_id="main-turn-2",
+        ),
+    )
+
+    assert sessions["main-turn-1"].status == "failed"
+    assert "本轮已被新对话替代" in sessions["main-turn-1"].answer_text
+    assert sessions["notice-process-one"].status == "running"
+    assert sessions["notice-process-two"].status == "running"
+
+
+async def test_background_notice_terminal_update_retries_and_cleans_controller(
+    client, monkeypatch
+):
+    test_client, feishu_client = client
+    message_id = "notice-background-terminal-retry"
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            100,
+            {
+                "title": "后台进程运行中",
+                "content": "Updating files: 76%",
+                "notice_scope": "independent",
+                "notice_kind": "background-process",
+                "notice_id": "background-process:proc_333333333333",
+                "notice_terminal": False,
+                "level": "info",
+            },
+            message_id=message_id,
+        ),
+    )
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(sidecar_server.asyncio, "sleep", fake_sleep)
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                "title": "后台进程已完成",
+                "content": "Updating files: 100%, done.",
+                "notice_scope": "independent",
+                "notice_kind": "background-process",
+                "notice_id": "background-process:proc_333333333333",
+                "notice_terminal": True,
+                "level": "success",
+            },
+            message_id=message_id,
+        ),
+    )
+
+    assert completed.status == 200
+    assert await completed.json() == ACCEPTED_RESPONSE
+    await wait_for_card_update(feishu_client, "Updating files: 100%, done.")
+    for _ in range(20):
+        if message_id not in test_client.app[FLUSH_CONTROLLERS_KEY]:
+            break
+        await _REAL_ASYNCIO_SLEEP(0)
+
+    metrics = test_client.app[METRICS_KEY]
+    assert metrics.feishu_update_attempts == sidecar_server.UPDATE_MAX_ATTEMPTS + 1
+    assert metrics.feishu_update_failures == sidecar_server.UPDATE_MAX_ATTEMPTS
+    assert message_id not in test_client.app[FLUSH_CONTROLLERS_KEY]
+    assert metrics.flush_controllers_collected == 1
+
+
+async def test_cron_completed_event_sends_completed_card_without_started(client):
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            0,
+            {"answer": "定时结果", "delivery_kind": "cron"},
+            message_id="cron_1",
+        ),
+    )
+
+    assert response.status == 200
+    assert await response.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert "定时结果" in str(feishu_client.sent[0][1])
+    assert feishu_client.updated == []
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["events_received"] == 1
+    assert metrics["events_applied"] == 1
+    assert metrics["events_ignored"] == 0
+    assert metrics["cron_cards_sent"] == 1
+
+
+async def test_cron_completed_event_with_thread_id_sends_card_to_thread(client):
+    """Cron event with thread_id should pass thread_id to send_card."""
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            0,
+            {"answer": "Cron in thread", "delivery_kind": "cron"},
+            message_id="cron_thread_1",
+            chat_id="oc_topic_group",
+            thread_id="omt_target_thread",
+            conversation_id="omt_target_thread",
+        ),
+    )
+
+    assert response.status == 200
+    assert await response.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    # FakeFeishuClient.send_card stores (chat_id, card, thread_id, reply_to_message_id)
+    chat_id, card, thread_id, reply_to = feishu_client.sent[0]
+    assert chat_id == "oc_topic_group"
+    assert thread_id == "omt_target_thread"
+    assert "Cron in thread" in str(card)
+
+
+async def test_cron_completed_event_without_thread_id_sends_card_to_chat(client):
+    """Cron event without thread_id should send card to chat_id directly."""
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            0,
+            {"answer": "Cron no thread", "delivery_kind": "cron"},
+            message_id="cron_no_thread_1",
+            chat_id="oc_dm_chat",
+            thread_id="",
+            conversation_id="cron_no_thread_1",
+        ),
+    )
+
+    assert response.status == 200
+    assert await response.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    chat_id, card, thread_id, reply_to = feishu_client.sent[0]
+    assert chat_id == "oc_dm_chat"
+    assert thread_id is None  # _thread_id_for_event returns None for non-omt_ ids
+
+
+async def test_duplicate_started_does_not_send_again(client):
+    test_client, feishu_client = client
+
+    first = await test_client.post("/events", json=event_payload("message.started", 0))
+    duplicate = await test_client.post("/events", json=event_payload("message.started", 0))
+
+    assert first.status == 200
+    assert await first.json() == DELIVERED_RESPONSE
+    assert duplicate.status == 200
+    assert await duplicate.json() == {"ok": True, "applied": False}
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.updated == []
+
+
+async def test_replayed_started_with_higher_sequence_does_not_block_later_delta(client):
+    test_client, feishu_client = client
+
+    first = await test_client.post("/events", json=event_payload("message.started", 0))
+    replayed = await test_client.post("/events", json=event_payload("message.started", 5))
+    thinking = await test_client.post(
+        "/events",
+        json=event_payload("thinking.delta", 1, {"text": "后续增量"}),
+    )
+
+    assert first.status == 200
+    assert await first.json() == DELIVERED_RESPONSE
+    assert replayed.status == 200
+    assert await replayed.json() == {"ok": True, "applied": False}
+    assert thinking.status == 200
+    assert await thinking.json() == {"ok": True, "applied": True}
+    assert len(feishu_client.sent) == 1
+    assert len(feishu_client.updated) == 1
+    assert "后续增量" in str(feishu_client.updated[0][1])
+    assert "执行中" in str(feishu_client.updated[0][1])
+    assert "生成中" not in str(feishu_client.updated[0][1])
+
+
+async def test_delta_after_completed_does_not_update_again(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+    updates_after_completed = len(feishu_client.updated)
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload("thinking.delta", 2, {"text": "迟到增量"}),
+    )
+
+    assert response.status == 200
+    assert (await response.json())["applied"] is False
+    assert len(feishu_client.updated) == updates_after_completed
+
+
+async def test_parallel_message_sessions_update_their_own_feishu_cards(client):
+    test_client, feishu_client = client
+
+    msg1 = {"conversation_id": "conversation-1", "message_id": "hermes-message-1"}
+    msg2 = {"conversation_id": "conversation-2", "message_id": "hermes-message-2"}
+
+    started1 = await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0, **msg1),
+    )
+    delta1 = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "第一条"}, **msg1),
+    )
+    started2 = await test_client.post(
+        "/events",
+        json=event_payload("message.started", 0, **msg2),
+    )
+    tool2 = await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "tool-2",
+                "name": "search",
+                "status": "running",
+                "detail": "第二条工具",
+            },
+            **msg2,
+        ),
+    )
+    completed1 = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 2, {"answer": "第一条完成"}, **msg1),
+    )
+    await wait_for_card_update(feishu_client, "第一条完成")
+    updates_before_late = len(feishu_client.updated)
+    late1 = await test_client.post(
+        "/events",
+        json=event_payload("tool.updated", 3, {"tool_id": "late"}, **msg1),
+    )
+
+    assert started1.status == 200
+    assert delta1.status == 200
+    assert started2.status == 200
+    assert tool2.status == 200
+    assert completed1.status == 200
+    assert late1.status == 200
+    assert await late1.json() == {"ok": True, "applied": False}
+    assert len(feishu_client.updated) == updates_before_late
+
+    assert [item[0] for item in feishu_client.sent] == ["oc_abc", "oc_abc"]
+    updates_by_message = {}
+    for feishu_message_id, card in feishu_client.updated:
+        updates_by_message.setdefault(feishu_message_id, []).append(str(card))
+    assert set(updates_by_message) == {"feishu-message-1", "feishu-message-2"}
+    assert any("第一条完成" in card for card in updates_by_message["feishu-message-1"])
+    assert any(
+        '<font color="blue">' in card and "**search** · #1 · 执行中" in card
+        for card in updates_by_message["feishu-message-2"]
+    )
+
+
+async def test_streaming_deltas_are_throttled_but_terminal_event_updates(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post("/events", json=event_payload("message.started", 0))
+    first_delta = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "第一段"}),
+    )
+    second_delta = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 2, {"text": "第二段"}),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 3, {"answer": "最终答案"}),
+    )
+
+    assert started.status == 200
+    assert first_delta.status == 200
+    assert second_delta.status == 200
+    assert await second_delta.json() == {"ok": True, "applied": True}
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+
+    assert len(feishu_client.sent) == 1
+    await wait_for_card_update(feishu_client, "最终答案")
+    assert len(feishu_client.updated) == 3
+    assert "第一段" in str(feishu_client.updated[0][1])
+    assert "最终答案" in str(feishu_client.updated[-1][1])
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["events_received"] == 4
+    assert metrics["events_applied"] == 4
+    assert metrics["events_rejected"] == 0
+    assert metrics["feishu_update_attempts"] == 3
+    assert metrics["feishu_update_successes"] == 3
+    assert metrics["terminal_drains"] == 1
+
+
+async def test_terminal_event_with_stale_sequence_still_finalizes_card(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 100, {"text": "部分答案"}),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 90, {"answer": "最终答案"}),
+    )
+
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+    await wait_for_card_update(feishu_client, "最终答案")
+    assert "最终答案" in str(feishu_client.updated[-1][1])
+    assert "本轮回复结束" in str(feishu_client.updated[-1][1])
+
+
+async def test_concurrent_streaming_deltas_share_message_update_window(client):
+    test_client, feishu_client = client
+    feishu_client.update_delay = 0.05
+
+    started = await test_client.post("/events", json=event_payload("message.started", 0))
+    first_delta, second_delta = await asyncio.gather(
+        test_client.post(
+            "/events",
+            json=event_payload("answer.delta", 1, {"text": "第一段"}),
+        ),
+        test_client.post(
+            "/events",
+            json=event_payload("answer.delta", 2, {"text": "第二段"}),
+        ),
+    )
+
+    assert started.status == 200
+    assert first_delta.status == 200
+    assert second_delta.status == 200
+    assert await first_delta.json() == {"ok": True, "applied": True}
+    assert await second_delta.json() == {"ok": True, "applied": True}
+    for _ in range(20):
+        if feishu_client.updated:
+            break
+        await asyncio.sleep(0.01)
+    assert len(feishu_client.updated) == 1
+    assert "第一段" in str(feishu_client.updated[0][1])
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["events_received"] == 3
+    assert metrics["events_applied"] == 3
+    assert metrics["feishu_update_attempts"] == 1
+    assert metrics["feishu_update_successes"] == 1
+
+
+async def test_concurrent_card_updates_preserve_newer_content(monkeypatch):
+    feishu_client = ReorderingFeishuClient()
+    app = create_app(feishu_client)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    monkeypatch.setattr(sidecar_server, "UPDATE_MIN_INTERVAL_SECONDS", 0)
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        first_delta, second_delta = await asyncio.gather(
+            test_client.post(
+                "/events",
+                json=event_payload("answer.delta", 1, {"text": "第一段"}),
+            ),
+            test_client.post(
+                "/events",
+                json=event_payload("answer.delta", 2, {"text": "第二段"}),
+            ),
+        )
+
+        assert first_delta.status == 200
+        assert second_delta.status == 200
+        for _ in range(20):
+            if len(feishu_client.updated) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(feishu_client.updated) == 2
+        assert "第一段第二段" in str(feishu_client.updated[-1][1])
+    finally:
+        await test_client.close()
+
+
+async def test_terminal_update_is_not_blocked_by_streaming_update_backlog(client, monkeypatch):
+    test_client, feishu_client = client
+    feishu_client.update_delay = 0.05
+    monkeypatch.setattr(sidecar_server, "UPDATE_MIN_INTERVAL_SECONDS", 0)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "片段0"}),
+    )
+    deltas = await asyncio.gather(
+        *[
+            test_client.post(
+                "/events",
+                json=event_payload("answer.delta", sequence, {"text": f"片段{sequence}"}),
+            )
+            for sequence in range(2, 12)
+        ]
+    )
+
+    started_at = asyncio.get_running_loop().time()
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 12, {"answer": "最终答案"}),
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert all(response.status == 200 for response in deltas)
+    assert completed.status == 200
+    assert elapsed < 0.5
+    await wait_for_card_update(feishu_client, "最终答案")
+    assert "最终答案" in str(feishu_client.updated[-1][1])
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["events_received"] == 13
+    # Concurrent deltas can arrive out of sequence on a slower event loop. The
+    # final event is authoritative, so stale intermediate deltas may be
+    # accepted as no-ops without weakening the terminal update guarantee.
+    assert 2 <= metrics["events_applied"] <= 13
+    assert metrics["update_coalesced"] > 0
+    assert metrics["feishu_update_attempts"] < metrics["events_received"]
+    assert metrics["feishu_update_failures"] == 0
+
+
+async def test_burst_updates_are_coalesced_and_reported_in_health(client, monkeypatch):
+    test_client, feishu_client = client
+    feishu_client.update_delay = 0.03
+    monkeypatch.setattr(sidecar_server, "UPDATE_MIN_INTERVAL_SECONDS", 0)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    responses = await asyncio.gather(
+        *[
+            test_client.post(
+                "/events",
+                json=event_payload("answer.delta", index, {"text": f"片段{index}"}),
+            )
+            for index in range(1, 25)
+        ]
+    )
+
+    assert all(response.status == 200 for response in responses)
+    await wait_for_card_update(feishu_client, "片段24")
+    health = await test_client.get("/health")
+    body = await health.json()
+    assert body["metrics"]["update_coalesced"] > 0
+    assert body["metrics"]["update_queue_peak"] > 1
+    assert body["metrics"]["feishu_update_attempts"] < 24
+
+
+async def test_terminal_event_ack_does_not_wait_for_slow_card_patch(client, monkeypatch):
+    del monkeypatch
+    feishu_client = FakeFeishuClient()
+    feishu_client.update_delay = 0.25
+    app = create_app(
+        feishu_client,
+        card_config={"flush_interval_ms": 0, "final_drain_timeout_ms": 120},
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+
+        started_at = asyncio.get_running_loop().time()
+        completed = await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+        )
+        elapsed = asyncio.get_running_loop().time() - started_at
+
+        assert completed.status == 200
+        assert await completed.json() == {"ok": True, "applied": True}
+        assert elapsed < 0.12
+        assert elapsed < feishu_client.update_delay
+        assert feishu_client.updated == []
+
+        for _ in range(40):
+            if feishu_client.updated:
+                break
+            await asyncio.sleep(0.01)
+        assert "最终答案" in str(feishu_client.updated[-1][1])
+    finally:
+        await test_client.close()
+
+
+async def test_terminal_event_drains_latest_pending_content_before_final_card(client, monkeypatch):
+    test_client, feishu_client = client
+    feishu_client.update_delay = 0.04
+    monkeypatch.setattr(sidecar_server, "UPDATE_MIN_INTERVAL_SECONDS", 0)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await asyncio.gather(
+        *[
+            test_client.post(
+                "/events",
+                json=event_payload("answer.delta", index, {"text": f"片段{index}"}),
+            )
+            for index in range(1, 15)
+        ]
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 15, {"answer": ""}),
+    )
+
+    assert completed.status == 200
+    await wait_for_card_update(feishu_client, "片段14")
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["terminal_drains"] == 1
+    assert metrics["terminal_drain_timeouts"] == 0
+    assert "片段14" in str(feishu_client.updated[-1][1])
+
+
+async def test_terminal_event_does_not_wait_for_update_window_without_pending_flush(
+    client, monkeypatch
+):
+    test_client, feishu_client = client
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(flush_module.asyncio, "sleep", fake_sleep)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post("/events", json=event_payload("answer.delta", 1, {"text": "片段"}))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 2, {"answer": "最终答案"}),
+    )
+
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+    await wait_for_card_update(feishu_client, "最终答案")
+    assert sleeps == []
+    assert len(feishu_client.updated) == 2
+    assert "最终答案" in str(feishu_client.updated[-1][1])
+
+
+async def test_missing_feishu_message_id_returns_conflict_without_update(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    test_client.app[FEISHU_MESSAGE_IDS_KEY].pop("hermes-message-1")
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload("thinking.delta", 1, {"text": "需要更新"}),
+    )
+
+    assert response.status == 409
+    body = await response.json()
+    assert body == {"ok": False, "error": "feishu_message_id missing"}
+    assert feishu_client.updated == []
+    health = await test_client.get("/health")
+    assert (await health.json())["metrics"]["events_rejected"] == 1
+
+
+async def test_update_retries_once_and_reports_retry_metrics(client):
+    test_client, feishu_client = client
+    feishu_client.update_failures_remaining = 1
+
+    started = await test_client.post("/events", json=event_payload("message.started", 0))
+    thinking = await test_client.post(
+        "/events",
+        json=event_payload("thinking.delta", 1, {"text": "需要重试"}),
+    )
+
+    assert started.status == 200
+    assert thinking.status == 200
+    assert (await thinking.json()) == {"ok": True, "applied": True}
+    assert len(feishu_client.updated) == 1
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["feishu_update_attempts"] == 2
+    assert metrics["feishu_update_successes"] == 1
+    assert metrics["feishu_update_failures"] == 1
+    assert metrics["feishu_update_retries"] == 1
+
+
+async def test_terminal_update_failure_still_accepts_event_to_prevent_native_fallback(client):
+    test_client, feishu_client = client
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+
+    assert completed.status == 200
+    assert await completed.json() == {"ok": True, "applied": True}
+    metrics = await wait_for_metric(
+        test_client,
+        "feishu_update_attempts",
+        sidecar_server.UPDATE_MAX_ATTEMPTS + 1,
+        attempts=180,
+    )
+    assert metrics["events_applied"] == 2
+    assert metrics["events_rejected"] == 0
+    assert metrics["feishu_update_attempts"] == 4  # 3 from _update_card + 1 from _retry_terminal
+    assert metrics["feishu_update_failures"] == sidecar_server.UPDATE_MAX_ATTEMPTS
+
+
+async def test_health_reports_last_attachment_event_for_native_delivery(client):
+    test_client, _ = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": "最终答案",
+                "attachments": [
+                    {"kind": "image", "name": "cover.png", "summary": "cover.png"}
+                ],
+                "native_delivery": "required",
+            },
+        ),
+    )
+
+    assert completed.status == 200
+    health = await test_client.get("/health")
+    diagnostics = (await health.json())["diagnostics"]
+    assert diagnostics["last_attachment_event"]["event"] == "message.completed"
+    assert diagnostics["last_attachment_event"]["attachment_count"] == 1
+    assert diagnostics["last_attachment_event"]["native_delivery"] == "required"
+    assert diagnostics["last_attachment_event"]["message_id_hash"]
+    assert "message_id" not in diagnostics["last_attachment_event"]
+
+
+async def test_terminal_update_failure_is_retried_in_background(client, monkeypatch):
+    test_client, feishu_client = client
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(sidecar_server.asyncio, "sleep", fake_sleep)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+
+    assert completed.status == 200
+    for _ in range(10):
+        if feishu_client.updated:
+            break
+        await asyncio.sleep(0)
+
+    assert len(feishu_client.updated) == 1
+    assert "最终答案" in str(feishu_client.updated[-1][1])
+
+
+@pytest.mark.parametrize("terminal,data,expected", [
+    ("message.completed", {"answer": "最终答案"}, "最终答案"),
+    ("message.failed", {"error": "provider failed"}, "provider failed"),
+])
+async def test_exhausted_terminal_patch_recovers_once_in_original_topic(
+    client, monkeypatch, terminal, data, expected,
+):
+    test_client, feishu_client = client
+    async def exhausted(*args):
+        return False
+    monkeypatch.setattr(sidecar_server, "_retry_terminal_update", exhausted)
+    route = {"thread_id": "omt_recovery"}
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0, {"reply_to_message_id": "om_anchor"}, **route,
+    ))
+    feishu_client.update_failures_remaining = 100
+    payload = event_payload(terminal, 1, data, **route)
+    response = await test_client.post("/events", json=payload)
+    assert (await response.json())["applied"] is True
+    for _ in range(100):
+        if len(feishu_client.sent) == 2:
+            break
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    assert len(feishu_client.sent) == 2
+    recovered = feishu_client.sent[-1]
+    assert expected in str(recovered[1])
+    assert recovered[2:] == ("omt_recovery", "om_anchor")
+    for sequence in [1, 2]:
+        duplicate = dict(payload, sequence=sequence)
+        assert (await (await test_client.post("/events", json=duplicate)).json())["applied"] is True
+    await _REAL_ASYNCIO_SLEEP(0.02)
+    assert len(feishu_client.sent) == 2
+    assert feishu_client.texts == []
+    assert next(iter(test_client.app[SESSIONS_KEY].values())).terminal_delivery_state == "recovered"
+
+
+@pytest.mark.parametrize("outcome", ["not_sent", "unknown"])
+async def test_terminal_recovery_send_failure_is_observable(client, monkeypatch, outcome):
+    test_client, feishu_client = client
+    async def exhausted(*args):
+        return False
+    monkeypatch.setattr(sidecar_server, "_retry_terminal_update", exhausted)
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    feishu_client.update_failures_remaining = 100
+    async def failed_send(*args, **kwargs):
+        raise FeishuAPIError("unavailable", retryable=False, outcome=outcome)
+    monkeypatch.setattr(feishu_client, "send_card", failed_send)
+    await test_client.post("/events", json=event_payload("message.completed", 1, {"answer": "答案"}))
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    for _ in range(100):
+        if session.terminal_delivery_state == outcome:
+            break
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    assert session.terminal_delivery_state == outcome
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.texts == []
+    health = await (await test_client.get("/health")).json()
+    assert health["diagnostics"]["last_terminal_delivery"]["outcome"] == outcome
+
+
+@pytest.mark.parametrize("patch_fails", [False, True])
+async def test_exact_hook_ownership_keeps_final_answer_after_patch_exhaustion(client, monkeypatch, patch_fails):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    async def exhausted(*args):
+        return False
+    async def post_to_sidecar(_url, payload, _timeout):
+        return await (await test_client.post("/events", json=payload)).json()
+    async def unexpected_native_send(**kwargs):
+        pytest.fail("accepted terminal must not also send native text")
+    monkeypatch.setattr(sidecar_server, "_retry_terminal_update", exhausted)
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", post_to_sidecar)
+    if patch_fails:
+        feishu_client.update_failures_remaining = 100
+    answer = "完整回答" * 500 + "末尾校验"
+    token = hook_runtime._HFC_EXACT_COMPLETION_STAGE.set({
+        "payload": event_payload("message.completed", 1, {"answer": answer}),
+        "event_url": "http://127.0.0.1/events", "timeout_seconds": 10,
+        "task_id": id(asyncio.current_task()),
+        "base_context": {"images": [], "local_files": [], "media_files": []},
+    })
+    try:
+        adapter = SimpleNamespace(name="feishu", _send_with_retry=unexpected_native_send)
+        delivery_adapter, content, reply_to, metadata = await hook_runtime.prepare_decomposed_base_final_delivery({
+            "delivery_adapter": adapter, "content": answer,
+            "reply_to": None, "metadata": None, "obligation_id": None,
+        })
+        delivered = await delivery_adapter._send_with_retry(content=content, reply_to=reply_to, metadata=metadata)
+        assert delivered.success is True
+        session = next(iter(test_client.app[SESSIONS_KEY].values()))
+        for _ in range(100):
+            if session.terminal_delivery_state in {"delivered", "recovered"}:
+                break
+            await _REAL_ASYNCIO_SLEEP(0.01)
+        assert session.terminal_delivery_state == ("recovered" if patch_fails else "delivered")
+        final_card = feishu_client.sent[-1][1] if patch_fails else feishu_client.updated[-1][1]
+        assert answer in str(final_card)
+        assert len(feishu_client.sent) == (2 if patch_fails else 1)
+        assert feishu_client.texts == []
+    finally:
+        hook_runtime._HFC_EXACT_COMPLETION_STAGE.reset(token)
+
+
+async def test_terminal_retry_backoff_does_not_inflate_patch_latency_metric(
+    client, monkeypatch
+):
+    test_client, feishu_client = client
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    now = [100.0]
+
+    async def fake_sleep(delay):
+        now[0] += delay
+
+    monkeypatch.setattr(sidecar_server.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(sidecar_server.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(flush_module.time, "monotonic", lambda: now[0])
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+    )
+
+    assert completed.status == 200
+    await wait_for_card_update(feishu_client, "最终答案")
+    health = await test_client.get("/health")
+    metrics = (await health.json())["metrics"]
+    assert metrics["feishu_update_attempts"] == sidecar_server.UPDATE_MAX_ATTEMPTS + 1
+    assert metrics["feishu_update_failures"] == sidecar_server.UPDATE_MAX_ATTEMPTS
+    assert metrics["feishu_update_latency_ms"] < 1000
+
+
+async def test_send_failure_returns_json_error_and_allows_started_retry(client):
+    test_client, feishu_client = client
+    feishu_client.fail_send = True
+
+    failed = await test_client.post("/events", json=event_payload("message.started", 0))
+
+    assert failed.status == 502
+    failed_body = await failed.json()
+    assert failed_body == {
+        "ok": False,
+        "error": "feishu send failed",
+        "delivery": {"outcome": "unknown"},
+    }
+    assert feishu_client.sent == []
+    health_after_failure = await test_client.get("/health")
+    failure_body = await health_after_failure.json()
+    assert failure_body["active_sessions"] == 0
+    assert failure_body["metrics"]["feishu_send_attempts"] == 1
+    assert failure_body["metrics"]["feishu_send_failures"] == 1
+
+    feishu_client.fail_send = False
+    retried = await test_client.post("/events", json=event_payload("message.started", 0))
+
+    assert retried.status == 200
+    assert await retried.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ["send", "route"])
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_repeated_failed_messages_do_not_retain_runtime_state(
+    failure_kind, replacement
+):
+    if failure_kind == "send":
+        boundary = FakeFeishuClient()
+        boundary.fail_send = True
+        app = create_app(boundary)
+    else:
+        boundary = FakeFeishuClientFactory()
+
+        def fail_route(event):
+            raise RuntimeError("route unavailable")
+
+        app = create_app(boundary, bot_router=fail_route)
+
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        for index in range(12):
+            session_key = f"om_failed_{index}"
+            reply_alias = f"om_reply_{index}"
+            parent_alias = f"om_parent_{index}"
+            if replacement:
+                old_session = CardSession("oc_abc", session_key, "oc_abc")
+                old_session.status = "completed"
+                old_session.answer_text = f"old answer {index}"
+                old_session.active_interaction = InteractionState(
+                    interaction_id=f"approval-{index}",
+                    kind="approval",
+                    prompt="Old approval",
+                    status="completed",
+                )
+                app[SESSIONS_KEY][session_key] = old_session
+                app[FEISHU_MESSAGE_IDS_KEY][session_key] = f"om_card_{index}"
+                app[MESSAGE_BOT_IDS_KEY][session_key] = "default"
+                app[SESSION_CARD_CONFIGS_KEY][session_key] = {"title": "Old"}
+                app[SESSION_ALIASES_KEY][f"om_old_alias_{index}"] = session_key
+                sidecar_server._store_interaction_result(app, old_session)
+                sidecar_server._store_card_summary(
+                    app,
+                    SidecarEvent.from_dict(
+                        event_payload(
+                            "message.completed",
+                            1,
+                            {"answer": old_session.answer_text},
+                            message_id=session_key,
+                        )
+                    ),
+                    old_session,
+                    f"om_card_{index}",
+                )
+
+            response = await test_client.post(
+                "/events",
+                json=event_payload(
+                    "message.started",
+                    0,
+                    {
+                        "reply_to_message_id": reply_alias,
+                        "parent_message_id": parent_alias,
+                    },
+                    message_id=session_key,
+                    thread_id=f"omt_topic_{index}",
+                ),
+            )
+            assert response.status == 502
+
+        if replacement:
+            # Failed replacement creates retain only the already-published
+            # terminal display, never active approval/execution state.
+            assert len(app[SESSIONS_KEY]) == 12
+            for index in range(12):
+                key = f"om_failed_{index}"
+                retained = app[SESSIONS_KEY][key]
+                assert retained.status == "completed"
+                assert retained.answer_text == f"old answer {index}"
+                assert retained.active_interaction is None
+                assert app[FEISHU_MESSAGE_IDS_KEY][key] == f"om_card_{index}"
+            assert app[INTERACTION_RESULTS_KEY] == {}
+            cleanup_runtime_state(sidecar_server._cleanup_state_for_app(app), time.time() + 3601)
+
+        assert app[SESSIONS_KEY] == {}
+        assert app[SESSION_ALIASES_KEY] == {}
+        assert app[MESSAGE_LOCKS_KEY] == {}
+        assert app[MESSAGE_LOCK_USERS_KEY] == {}
+        assert app[FEISHU_MESSAGE_IDS_KEY] == {}
+        assert app[MESSAGE_BOT_IDS_KEY] == {}
+        assert app[SESSION_CARD_CONFIGS_KEY] == {}
+        assert app[FLUSH_CONTROLLERS_KEY] == {}
+        assert app[CARD_SUMMARIES_KEY] == {}
+        assert app[CARD_SUMMARY_SESSION_KEYS_KEY] == {}
+        assert app[INTERACTION_RESULTS_KEY] == {}
+        assert app[INTERACTION_RESULT_SESSION_KEYS_KEY] == {}
+    finally:
+        await test_client.close()
+
+
+def test_failed_session_cleanup_preserves_reassigned_aliases_and_owners():
+    app = create_app(FakeFeishuClient())
+    failed_key = "om_failed"
+    active_key = "om_active"
+    active_session = CardSession("oc_abc", active_key, "oc_abc")
+    app[SESSIONS_KEY][active_key] = active_session
+    app[SESSION_ALIASES_KEY]["om_reply"] = active_key
+    app[CARD_SUMMARIES_KEY]["om_card"] = {"summary": "active"}
+    app[CARD_SUMMARY_SESSION_KEYS_KEY]["om_card"] = active_key
+    app[INTERACTION_RESULTS_KEY]["approval-active"] = {"status": "pending"}
+    app[INTERACTION_RESULT_SESSION_KEYS_KEY]["approval-active"] = active_key
+
+    sidecar_server._cleanup_failed_session_state(app, failed_key)
+
+    assert app[SESSION_ALIASES_KEY] == {"om_reply": active_key}
+    assert app[CARD_SUMMARIES_KEY] == {"om_card": {"summary": "active"}}
+    assert app[CARD_SUMMARY_SESSION_KEYS_KEY] == {"om_card": active_key}
+    assert app[INTERACTION_RESULTS_KEY] == {
+        "approval-active": {"status": "pending"}
+    }
+    assert app[INTERACTION_RESULT_SESSION_KEYS_KEY] == {
+        "approval-active": active_key
+    }
+
+    app[SESSIONS_KEY][failed_key] = CardSession("oc_abc", failed_key, "oc_abc")
+    app[SESSION_ALIASES_KEY]["om_failed_reply"] = failed_key
+    app[CARD_SUMMARIES_KEY]["om_failed_card"] = {"summary": "current"}
+    app[CARD_SUMMARY_SESSION_KEYS_KEY]["om_failed_card"] = failed_key
+    app[INTERACTION_RESULTS_KEY]["approval-current"] = {"status": "pending"}
+    app[INTERACTION_RESULT_SESSION_KEYS_KEY]["approval-current"] = failed_key
+
+    sidecar_server._cleanup_failed_session_state(app, failed_key)
+
+    assert app[SESSION_ALIASES_KEY]["om_failed_reply"] == failed_key
+    assert app[CARD_SUMMARIES_KEY]["om_failed_card"] == {"summary": "current"}
+    assert app[CARD_SUMMARY_SESSION_KEYS_KEY]["om_failed_card"] == failed_key
+    assert app[INTERACTION_RESULTS_KEY]["approval-current"] == {"status": "pending"}
+    assert app[INTERACTION_RESULT_SESSION_KEYS_KEY]["approval-current"] == failed_key
+
+
+async def test_started_routes_card_to_bound_bot_client():
+    factory = FakeFeishuClientFactory()
+
+    def bot_router(event):
+        assert event.chat_id == "oc_sales"
+        return RouteResult("sales", "bindings.chats")
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, chat_id="oc_sales"),
+        )
+        status = response.status
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert status == 200
+    assert body == DELIVERED_RESPONSE
+    assert factory.clients["default"].sent == []
+    assert len(factory.clients["sales"].sent) == 1
+    assert factory.clients["sales"].sent[0][0] == "oc_sales"
+
+
+async def test_started_card_title_uses_bot_over_profile_and_global():
+    factory = FakeFeishuClientFactory(
+        cards={"sales": {"title": "Sales Bot"}},
+        profile_card={"title": "Profile"},
+    )
+
+    def bot_router(event):
+        return RouteResult("sales", "bindings.chats")
+
+    app = create_app(
+        factory,
+        card_config={"title": "Global"},
+        bot_router=bot_router,
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                chat_id="oc_sales",
+            ),
+        )
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    sent_card = factory.clients["sales"].sent[0][1]
+    assert sent_card["header"]["title"]["content"] == "⏳ 执行中 · Sales Bot"
+
+
+@pytest.mark.parametrize("command", ["status", "doctor", "update"])
+async def test_width_mode_command_cards_keep_bot_scope(command, monkeypatch):
+    factory = FakeFeishuClientFactory(
+        cards={"sales": {"width_mode": "fill"}}, profile_card={"width_mode": "default"},
+    )
+    app = create_app(
+        factory, card_config={"width_mode": "compact"},
+        bot_router=lambda event: RouteResult("sales", "bindings.chats"),
+    )
+    monkeypatch.setattr(
+        sidecar_server, "_build_operations_report_sync",
+        lambda *args, **kwargs: (operations_report(), SimpleNamespace(root=Path("/test/hermes"))),
+    )
+
+    async def unavailable_update(app):
+        return sidecar_server._unavailable_update_inspection(app, "maintenance_runtime_unavailable")
+
+    monkeypatch.setattr(sidecar_server, "_inspect_update_for_app", unavailable_update)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post("/commands", json=signed_operations_command({
+            "command": command, "chat_id": "oc_sales", "message_id": "command-width",
+            "chat_type": "private",
+            "operator": {"open_id": "ou_owner"},
+        }))
+        assert response.status == 200
+        await wait_for_condition(lambda: bool(factory.clients["sales"].sent))
+        card = factory.clients["sales"].sent[-1][1]
+        assert card["config"]["width_mode"] == "fill"
+        assert factory.clients["default"].sent == []
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.parametrize("bot_card, expected", [({}, "compact"), ({"width_mode": "fill"}, "fill"), ({"width_mode": "default"}, None)])
+async def test_width_mode_is_scoped_and_preserved_from_stream_to_final(bot_card, expected):
+    factory = FakeFeishuClientFactory(
+        cards={"sales": bot_card}, profile_card={"width_mode": "compact"},
+    )
+    app = create_app(
+        factory, card_config={"width_mode": "fill", "streaming_mode": True},
+        bot_router=lambda event: RouteResult("sales", "bindings.chats"),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post("/events", json=event_payload("message.started", 0))
+        assert started.status == 200
+        first = factory.clients["sales"].sent[0][1]
+        assert first["config"].get("width_mode") == expected
+        assert first["config"]["streaming_mode"] is True
+        completed = await test_client.post("/events", json=event_payload(
+            "message.completed", 1, {"answer": "Complete answer"},
+        ))
+        assert completed.status == 200
+        await wait_for_condition(lambda: bool(factory.clients["sales"].updated))
+        final = factory.clients["sales"].updated[-1][1]
+        assert final["config"].get("width_mode") == expected
+        assert final["config"]["streaming_mode"] is False
+        assert "Complete answer" in json.dumps(final)
+        assert factory.clients["default"].sent == []
+    finally:
+        await test_client.close()
+
+
+async def test_width_mode_handoff_repair_uses_original_session_not_global(monkeypatch):
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"width_mode": "compact"})
+    monkeypatch.setattr(sidecar_server, "_commit_native_handoff", lambda *args: None)
+    config = {"width_mode": "fill", "title": "Original owner"}
+    task = sidecar_server._schedule_pending_native_handoff_repair(
+        app, "owner", SimpleNamespace(card_state="pending"),
+        feishu_message_id="original-card", card_config=config,
+    )
+    config["width_mode"] = "default"
+    assert await task is True
+    message_id, card = feishu_client.updated[-1]
+    assert message_id == "original-card"
+    assert card["config"]["width_mode"] == "fill"
+    assert card["header"]["title"]["content"] == "Original owner"
+
+
+async def test_session_card_config_preserves_base_text_size_roles_on_profile_override():
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={
+            "text_sizes": {"body": "normal", "footer": "x-small"},
+        },
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                data={"card": {"text_sizes": {"footer": "notation"}}},
+            ),
+        )
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    session_card = next(iter(app[SESSION_CARD_CONFIGS_KEY].values()))
+    assert session_card["text_sizes"] == {
+        "body": "normal",
+        "footer": "notation",
+    }
+    sent_card = feishu_client.sent[0][1]
+    main = next(
+        item
+        for item in sent_card["body"]["elements"]
+        if item.get("element_id") == "main_content"
+    )
+    footer = next(
+        item
+        for item in sent_card["body"]["elements"]
+        if item.get("element_id") == "footer"
+    )
+    assert main["text_size"] == "normal"
+    assert footer["text_size"] == "notation"
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "uses_default_profile"),
+    [("bad:profile/path", False), ("", True), ("x" * 65, False)],
+)
+async def test_invalid_profile_is_native_but_empty_profile_uses_default(
+    profile_id,
+    uses_default_profile,
+):
+    factory = FakeFeishuClientFactory()
+
+    def bot_router(event):
+        return RouteResult("sales", "bindings.chats")
+
+    app = create_app({"default": factory, "sales": factory}, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"profile_id": profile_id, "profile_source": "env"},
+                chat_id="oc_sales",
+            ),
+        )
+        status = response.status
+        body = await response.json()
+        health = await test_client.get("/health")
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert status == 200
+    assert factory.clients["default"].sent == []
+    if uses_default_profile:
+        assert body == DELIVERED_RESPONSE
+        assert len(factory.clients["sales"].sent) == 1
+        assert health_body["profile_diagnostics"]["default"]["events"] == 1
+    else:
+        assert body == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert factory.clients["sales"].sent == []
+        assert health_body["profile_diagnostics"] == {}
+    assert health_body["routing"]["last_route_error"] == ""
+
+
+async def test_update_reuses_original_bot_without_rerouting():
+    factory = FakeFeishuClientFactory()
+    route_calls = 0
+
+    def bot_router(event):
+        nonlocal route_calls
+        route_calls += 1
+        if route_calls == 1:
+            return ("sales", "bindings.chats")
+        raise AssertionError("updates must not reroute")
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, chat_id="oc_sales"),
+        )
+        completed = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {"answer": "成交"},
+                chat_id="oc_sales",
+            ),
+        )
+        await wait_for_card_update(factory.clients["sales"], "成交")
+    finally:
+        await test_client.close()
+
+    assert started.status == 200
+    assert completed.status == 200
+    assert route_calls == 1
+    assert factory.clients["default"].updated == []
+    assert len(factory.clients["sales"].updated) == 1
+    assert factory.clients["sales"].updated[0][0] == "feishu-message-1"
+
+
+async def test_health_reports_safe_routing_diagnostics_without_secrets():
+    factory = FakeFeishuClientFactory()
+
+    def bot_router(event):
+        return ("sales", "bindings.chats")
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, chat_id="oc_sales"),
+        )
+        response = await test_client.get("/health")
+        status = response.status
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert status == 200
+    routing = body["routing"]
+    assert routing["default_bot"] == "default"
+    assert routing["bot_count"] == 2
+    assert routing["chat_binding_count"] == 1
+    assert routing["last_route"]["bot_id"] == "sales"
+    assert routing["last_route"]["reason"] == "bindings.chats"
+    assert routing["last_route"]["chat_id_hash"]
+    assert routing["last_route"]["message_id_hash"]
+    assert routing["last_route_error"] == ""
+    assert "chat_id" not in routing["last_route"]
+    assert "message_id" not in routing["last_route"]
+    assert "registry-secret" not in str(body)
+    assert "oc_sales" not in str(body)
+    assert "hermes-message-1" not in str(body)
+    assert "secret" not in routing
+
+
+async def test_health_routing_groups_multi_profile_diagnostics_without_secrets():
+    factories = {
+        "default": FakeFeishuClientFactory(),
+        "work": FakeFeishuClientFactory(),
+    }
+
+    def bot_router(event):
+        return ("sales", "bindings.chats")
+
+    app = create_app(factories, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"profile_id": "work", "profile_source": "env"},
+                chat_id="oc_sales",
+            ),
+        )
+        response = await test_client.get("/health")
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    routing = body["routing"]
+    assert routing["profile_count"] == 2
+    assert routing["bot_count"] == 4
+    assert routing["chat_binding_count"] == 2
+    assert routing["last_route"]["profile_id"] == "work"
+    assert routing["last_route"]["bot_id"] == "sales"
+    assert routing["last_route"]["reason"] == "bindings.chats"
+    assert routing["last_route"]["chat_id_hash"]
+    assert routing["last_route"]["message_id_hash"]
+    assert routing["profiles"]["work"]["bot_count"] == 2
+    assert routing["profiles"]["work"]["chat_binding_count"] == 1
+    assert routing["profiles"]["work"]["last_route"]["bot_id"] == "sales"
+    assert routing["profiles"]["work"]["last_route"]["chat_id_hash"]
+    assert routing["profiles"]["work"]["last_route"]["message_id_hash"]
+    assert routing["profiles"]["work"]["last_route_error"] == ""
+    assert "chat_id" not in routing["profiles"]["work"]["last_route"]
+    assert "message_id" not in routing["profiles"]["work"]["last_route"]
+    assert "registry-secret" not in str(routing)
+    assert "oc_sales" not in str(body)
+    assert "hermes-message-1" not in str(body)
+    assert "secret" not in routing["profiles"]["work"]
+
+
+async def test_route_failure_returns_502_and_reports_safe_error():
+    factory = FakeFeishuClientFactory()
+
+    def bot_router(event):
+        raise RuntimeError("cannot route with app_secret=super-secret")
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        failed = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, chat_id="oc_sales"),
+        )
+        failed_status = failed.status
+        failed_body = await failed.json()
+        health = await test_client.get("/health")
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert failed_status == 502
+    assert failed_body == {
+        "ok": False,
+        "error": "bot route failed",
+        "delivery": {"outcome": "not_sent"},
+    }
+    assert factory.clients["default"].sent == []
+    assert factory.clients["sales"].sent == []
+    assert health_body["active_sessions"] == 0
+    assert health_body["metrics"]["events_rejected"] == 1
+    assert health_body["diagnostics"]["last_route_error"] == "RuntimeError"
+    assert health_body["routing"]["last_route_error"] == "RuntimeError"
+    assert "super-secret" not in str(health_body)
+
+
+async def test_routed_update_failure_reports_safe_bot_id():
+    factory = FakeFeishuClientFactory()
+    factory.clients["sales"].update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+
+    def bot_router(event):
+        return ("sales", "bindings.chats")
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, chat_id="oc_sales"),
+        )
+        updated = await test_client.post(
+            "/events",
+            json=event_payload(
+                "thinking.delta",
+                1,
+                {"text": "需要更新"},
+                chat_id="oc_sales",
+            ),
+        )
+        health = await test_client.get("/health")
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert started.status == 200
+    assert updated.status == 200
+    # Lock optimization: non-terminal update failures no longer return 502
+    last_update_error = health_body["diagnostics"]["last_update_error"]
+    assert re.fullmatch(r"bot_hash=[0-9a-f]{12} RuntimeError", last_update_error)
+    assert "sales" not in last_update_error
+    assert "secret" not in health_body["diagnostics"]["last_update_error"].lower()
+    assert "token" not in health_body["diagnostics"]["last_update_error"].lower()
+
+
+async def test_routed_update_failure_redacts_sensitive_exception_text():
+    factory = FakeFeishuClientFactory()
+    factory.clients["sales"].update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    factory.clients["sales"].update_error_message = (
+        "Authorization Bearer tenant-token-secret app_secret=super-secret"
+    )
+
+    def bot_router(event):
+        return ("sales", "bindings.chats")
+
+    app = create_app(factory, bot_router=bot_router)
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0, chat_id="oc_sales"),
+        )
+        updated = await test_client.post(
+            "/events",
+            json=event_payload(
+                "thinking.delta",
+                1,
+                {"text": "需要更新"},
+                chat_id="oc_sales",
+            ),
+        )
+        health = await test_client.get("/health")
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    last_update_error = health_body["diagnostics"]["last_update_error"]
+    assert updated.status == 200
+    # Lock optimization: non-terminal update failures no longer return 502
+    assert re.search(r"bot_hash=[0-9a-f]{12}", last_update_error)
+    assert "sales" not in last_update_error
+    assert "RuntimeError" in last_update_error
+    assert "tenant-token-secret" not in last_update_error
+    assert "super-secret" not in last_update_error
+    assert "Authorization" not in last_update_error
+    assert "Bearer" not in last_update_error
+
+
+def test_diagnostic_hash_is_fixed_width_and_domain_separated():
+    bot_hash = sidecar_server._diagnostic_id_hash("sales", domain="bot")
+
+    assert re.fullmatch(r"[0-9a-f]{12}", bot_hash)
+    assert bot_hash == sidecar_server._diagnostic_id_hash("sales", domain="bot")
+    assert bot_hash != sidecar_server._diagnostic_id_hash("sales", domain="chat")
+
+
+async def test_session_key_uses_profile_id():
+    from hermes_feishu_card.server import _session_key
+    from hermes_feishu_card.events import SidecarEvent
+    event = SidecarEvent(
+        schema_version="1", event="message.started",
+        conversation_id="c", message_id="m", chat_id="c",
+        platform="feishu", sequence=0, created_at=0.0,
+        data={"profile_id": "work"},
+    )
+    assert _session_key(event) == "work:m"
+
+
+async def test_session_key_no_profile_is_just_message_id():
+    from hermes_feishu_card.server import _session_key
+    from hermes_feishu_card.events import SidecarEvent
+    event = SidecarEvent(
+        schema_version="1", event="message.started",
+        conversation_id="c", message_id="m", chat_id="c",
+        platform="feishu", sequence=0, created_at=0.0,
+        data={},
+    )
+    assert _session_key(event) == "m"
+
+
+async def test_session_key_explicit_empty_profile_uses_default_composite_key():
+    from hermes_feishu_card.server import _session_key
+    from hermes_feishu_card.events import SidecarEvent
+    event = SidecarEvent(
+        schema_version="1", event="message.started",
+        conversation_id="c", message_id="m", chat_id="c",
+        platform="feishu", sequence=0, created_at=0.0,
+        data={"profile_id": ""},
+    )
+    assert _session_key(event) == "default:m"
+
+
+# --- Tests for _abandon_stale_sessions_for_chat (interrupt scenario, #92) ---
+
+
+async def test_interrupt_abandons_stale_session_via_session_creating_event(client):
+    """When a new session is created via SESSION_CREATING_EVENTS (e.g. answer.delta
+    after an interrupt with no message.started), the old active session for the
+    same chat+conversation should be marked unsuccessful and its card updated."""
+    test_client, feishu_client = client
+
+    # First turn: message.started + some streaming
+    msg1 = {"conversation_id": "conv-1", "message_id": "msg-turn-1"}
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg1))
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "正在回答第一个问题"}, **msg1),
+    )
+    await wait_for_card_update(feishu_client, "正在回答第一个问题")
+
+    # Interrupt: a new turn arrives via SESSION_CREATING_EVENTS (answer.delta with
+    # a different message_id but same conversation_id — simulates the gateway
+    # interrupt fallback path where event_message_id changes).
+    msg2 = {"conversation_id": "conv-1", "message_id": "msg-turn-2"}
+    resp = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 0, {"text": "新的回答"}, **msg2),
+    )
+    assert resp.status == 200
+
+    # The old card should have been updated to completed state.
+    # Two cards were sent (one for each session).
+    assert len(feishu_client.sent) == 2
+
+    # The old card (feishu-message-1) should have a final update showing completed
+    updates_for_old = [
+        card for mid, card in feishu_client.updated if mid == "feishu-message-1"
+    ]
+    # At least 2 updates: the streaming delta + the abandon completion
+    assert len(updates_for_old) >= 2
+    # The last update should contain the completed marker (subtitle)
+    last_card = str(updates_for_old[-1])
+    assert "本轮已被新对话替代" in last_card
+
+
+async def test_interrupt_abandons_stale_session_via_message_started(client):
+    """When a new message.started arrives with a different message_id but same
+    conversation, the old active session should be abandoned."""
+    test_client, feishu_client = client
+
+    msg1 = {"conversation_id": "conv-1", "message_id": "msg-first"}
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg1))
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "第一轮内容"}, **msg1),
+    )
+    await wait_for_card_update(feishu_client, "第一轮内容")
+
+    # New turn with different message_id, same conversation
+    msg2 = {"conversation_id": "conv-1", "message_id": "msg-second"}
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg2))
+
+    # Two cards sent (old + new)
+    assert len(feishu_client.sent) == 2
+
+    # Old card should have been updated with completed state
+    updates_for_old = [
+        card for mid, card in feishu_client.updated if mid == "feishu-message-1"
+    ]
+    assert len(updates_for_old) >= 2
+    assert "本轮已被新对话替代" in str(updates_for_old[-1])
+
+
+async def test_late_terminal_with_turn_id_does_not_complete_new_quoted_turn(client):
+    test_client, feishu_client = client
+    quote = "om_shared_quote"
+    conversation = "omt_topic"
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": quote},
+            conversation_id=conversation,
+            message_id="om_turn_a",
+            turn_id="om_turn_a",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": quote},
+            conversation_id=conversation,
+            message_id="om_turn_b",
+            turn_id="om_turn_b",
+        ),
+    )
+    late = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"reply_to_message_id": quote, "answer": "A FINAL"},
+            conversation_id=conversation,
+            message_id=quote,
+            turn_id="om_turn_a",
+        ),
+    )
+
+    assert await late.json() == {"ok": True, "applied": True}
+    b_delta = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": quote, "text": "B LIVE"},
+            conversation_id=conversation,
+            message_id=quote,
+            turn_id="om_turn_b",
+        ),
+    )
+    assert (await b_delta.json())["applied"] is True
+
+    sessions = test_client.app[SESSIONS_KEY]
+    assert sessions["om_turn_b"].status not in {"completed", "failed"}
+    assert "A FINAL" not in sessions["om_turn_b"].answer_text
+    assert "B LIVE" in sessions["om_turn_b"].answer_text
+    await _wait_until(
+        lambda: any(
+            message_id == "feishu-message-2" and "B LIVE" in str(card)
+            for message_id, card in feishu_client.updated
+        )
+    )
+    assert all(
+        "A FINAL" not in str(card)
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-2"
+    )
+
+
+def test_explicit_turn_id_never_consults_a_preexisting_alias():
+    event = SidecarEvent.from_dict(
+        event_payload(
+            "message.completed",
+            2,
+            {"answer": "late A"},
+            message_id="om_quote",
+            turn_id="om_turn_a",
+        )
+    )
+    app = {
+        SESSIONS_KEY: {
+            "om_turn_b": CardSession("conversation-1", "om_turn_b", "oc_abc")
+        },
+        SESSION_ALIASES_KEY: {"om_turn_a": "om_turn_b"},
+    }
+
+    assert sidecar_server._resolve_session_key(app, event) == "om_turn_a"
+
+
+async def test_legacy_quoted_reply_without_turn_id_keeps_alias_routing(client):
+    test_client, _feishu_client = client
+    quote = "om_legacy_quote"
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": quote},
+            message_id="om_legacy_turn",
+        ),
+    )
+    delta = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": quote, "text": "legacy delta"},
+            message_id=quote,
+        ),
+    )
+
+    assert (await delta.json())["applied"] is True
+    assert "legacy delta" in (
+        test_client.app[SESSIONS_KEY]["om_legacy_turn"].answer_text
+    )
+    assert quote not in test_client.app[SESSIONS_KEY]
+
+
+async def test_shared_alias_cleanup_preserves_new_canonical_owner(client):
+    test_client, _feishu_client = client
+    quote = "om_shared_cleanup_quote"
+    for turn_id in ("om_turn_a", "om_turn_b"):
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"reply_to_message_id": quote},
+                message_id=turn_id,
+                turn_id=turn_id,
+            ),
+        )
+
+    app = test_client.app
+    assert app[SESSION_ALIASES_KEY][quote] == "om_turn_b"
+    failed_a = app[SESSIONS_KEY]["om_turn_a"]
+    config_a = app[SESSION_CARD_CONFIGS_KEY].get("om_turn_a")
+    sidecar_server._cleanup_failed_session_state(
+        app,
+        "om_turn_a",
+        failed_session=failed_a,
+        session_card_config=config_a,
+    )
+
+    assert app[SESSION_ALIASES_KEY][quote] == "om_turn_b"
+    assert app[SESSIONS_KEY]["om_turn_b"].status == "thinking"
+
+
+def test_native_handoff_identity_uses_canonical_turn_not_reply_anchor():
+    event = SidecarEvent.from_dict(
+        event_payload(
+            "message.completed",
+            2,
+            {"profile_id": "work", "answer": "done"},
+            conversation_id="omt_topic",
+            message_id="om_shared_quote",
+            chat_id="oc_chat",
+            turn_id="om_turn_a",
+        )
+    )
+
+    assert sidecar_server._native_handoff_identity(event) == handoff_identity_key(
+        profile_id="work",
+        chat_id="oc_chat",
+        conversation_id="omt_topic",
+        message_id="om_turn_a",
+    )
+
+
+async def test_quoted_reply_with_new_message_id_opens_and_updates_new_card(client):
+    test_client, feishu_client = client
+    reply_anchor = "om_quoted_message"
+    conversation_id = "omt-topic"
+
+    first_started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": reply_anchor},
+            conversation_id=conversation_id,
+            message_id="om_first_reply",
+            thread_id=conversation_id,
+        ),
+    )
+    assert await first_started.json() == DELIVERED_RESPONSE
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": reply_anchor, "text": "第一轮内容"},
+            conversation_id=conversation_id,
+            message_id=reply_anchor,
+            thread_id=conversation_id,
+        ),
+    )
+    await wait_for_card_update(feishu_client, "第一轮内容")
+
+    second_started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": reply_anchor},
+            conversation_id=conversation_id,
+            message_id="om_second_reply",
+            thread_id=conversation_id,
+        ),
+    )
+
+    assert await second_started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 2
+    assert [sent[3] for sent in feishu_client.sent] == [
+        "om_first_reply",
+        "om_second_reply",
+    ]
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": reply_anchor, "text": "第二轮内容"},
+            conversation_id=conversation_id,
+            message_id=reply_anchor,
+            thread_id=conversation_id,
+        ),
+    )
+    updated_message_id, _card = await wait_for_card_update(
+        feishu_client,
+        "第二轮内容",
+    )
+    assert updated_message_id == "feishu-message-2"
+
+
+async def test_interrupt_does_not_abandon_different_conversation(client):
+    """Sessions in different conversations (e.g. different topic group threads)
+    should NOT be abandoned when a new session is created."""
+    test_client, feishu_client = client
+
+    # Two different conversations in the same chat
+    msg1 = {"conversation_id": "thread-A", "message_id": "msg-thread-a"}
+    msg2 = {"conversation_id": "thread-B", "message_id": "msg-thread-b"}
+
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg1))
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "Thread A 内容"}, **msg1),
+    )
+    await wait_for_card_update(feishu_client, "Thread A 内容")
+    updates_before = len(feishu_client.updated)
+
+    # New session in a DIFFERENT conversation — should NOT abandon thread-A
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg2))
+
+    # Give any background tasks a chance to run
+    await asyncio.sleep(0.05)
+
+    # Old card (feishu-message-1) should NOT have gotten an abandon update
+    updates_after = feishu_client.updated[updates_before:]
+    old_card_updates = [card for mid, card in updates_after if mid == "feishu-message-1"]
+    assert len(old_card_updates) == 0, (
+        "Session in different conversation should not be abandoned"
+    )
+
+async def test_terminal_event_on_abandoned_session_returns_applied_true(client):
+    """When message.completed arrives for a session that was already abandoned
+    (status=failed), the sidecar should return applied=True so the gateway
+    hook suppresses the native plain-text delivery."""
+    test_client, feishu_client = client
+
+    msg1 = {"conversation_id": "conv-1", "message_id": "msg-original"}
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg1))
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": "部分回答"}, **msg1),
+    )
+    await wait_for_card_update(feishu_client, "部分回答")
+
+    # Trigger abandon by creating a new session in the same conversation
+    msg2 = {"conversation_id": "conv-1", "message_id": "msg-followup"}
+    await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 0, {"text": "新回答"}, **msg2),
+    )
+    await wait_for_card_update(feishu_client, "本轮已被新对话替代")
+    old_updates_before_late_terminal = len(
+        [
+            card
+            for message_id, card in feishu_client.updated
+            if message_id == "feishu-message-1"
+        ]
+    )
+
+    # Now send message.completed for the OLD session — should report applied=True
+    response = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 2, {"answer": "最终答案"}, **msg1),
+    )
+    result = await response.json()
+    await asyncio.sleep(0.05)
+    assert result["ok"] is True
+    assert result["applied"] is True
+    old_updates_after_late_terminal = len(
+        [
+            card
+            for message_id, card in feishu_client.updated
+            if message_id == "feishu-message-1"
+        ]
+    )
+    assert old_updates_after_late_terminal == old_updates_before_late_terminal
+
+
+async def test_interrupt_abandon_does_not_affect_completed_sessions(client):
+    """Sessions that are already completed should not be re-abandoned or cause
+    extra card updates when a new session is created."""
+    test_client, feishu_client = client
+
+    msg1 = {"conversation_id": "conv-1", "message_id": "msg-done"}
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg1))
+    await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": "完成了"}, **msg1),
+    )
+    await wait_for_card_update(feishu_client, "完成了")
+    updates_after_complete = len(feishu_client.updated)
+
+    # New session in same conversation — should not touch the completed one
+    msg2 = {"conversation_id": "conv-1", "message_id": "msg-new-turn"}
+    await test_client.post("/events", json=event_payload("message.started", 0, **msg2))
+
+    # No extra card updates should happen for the old completed session
+    await asyncio.sleep(0.05)
+    new_updates = feishu_client.updated[updates_after_complete:]
+    for mid, _ in new_updates:
+        assert mid != "feishu-message-1", (
+            "Already-completed session should not get extra updates on abandon"
+        )
+
+
+async def test_topic_approval_expiry_updates_current_card_without_main_stream_send(client):
+    test_client, feishu_client = client
+    routing = {"reply_in_thread": True, "reply_to_message_id": "om_topic_anchor"}
+    await test_client.post("/events", json=event_payload("message.started", 0, routing))
+    await test_client.post("/events", json=event_payload("interaction.requested", 1, {
+        **routing,
+        "interaction_id": "topic-expiry", "kind": "approval", "prompt": "授权",
+        "options": [{"label": "允许一次", "value": "once"}], "timeout_seconds": 300,
+    }))
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    session.active_interaction.requested_at = 100.0
+    current_card_id = test_client.app[FEISHU_MESSAGE_IDS_KEY][session.message_id]
+    sent_count = len(feishu_client.sent)
+    assert all(item[3] == "om_topic_anchor" for item in feishu_client.sent)
+    assert all(feishu_client.sent_reply_in_thread)
+    assert await sidecar_server._expire_pending_interactions(test_client.app, now=400.0) == 1
+    updated_id, card = await wait_for_card_update(feishu_client, "交互已过期")
+    # The independently delivered approval owns the expiry receipt. Refresh
+    # it first; only a confirmed full receipt permits removing owner duplicates.
+    assert updated_id == session.active_interaction.feishu_message_id
+    assert updated_id != current_card_id
+    owner = next(card for mid, card in reversed(feishu_client.updated) if mid == current_card_id)
+    assert "交互已过期" not in str(owner)
+    assert len(feishu_client.sent) == sent_count
+    assert not feishu_client.texts
+    assert not interaction_buttons(card)
+
+
+def _preflight_owner_state(session):
+    if session is None:
+        return None
+    return copy.deepcopy({
+        key: vars(value) if key in {"thinking_normalizer", "answer_normalizer"} else value
+        for key, value in vars(session).items()
+    })
+
+
+@pytest.mark.parametrize("existing_session", [False, True])
+async def test_oversized_interaction_declines_before_claiming_or_sending(client, existing_session):
+    test_client, feishu_client = client
+    if existing_session:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+    owner = next(iter(test_client.app[SESSIONS_KEY].values()), None)
+    owner_before = _preflight_owner_state(owner)
+    state_keys = (
+        SESSION_ALIASES_KEY, REDIRECT_SESSION_ALIASES_KEY,
+        FEISHU_MESSAGE_IDS_KEY, MESSAGE_BOT_IDS_KEY, SESSION_CARD_CONFIGS_KEY,
+        INTERACTION_RESULTS_KEY, INTERACTION_RESULT_SESSION_KEYS_KEY,
+        sidecar_server.RUNTIME_INTERACTION_RESERVATIONS_KEY,
+    )
+    session_keys = set(test_client.app[SESSIONS_KEY])
+    before = {key: copy.deepcopy(test_client.app[key]) for key in state_keys}
+    sent_count = len(feishu_client.sent)
+    updates = list(feishu_client.updated)
+    texts = list(feishu_client.texts)
+    response = await test_client.post("/events", json=event_payload("interaction.requested", 1, {
+        "interaction_id": "too-large-choice", "kind": "approval", "prompt": "授权",
+        "options": [{"label": "完整说明" * 4000, "value": "once"}],
+    }))
+    assert response.status == 200
+    assert await response.json() == {"ok": True, "applied": False, "reason": "interaction_card_limit"}
+    assert len(feishu_client.sent) == sent_count
+    assert all(session.active_interaction is None for session in test_client.app[SESSIONS_KEY].values())
+    assert "too-large-choice" not in test_client.app[INTERACTION_RESULTS_KEY]
+    assert feishu_client.updated == updates and feishu_client.texts == texts
+    assert set(test_client.app[SESSIONS_KEY]) == session_keys
+    assert all(test_client.app[key] == before[key] for key in state_keys)
+    if owner is None:
+        assert test_client.app[SESSIONS_KEY] == {}
+    else:
+        assert next(iter(test_client.app[SESSIONS_KEY].values())) is owner
+        assert _preflight_owner_state(owner) == owner_before and owner.last_sequence == 0
+
+
+async def test_duplicate_interaction_preflight_skips_renderer_and_keeps_original_owner(client, monkeypatch):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    payload = event_payload("interaction.requested", 1, {
+        "interaction_id": "duplicate-choice", "kind": "approval", "prompt": "Review",
+        "options": [{"label": "Allow once", "value": "once"}],
+    })
+    admitted = await test_client.post("/events", json=payload)
+    assert admitted.status == 200 and (await admitted.json())["applied"] is True
+    owner = next(iter(test_client.app[SESSIONS_KEY].values()))
+    before = _preflight_owner_state(owner)
+    sent_count = len(feishu_client.sent)
+    updates = list(feishu_client.updated)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("duplicate interaction rendered or re-evaluated card capacity")
+
+    monkeypatch.setattr(sidecar_server, "_render_session_card_result_for_app", forbidden)
+    replay = await test_client.post("/events", json=payload)
+    assert replay.status == 200
+    body = await replay.json()
+    assert body["applied"] is False and "reason" not in body
+    assert next(iter(test_client.app[SESSIONS_KEY].values())) is owner
+    assert _preflight_owner_state(owner) == before
+    assert len(feishu_client.sent) == sent_count and feishu_client.updated == updates
+
+
+async def test_approval_preflight_uses_compact_card_even_after_long_answer(client):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    session.answer_text = "历史正文" * 10000
+    response = await test_client.post("/events", json=event_payload("interaction.requested", 1, {
+        "interaction_id": "compact-approval", "kind": "approval", "prompt": "授权",
+        "options": [{"label": "允许一次", "value": "once"}],
+    }))
+    assert response.status == 200
+    assert (await response.json())["applied"] is True
+    assert interaction_buttons(feishu_client.sent[-1][1])[0]["value"]["choice"] == "once"
+    assert not feishu_client.texts
+
+
+async def test_interaction_callback_ack_does_not_wait_for_blocked_feishu_patch(client, monkeypatch):
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'slow-patch-choice', 'kind': 'clarify', 'prompt': 'Choose',
+        'options': [{'label': 'A', 'value': 'a'}],
+    }))
+    value = interaction_buttons(feishu_client.sent[-1][1])[0]['value']
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    original = feishu_client.update_card_message
+
+    async def blocked(message_id, card):
+        await release.wait()
+        await original(message_id, card)
+        finished.set()
+
+    monkeypatch.setattr(feishu_client, 'update_card_message', blocked)
+    try:
+        response = await asyncio.wait_for(test_client.post('/card/actions', json={'event': {
+            'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+            'action': {'value': value},
+        }}), timeout=0.5)
+        assert response.status == 200
+        body = await response.json()
+        assert '已选择：A' in str(body['card'])
+        assert not finished.is_set()
+        result = await test_client.get('/interactions/slow-patch-choice')
+        assert (await result.json())['choice'] == 'a'
+    finally:
+        release.set()
+    await asyncio.wait_for(finished.wait(), 1)
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+async def test_cardkit_opt_in_reaches_live_renderer_and_closes_at_terminal(streaming):
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={'streaming_mode': streaming, 'flush_interval_ms': 0})
+    async with TestClient(TestServer(app)) as test_client:
+        response = await test_client.post('/events', json=event_payload('message.started', 0))
+        assert response.status == 200
+        assert feishu_client.sent[0][1]['config'].get('streaming_mode', False) is streaming
+        await test_client.post('/events', json=event_payload('message.completed', 1, {'answer': 'complete tail'}))
+        await wait_for_card_update(feishu_client, 'complete tail')
+        assert feishu_client.updated[-1][1]['config'].get('streaming_mode', False) is False
+
+
+async def test_completion_mention_can_use_answer_card_without_extra_message():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={'completion_notify': {'enabled': True, 'placement': 'card'}})
+    async with TestClient(TestServer(app)) as test_client:
+        await test_client.post('/events', json=event_payload('message.started', 0, {'sender_open_id': 'ou_requester'}))
+        await test_client.post('/events', json=event_payload('message.completed', 1, {'answer': 'Answer tail'}))
+        await wait_for_card_update(feishu_client, 'Answer tail')
+        card = feishu_client.updated[-1][1]
+        body = next(item['content'] for item in card['body']['elements'] if item.get('element_id') == 'main_content')
+        assert body.startswith('<at id="ou_requester"></at>\n\nAnswer tail')
+        assert feishu_client.texts == []
+
+
+async def test_expired_approval_pauses_then_requires_fresh_explicit_consent(client):
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'pause-consent', 'kind': 'approval', 'prompt': 'Review operation',
+        'description': 'exact operation scope', 'pause_on_timeout': True, 'timeout_seconds': 300,
+        'options': [{'label': 'Allow once', 'value': 'once'}, {'label': 'Deny', 'value': 'deny'}],
+    }, thread_id='omt_topic'))
+    old_choice = interaction_buttons(feishu_client.sent[-1][1])[0]['value']
+    session = test_client.app[SESSIONS_KEY]['hermes-message-1']
+    interaction = session.active_interaction
+    assert interaction.feishu_message_id  # the approval card is tracked so it can be reused
+    cards_sent = len(feishu_client.sent)
+    interaction.requested_at -= 301
+    result = await test_client.get('/interactions/pause-consent')
+    assert (await result.json())['status'] == 'paused'
+    assert interaction.choice == ''
+    await _wait_until(lambda: cards_edited_into(feishu_client, interaction.feishu_message_id))
+    paused = cards_edited_into(feishu_client, interaction.feishu_message_id)[-1]
+    resume = interaction_buttons(paused)[0]['value']
+    assert 'exact operation scope' in str(paused)
+    assert resume['token'] != old_choice['token']
+    # Reuse, not a repeat: the paused notice refreshed the approval card instead of being posted
+    # as a second card the user would have to read twice (#314).
+    assert len(feishu_client.sent) == cards_sent
+
+    async def click(value):
+        return await test_client.post('/card/actions', json={'event': {
+            'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+            'action': {'value': value},
+        }})
+    assert (await click(old_choice)).status == 404
+    response = await click(resume)
+    assert response.status == 200
+    renewed = (await response.json())['card']
+    assert interaction.status == 'pending' and interaction.choice == ''
+    fresh_choice = interaction_buttons(renewed)[0]['value']
+    assert fresh_choice['token'] not in {old_choice['token'], resume['token']}
+    assert (await click(resume)).status == 404
+    assert (await click(fresh_choice)).status == 200
+    result = await test_client.get('/interactions/pause-consent')
+    assert (await result.json())['choice'] == 'once'
+
+
+async def test_resume_refreshes_in_place_when_the_dead_card_cannot_be_recalled(client):
+    """Recall is best-effort: a refused recall refreshes that card instead of orphaning it."""
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'pause-dead-recall-refused', 'kind': 'approval', 'prompt': 'Review',
+        'description': 'exact operation scope', 'pause_on_timeout': True, 'timeout_seconds': 300,
+        'options': [{'label': 'Allow once', 'value': 'once'}],
+    }, thread_id='omt_topic'))
+    session = test_client.app[SESSIONS_KEY]['hermes-message-1']
+    interaction = session.active_interaction
+    dead_card_id = interaction.feishu_message_id
+    interaction.requested_at -= 301
+    assert (await (await test_client.get('/interactions/pause-dead-recall-refused')).json())[
+        'status'
+    ] == 'paused'
+    await _wait_until(lambda: cards_edited_into(feishu_client, dead_card_id))
+    resume = interaction_buttons(cards_edited_into(feishu_client, dead_card_id)[-1])[0]['value']
+    cards_before = len(feishu_client.sent)
+    edits_before = len(cards_edited_into(feishu_client, dead_card_id))
+    feishu_client.fail_delete = True
+
+    interaction.last_waiter_poll_at -= 16  # stale by more than the runtime heartbeat window
+    response = await test_client.post('/card/actions', json={'event': {
+        'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+        'action': {'value': resume},
+    }})
+    assert response.status == 409
+    body = await response.json()
+    assert '重新发送原请求' in body['toast']['content']
+    assert not interaction_buttons(body['card'])
+    assert feishu_client.deleted == []
+    assert len(feishu_client.sent) == cards_before
+    assert interaction.feishu_message_id == dead_card_id
+    assert interaction.status == 'failed'
+
+
+async def test_any_option_on_an_expired_approval_reissues_it_instead_of_a_dead_button(client):
+    """The window closed while the card was on screen: every option leads back to a usable card.
+
+    Field report: clicking an option answered with a toast nobody understood ("暂未确认选择结果"),
+    the card never changed, and the approval could not be taken any more.
+    """
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'reissue-on-expired-option', 'kind': 'approval', 'prompt': 'Review',
+        'description': 'exact operation scope', 'pause_on_timeout': True, 'timeout_seconds': 300,
+        'options': [{'label': 'Allow once', 'value': 'once'}, {'label': 'Deny', 'value': 'deny'}],
+    }, thread_id='omt_topic'))
+    session = test_client.app[SESSIONS_KEY]['hermes-message-1']
+    interaction = session.active_interaction
+    expired_option = interaction_buttons(feishu_client.sent[-1][1])[0]['value']
+    dead_card_id = interaction.feishu_message_id
+    cards_before = len(feishu_client.sent)
+    interaction.last_waiter_poll_at = time.time()
+    interaction.requested_at -= 301  # the card is still on screen, its window is not
+
+    async def click(value):
+        return await test_client.post('/card/actions', json={'event': {
+            'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+            'action': {'value': value},
+        }})
+
+    response = await click(expired_option)
+    assert response.status == 200
+    assert '重新审批' in (await response.json())['toast']['content']
+    assert interaction.status == 'pending' and interaction.choice == ''
+    # Renewal is not consent: the withdrawn card's option decides nothing on replay.
+    assert (await click(expired_option)).status == 404
+    assert len(feishu_client.sent) == cards_before
+    assert feishu_client.deleted == []
+    assert interaction.feishu_message_id == dead_card_id
+
+
+async def test_expired_approval_without_pause_requires_a_new_request(client):
+    """A failed request cannot be resurrected by repainting its approval card."""
+
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'reissue-failed-approval', 'kind': 'approval', 'prompt': 'Review',
+        'description': 'exact operation scope', 'timeout_seconds': 300,
+        'options': [{'label': 'Allow once', 'value': 'once'}],
+    }, thread_id='omt_topic'))
+    session = test_client.app[SESSIONS_KEY]['hermes-message-1']
+    interaction = session.active_interaction
+    option = interaction_buttons(feishu_client.sent[-1][1])[0]['value']
+    cards_before = len(feishu_client.sent)
+    interaction.requested_at -= 301
+    assert (await (await test_client.get('/interactions/reissue-failed-approval')).json())[
+        'status'
+    ] == 'failed'
+
+    response = await test_client.post('/card/actions', json={'event': {
+        'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+        'action': {'value': option},
+    }})
+
+    assert response.status == 409
+    assert '重新发送原请求' in (await response.json())['toast']['content']
+    assert interaction.status == 'failed' and interaction.choice == ''
+    assert len(feishu_client.sent) == cards_before
+
+
+@pytest.mark.parametrize('outcome', ['not_sent', 'unknown'])
+async def test_paused_approval_notification_recovers_with_same_uuid(client, monkeypatch, outcome):
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'pause-retry', 'kind': 'approval', 'prompt': 'Review operation',
+        'pause_on_timeout': True, 'timeout_seconds': 300,
+        'options': [{'label': 'Allow once', 'value': 'once'}],
+    }))
+    attempts = []
+
+    async def delivery(chat_id, card, **kwargs):
+        attempts.append(kwargs.pop('delivery_uuid'))
+        if len(attempts) == 1:
+            raise FeishuAPIError('temporary send failure', outcome=outcome)
+        message_id = await feishu_client.send_card(chat_id, card, **kwargs)
+        return SimpleNamespace(message_id=message_id, retry_count=0)
+
+    monkeypatch.setattr(feishu_client, 'send_card_delivery', delivery, raising=False)
+    interaction = test_client.app[SESSIONS_KEY]['hermes-message-1'].active_interaction
+    # Exercise the fallback notice path: this approval's card was never recorded, so the notice is
+    # posted as its own message — whose retry must keep ONE delivery UUID and ONE consent token.
+    interaction.feishu_message_id = ''
+    interaction.requested_at -= 301
+    await test_client.get('/interactions/pause-retry')
+    await _wait_until(lambda: not test_client.app[sidecar_server.PAUSED_APPROVAL_TASKS_KEY])
+    token = interaction.callback_token
+    assert interaction.status == 'paused' and interaction.choice == ''
+    await test_client.get('/interactions/pause-retry')
+    assert len(attempts) == 1  # Backoff prevents polling from flooding Feishu.
+    interaction.pause_retry_after = 0
+    await test_client.get('/interactions/pause-retry')
+    await _wait_until(lambda: len(feishu_client.sent) == 3)
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert interaction.callback_token == token
+    resume = interaction_buttons(feishu_client.sent[-1][1])[0]['value']
+    response = await test_client.post('/card/actions', json={'event': {
+        'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+        'action': {'value': resume},
+    }})
+    assert response.status == 200
+    assert interaction.status == 'pending' and interaction.choice == ''
+    await test_client.get('/interactions/pause-retry')
+    assert len(attempts) == 2
+
+
+async def test_paused_approval_after_runtime_disappears_explains_expiry_without_consent(client):
+    """A stale waiter yields an explicit terminal card, without consent or replacement."""
+
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 0))
+    await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'pause-orphan', 'kind': 'approval', 'prompt': 'Review',
+        'pause_on_timeout': True, 'timeout_seconds': 300, 'options': [{'label': 'A', 'value': 'once'}],
+    }))
+    interaction = test_client.app[SESSIONS_KEY]['hermes-message-1'].active_interaction
+    interaction.requested_at -= 301
+    await test_client.get('/interactions/pause-orphan')
+    await _wait_until(lambda: cards_edited_into(feishu_client, interaction.feishu_message_id))
+    dead_card_id = interaction.feishu_message_id
+    resume = interaction_buttons(cards_edited_into(feishu_client, dead_card_id)[-1])[0]['value']
+    withdrawn_token = interaction.callback_token
+    cards_before = len(feishu_client.sent)
+    interaction.last_waiter_poll_at -= 16
+    response = await test_client.post('/card/actions', json={'event': {
+        'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'}, 'action': {'value': resume},
+    }})
+    assert response.status == 409
+    result = await response.json()
+    assert '重新发送原请求' in result['toast']['content']
+    assert not interaction_buttons(result['card'])
+    assert interaction.status == 'failed' and interaction.choice == ''
+    assert interaction.callback_token != withdrawn_token
+    assert feishu_client.deleted == []
+    assert len(feishu_client.sent) == cards_before
+    replay = await test_client.post('/card/actions', json={'event': {
+        'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'}, 'action': {'value': resume},
+    }})
+    assert replay.status == 404  # the withdrawn token can never complete the renewed approval
+    assert interaction.choice == ''
+
+
+async def test_live_gateway_approval_wait_survives_expiry_until_fresh_choice(client, monkeypatch):
+    test_client, feishu_client = client
+    hook_runtime.reset_runtime_state()
+    config = hook_runtime.RuntimeConfig(True, str(test_client.make_url('/events')), 0.5, 0, 240, 32)
+    monkeypatch.setattr(hook_runtime, 'load_runtime_config', lambda: config)
+    monkeypatch.setattr(hook_runtime, '_policy_gate_sync', lambda *args: SimpleNamespace(card=True))
+    alive = [True]
+    source = SimpleNamespace(platform='feishu', chat_id='oc_abc', thread_id='omt_live', message_id='om_live')
+    local_vars = {'source': source, 'event': SimpleNamespace(message_id='om_live'),
+                  'chat_id': 'oc_abc', 'conversation_id': 'oc_abc', 'message_id': 'om_live',
+                  '_run_still_current': lambda: alive[0]}
+    started = hook_runtime.build_event('message.started', local_vars)
+    assert (await test_client.post('/events', json=started)).status == 200
+    waiter = asyncio.create_task(asyncio.to_thread(
+        hook_runtime.request_approval_choice_from_hermes_locals, local_vars,
+        {'command': 'echo exact-scope', 'description': 'fixture operation'},
+        interaction_id='live-wait', timeout_seconds=300,
+    ))
+    try:
+        await _wait_until(lambda: len(feishu_client.sent) == 2)
+        session = next(s for s in test_client.app[SESSIONS_KEY].values() if s.active_interaction)
+        session.active_interaction.requested_at -= 301
+        await _wait_until(lambda: session.active_interaction.status == 'paused')
+        await _wait_until(lambda: cards_edited_into(feishu_client, session.active_interaction.feishu_message_id))
+        assert not waiter.done()
+        resume = interaction_buttons(
+            cards_edited_into(feishu_client, session.active_interaction.feishu_message_id)[-1]
+        )[0]['value']
+        async def choose(value):
+            return await test_client.post('/card/actions', json={'event': {
+                'context': {'open_chat_id': 'oc_abc'}, 'operator': {'open_id': 'ou_user'},
+                'action': {'value': value},
+            }})
+        renewed = await choose(resume)
+        assert renewed.status == 200
+        fresh = interaction_buttons((await renewed.json())['card'])[0]['value']
+        assert not waiter.done()
+        assert (await choose(fresh)).status == 200
+        assert await asyncio.wait_for(asyncio.shield(waiter), 3) == 'once'
+    finally:
+        alive[0] = False
+        await asyncio.wait_for(asyncio.shield(waiter), 3)
+
+
+async def test_paused_approval_keeps_initial_reply_anchor_without_started_event(client):
+    test_client, feishu_client = client
+    response = await test_client.post('/events', json=event_payload('interaction.requested', 1, {
+        'interaction_id': 'first-approval', 'kind': 'approval', 'prompt': 'Review',
+        'pause_on_timeout': True, 'timeout_seconds': 300,
+        'reply_to_message_id': 'om_inbound', 'reply_in_thread': True,
+        'options': [{'label': 'A', 'value': 'once'}],
+    }, message_id='om_first', thread_id='omt_thread'))
+    assert response.status == 200
+    session = test_client.app[SESSIONS_KEY]['om_first']
+    session.active_interaction.requested_at -= 301
+    # This approval's card was never recorded as delivered, so the notice has to be posted on its
+    # own — and it must still inherit the approval's place in the thread.
+    session.active_interaction.feishu_message_id = ''
+    await test_client.get('/interactions/first-approval')
+    await _wait_until(lambda: len(feishu_client.sent) == 2)
+    assert feishu_client.sent[-1][2:] == ('omt_thread', 'om_inbound')
+    assert feishu_client.sent_reply_in_thread[-1] is True
+
+
+async def test_heartbeat_card_is_recalled_once_its_refreshes_stop(client, monkeypatch):
+    """A heartbeat is reassurance, not a permanent record.
+
+    The complaint was a ⏳ Working card lingering in the thread as noise. Every refresh re-arms the
+    recall deadline, so it survives while the agent is working; once refreshes stop (the turn
+    ended, or the run died) the card is recalled and its state dropped — otherwise the next
+    heartbeat would keep editing a message that no longer exists.
+    """
+    monkeypatch.setattr(sidecar_server, "HEARTBEAT_RECALL_SECONDS", 0.05)
+    test_client, feishu_client = client
+
+    text = "⏳ Working — 3 min — iteration 5/90, terminal"
+    notice = _retained_heartbeat_notice(text)
+    assert notice["notice_kind"] == "heartbeat"
+    message_id = hook_runtime._hfc_independent_notice_message_id(
+        "oc_1", text, notice, anchor="om_user_task"
+    )
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                **notice,
+                "content": text,
+                "notice_scope": "independent",
+                "delivery_kind": "notice",
+                "reply_to_message_id": "om_user_task",
+            },
+            message_id=message_id,
+        ),
+    )
+
+    assert response.status == 200
+    assert len(feishu_client.sent) == 1
+    delivered_message_id = f"feishu-message-{len(feishu_client.sent)}"
+
+    await _wait_until(lambda: feishu_client.deleted)
+    assert feishu_client.deleted == [delivered_message_id]
+    assert message_id not in test_client.app[SESSIONS_KEY]
+
+
+async def test_a_refreshed_heartbeat_pushes_its_recall_deadline_out(client, monkeypatch):
+    """While refreshes keep arriving the card stays; the deadline tracks the LAST update."""
+    monkeypatch.setattr(sidecar_server, "HEARTBEAT_RECALL_SECONDS", 0.2)
+    test_client, feishu_client = client
+
+    texts = (
+        "⏳ Working — 3 min — iteration 5/90, terminal",
+        "⏳ Working — 6 min — iteration 9/90, terminal",
+    )
+    message_id = ""
+    for sequence, text in enumerate(texts, start=1):
+        notice = _retained_heartbeat_notice(text)
+        message_id = hook_runtime._hfc_independent_notice_message_id(
+            "oc_1", text, notice, anchor="om_user_task"
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "system.notice",
+                sequence,
+                {
+                    **notice,
+                    "content": text,
+                    "notice_scope": "independent",
+                    "delivery_kind": "notice",
+                    "reply_to_message_id": "om_user_task",
+                },
+                message_id=message_id,
+            ),
+        )
+
+    # One card, edited in place — never a second card — and not recalled while refreshing.
+    assert len(feishu_client.sent) == 1
+    await _wait_until(lambda: len(feishu_client.updated) == 1)
+    assert feishu_client.deleted == []
+
+    await _wait_until(lambda: feishu_client.deleted)
+    assert feishu_client.deleted == [f"feishu-message-{len(feishu_client.sent)}"]
+
+
+async def test_refused_recall_keeps_the_heartbeat_card_usable(client, monkeypatch):
+    """Feishu may refuse a recall; then the card must stay, and its state must survive."""
+    monkeypatch.setattr(sidecar_server, "HEARTBEAT_RECALL_SECONDS", 0.05)
+    test_client, feishu_client = client
+    feishu_client.fail_delete = True
+
+    text = "⏳ Working — 3 min — iteration 5/90, terminal"
+    notice = _retained_heartbeat_notice(text)
+    message_id = hook_runtime._hfc_independent_notice_message_id(
+        "oc_1", text, notice, anchor="om_user_task"
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            1,
+            {
+                **notice,
+                "content": text,
+                "notice_scope": "independent",
+                "delivery_kind": "notice",
+                "reply_to_message_id": "om_user_task",
+            },
+            message_id=message_id,
+        ),
+    )
+
+    await _REAL_ASYNCIO_SLEEP(0.2)
+    assert feishu_client.deleted == []
+    assert message_id in test_client.app[SESSIONS_KEY]
+
+async def test_session_heartbeat_never_recalls_final_answer(client, monkeypatch):
+    monkeypatch.setattr(sidecar_server, 'HEARTBEAT_RECALL_SECONDS', 0.03)
+    test_client, feishu_client = client
+    await test_client.post('/events', json=event_payload('message.started', 1, {}))
+    await test_client.post('/events', json=event_payload('system.notice', 2, {
+        'content': '⏳ Working — 3 min', 'notice_kind': 'heartbeat',
+        'notice_scope': 'session', 'notice_terminal': False,
+    }))
+    await test_client.post('/events', json=event_payload('message.completed', 3, {'answer': '完整答案'}))
+    await _REAL_ASYNCIO_SLEEP(0.15)
+    assert feishu_client.deleted == []
+    assert test_client.app[SESSIONS_KEY]
+
+
+async def test_an_independent_heartbeat_gets_its_own_card_and_spares_the_turn(client, monkeypatch):
+    """A heartbeat must not ride on the turn's card — only its own card can ever be withdrawn.
+
+    Production shape, and the reason this needs its own test: the heartbeat's status metadata
+    carries the user's message as `reply_to_message_id`, and the turn's session is live under that
+    very id. The reply_to alias would therefore hand the heartbeat the TURN's session key and fold
+    ⏳ Working into the turn's card. From there it can never be withdrawn — /recall/schedule refuses
+    an owned session card (409), and the card recall path wants delivery_kind=="notice" — so the
+    line stays in the thread for good, which is what the user reported ("变成卡片的时候好像不会
+    自动撤销了").
+
+    Asserted here: the heartbeat lands on its OWN card, its recall deletes only that card, and the
+    turn keeps rendering (its session, its card and its final answer all survive).
+    """
+    monkeypatch.setattr(sidecar_server, "HEARTBEAT_RECALL_SECONDS", 0.05)
+    test_client, feishu_client = client
+
+    # The turn owns the user's message id, and its card is the first thing sent.
+    await test_client.post(
+        "/events", json=event_payload("message.started", 1, {}, message_id="om_user_task")
+    )
+    assert len(feishu_client.sent) == 1
+
+    text = "⏳ Working — 18 min — iteration 39/150, terminal"
+    notice = _retained_heartbeat_notice(text)
+    heartbeat_id = hook_runtime._hfc_independent_notice_message_id(
+        "oc_abc", text, notice, anchor="om_user_task"
+    )
+
+    response = await test_client.post(
+        "/events",
+        json=event_payload(
+            "system.notice",
+            2,
+            {
+                **notice,
+                "content": text,
+                "notice_scope": "independent",
+                "delivery_kind": "notice",
+                "reply_to_message_id": "om_user_task",
+            },
+            message_id=heartbeat_id,
+        ),
+    )
+
+    assert response.status == 200
+    # A second, SEPARATE card: the heartbeat did not resolve onto the turn's session.
+    assert len(feishu_client.sent) == 2
+    assert heartbeat_id in test_client.app[SESSIONS_KEY]
+    assert "om_user_task" in test_client.app[SESSIONS_KEY]
+
+    # Its own recall fires; the turn's card is untouched.
+    await _wait_until(lambda: feishu_client.deleted)
+    assert feishu_client.deleted == ["feishu-message-2"]
+    assert heartbeat_id not in test_client.app[SESSIONS_KEY]
+    assert "om_user_task" in test_client.app[SESSIONS_KEY]
+
+    # ...and the turn still completes onto its own card.
+    await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 3, {"answer": "完整答案"}, message_id="om_user_task"),
+    )
+    turn = test_client.app[SESSIONS_KEY]["om_user_task"]
+    assert turn.answer_text == "完整答案"
+
+
+async def test_recall_schedule_withdraws_a_message_once_its_delay_elapses(client):
+    """The gateway cannot delete its own Feishu messages, so it delegates the recall to the sidecar.
+
+    The busy path's redirect acknowledgement ("↪ Redirected current run") is read once and then only
+    clutter in the thread: the gateway patch captures its message id and asks for this recall.
+    """
+    test_client, feishu_client = client
+
+    response = await test_client.post(
+        "/recall/schedule",
+        json={"message_id": "om_redirect_ack", "delay_seconds": 0.05},
+    )
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["ok"] is True
+    assert body["message_id"] == "om_redirect_ack"
+    # Nothing is withdrawn before the delay elapses — the user must still be able to read the
+    # acknowledgement while the corrected turn starts.
+    assert feishu_client.deleted == []
+    await _wait_until(lambda: feishu_client.deleted)
+    assert feishu_client.deleted == ["om_redirect_ack"]
+    assert test_client.app[METRICS_KEY].ephemeral_recalls_scheduled == 1
+    assert test_client.app[METRICS_KEY].ephemeral_recalls_completed == 1
+    assert test_client.app[METRICS_KEY].ephemeral_recall_failures == 0
+
+
+async def test_recall_schedule_clamps_the_delay_and_requires_a_message_id(client):
+    """A caller may not pin a deletion far into the future, and an empty id is a client error."""
+    test_client, feishu_client = client
+
+    response = await test_client.post("/recall/schedule", json={"message_id": "om_soon"})
+    assert response.status == 200
+    # No delay_seconds → the default, not zero: a recall racing the send could delete nothing.
+    assert (await response.json())["delay_seconds"] == sidecar_server.EPHEMERAL_RECALL_DEFAULT_SECONDS
+
+    response = await test_client.post(
+        "/recall/schedule", json={"message_id": "om_far", "delay_seconds": 10_000}
+    )
+    assert response.status == 200
+    assert (await response.json())["delay_seconds"] == sidecar_server.EPHEMERAL_RECALL_MAX_SECONDS
+
+    response = await test_client.post("/recall/schedule", json={"message_id": "   "})
+    assert response.status == 400
+    assert "message_id" in (await response.json())["error"]
+
+    response = await test_client.post(
+        "/recall/schedule", json={"message_id": "om_x", "delay_seconds": "soon"}
+    )
+    assert response.status == 400
+
+
+async def test_a_refused_recall_reports_why_it_was_refused(client, monkeypatch, caplog):
+    """A refusal must name the API's reason, not only the exception class.
+
+    Maintainer note (contract): ``_delete_card_for_app`` used to log the exception class alone, so a
+    live run with 12 of 44 recalls failing could not tell an API refusal from a message that had
+    already gone — and the metric could not either. ``FeishuAPIError`` carries
+    ``status_code``/``api_code`` and both must reach the log. The message id stays hashed: a recall
+    line must never put a real Feishu id in a log file.
+    """
+    test_client, feishu_client = client
+
+    async def _refuse(message_id):
+        raise FeishuAPIError("om_secret_id credential=private_token https://private.invalid/request", status_code=400, api_code=230011)
+
+    monkeypatch.setattr(feishu_client, "delete_message", _refuse)
+
+    response = await test_client.post(
+        "/recall/schedule", json={"message_id": "om_secret_id", "delay_seconds": 0.05}
+    )
+
+    assert response.status == 200
+    await _wait_until(lambda: test_client.app[METRICS_KEY].ephemeral_recall_failures)
+    assert "FeishuAPIError" in caplog.text
+    assert "230011" in caplog.text
+    assert "400" in caplog.text
+    assert "om_secret_id" not in caplog.text
+    assert "private_token" not in caplog.text
+    assert "private.invalid" not in caplog.text
+
+
+async def test_a_refused_recall_is_counted_and_leaves_the_message_alone(client):
+    """Feishu may refuse (missing scope, message too old): that is a counted best-effort miss."""
+    test_client, feishu_client = client
+    feishu_client.fail_delete = True
+
+    response = await test_client.post(
+        "/recall/schedule", json={"message_id": "om_stuck", "delay_seconds": 0.05}
+    )
+
+    assert response.status == 200
+    await _wait_until(lambda: test_client.app[METRICS_KEY].ephemeral_recall_failures)
+    assert feishu_client.deleted == []
+    assert test_client.app[METRICS_KEY].ephemeral_recalls_completed == 0
+
+@pytest.mark.parametrize('delay', ['nan', 'inf', '-inf'])
+async def test_recall_rejects_nonfinite_delays(client, delay):
+    http, fake = client
+    response = await http.post('/recall/schedule', json={'message_id':'om_ack', 'delay_seconds':delay})
+    assert response.status == 400
+    assert fake.deleted == []
+
+
+async def test_recall_deduplicates_and_bounds_pending_tasks(client, monkeypatch):
+    http, fake = client
+    monkeypatch.setattr(sidecar_server, 'EPHEMERAL_RECALL_MAX_PENDING', 1)
+    payload = {'message_id':'om_ack', 'delay_seconds':60}
+    assert (await http.post('/recall/schedule', json=payload)).status == 200
+    assert (await http.post('/recall/schedule', json=payload)).status == 200
+    assert len(http.app[sidecar_server.EPHEMERAL_RECALL_TASKS_KEY]) == 1
+    assert (await http.post('/recall/schedule', json={**payload,'message_id':'om_other'})).status == 429
+    assert http.app[METRICS_KEY].ephemeral_recalls_scheduled == 1
+
+
+async def test_recall_never_removes_owned_answer_even_after_schedule(client):
+    http, fake = client
+    http.app[FEISHU_MESSAGE_IDS_KEY]['fixture'] = 'om_owned'
+    response = await http.post('/recall/schedule', json={'message_id':'om_owned', 'delay_seconds':0})
+    assert response.status == 409
+    assert (await http.post('/recall/schedule', json={'message_id':'om_later', 'delay_seconds':0.03})).status == 200
+    http.app[FEISHU_MESSAGE_IDS_KEY]['fixture'] = 'om_later'
+    await _REAL_ASYNCIO_SLEEP(0.1)
+    assert fake.deleted == []
+
+
+@pytest.mark.parametrize('setting', [False, 'false', 0])
+@pytest.mark.parametrize('streaming', [False, True])
+async def test_stream_thinking_to_body_opt_out_reaches_http_renderer(setting, streaming):
+    client = FakeFeishuClient()
+    app = create_app(client, card_config={
+        'stream_thinking_to_body': setting, 'streaming_mode': streaming,
+        'flush_interval_ms': 0,
+    })
+    http = TestClient(TestServer(app))
+    await http.start_server()
+    try:
+        assert (await http.post('/events', json=event_payload('message.started', 0))).status == 200
+        thought = 'HTTP reasoning marker ' + '思考' * 15000
+        assert (await http.post('/events', json=event_payload('thinking.delta', 1, {'text': thought}))).status == 200
+        await wait_for_card_update(client, '实时思考')
+        card = client.updated[-1][1]
+        elements = card['body']['elements']
+        assert 'HTTP reasoning marker' not in '\n'.join(e.get('content', '') for e in elements)
+        panel = next(e for e in elements if e.get('element_id') == 'auxiliary_timeline')
+        assert 'HTTP reasoning marker' in str(panel)
+        assert inspect_card_limits(card).safe
+        assert len(client.sent) == 1
+        assert (await http.post('/events', json=event_payload('message.completed', 2, {'answer': 'HTTP final answer'}))).status == 200
+        await wait_for_card_update(client, 'HTTP final answer')
+        assert len(client.sent) == 1
+        assert 'HTTP reasoning marker' not in str(client.updated[-1][1])
+    finally:
+        await http.close()
+
+
+@pytest.mark.parametrize("first_event", ["message.started", "answer.delta", "tool.updated"])
+@pytest.mark.parametrize("senders", [("ou_alice", "ou_bob"), ("ou_alice", ""), ("", "ou_bob"), ("", ""), ("ou_alice", "invalid")])
+async def test_group_concurrent_requesters_keep_own_final_cards(client, first_event, senders):
+    test_client, feishu_client = client
+    for index, sender in enumerate(senders):
+        response = await test_client.post("/events", json=event_payload(
+            first_event, 0,
+            {"chat_type": "group", "sender_open_id": sender, "text": "partial",
+             "tool_id": "tool", "name": "search", "status": "running"},
+            conversation_id="oc_abc", message_id=f"om_group_{index}",
+        ))
+        assert (await response.json())["applied"] is True
+    sessions = test_client.server.app[SESSIONS_KEY]
+    assert all(session.status not in {"completed", "failed"} for session in sessions.values())
+    for index in (1, 0):
+        payload = event_payload("message.completed", 1, {"answer": f"FINAL USER {index}"},
+                                conversation_id="oc_abc", message_id=f"om_group_{index}")
+        response = await test_client.post("/events", json=payload)
+        assert (await response.json())["applied"] is True
+        await wait_for_card_update(feishu_client, f"FINAL USER {index}")
+        updates = [card for mid, card in feishu_client.updated if mid == f"feishu-message-{index + 1}"]
+        assert f"FINAL USER {index}" in str(updates[-1])
+        assert "本轮已被新对话替代" not in str(updates[-1])
+        before = len(updates)
+        await test_client.post("/events", json=payload)
+        # Other requesters may legitimately refresh while this POST yields.
+        assert sum(mid == f"feishu-message-{index + 1}"
+                   for mid, _card in feishu_client.updated) == before
+    assert len(feishu_client.sent) == 2
+
+
+@pytest.mark.parametrize("first_event", ["message.started", "answer.delta", "tool.updated"])
+async def test_group_same_requester_still_retires_interrupted_card(client, first_event):
+    test_client, feishu_client = client
+    for index in range(2):
+        await test_client.post("/events", json=event_payload(
+            first_event, 0, {"chat_type": "group", "sender_open_id": "ou_alice",
+                             "text": "partial", "tool_id": "tool", "name": "search"},
+            conversation_id="oc_abc", message_id=f"om_same_{index}",
+        ))
+    await wait_for_card_update(feishu_client, "本轮已被新对话替代")
+    assert test_client.server.app[SESSIONS_KEY]["om_same_0"].status == "failed"
+    assert test_client.server.app[SESSIONS_KEY]["om_same_1"].status != "failed"
+
+
+@pytest.mark.parametrize("source", ["om_alice", ""])
+async def test_group_redirect_only_retires_explicit_source(client, source):
+    test_client, feishu_client = client
+    for sender in ("alice", "bob"):
+        await test_client.post("/events", json=event_payload(
+            "message.started", 0, {"chat_type": "group", "sender_open_id": f"ou_{sender}"},
+            message_id=f"om_{sender}", turn_id=f"om_{sender}",
+        ))
+    await test_client.post("/events", json=event_payload(
+        "message.started", 0, {"chat_type": "group", "sender_open_id": "ou_alice",
+                               "redirect_followup": True, "redirect_from_turn_id": source},
+        message_id="om_redirect", turn_id="om_redirect",
+    ))
+    sessions = test_client.app[SESSIONS_KEY]
+    assert sessions["om_bob"].status == "thinking"
+    assert sessions["om_alice"].status == ("failed" if source else "thinking")
+    await test_client.post("/events", json=event_payload(
+        "message.completed", 1, {"answer": "BOB FINAL"}, message_id="om_bob", turn_id="om_bob",
+    ))
+    mid, card = await wait_for_card_update(feishu_client, "BOB FINAL")
+    assert mid == "feishu-message-2"
+
+
+async def test_group_failed_turn_does_not_affect_other_requester_or_revive(client):
+    test_client, feishu_client = client
+    for sender in ("alice", "bob", "carol"):
+        await test_client.post("/events", json=event_payload(
+            "message.started", 0, {"chat_type": "group", "sender_open_id": f"ou_{sender}"},
+            message_id=f"om_{sender}",
+        ))
+    await test_client.post("/events", json=event_payload(
+        "message.failed", 1, {"error": "provider unavailable"}, message_id="om_bob",
+    ))
+    await test_client.post("/events", json=event_payload(
+        "message.completed", 2, {"answer": "LATE BOB"}, message_id="om_bob",
+    ))
+    for sender, card_id in (("alice", "feishu-message-1"), ("carol", "feishu-message-3")):
+        await test_client.post("/events", json=event_payload(
+            "message.completed", 1, {"answer": f"FINAL {sender}"}, message_id=f"om_{sender}",
+        ))
+        mid, card = await wait_for_card_update(feishu_client, f"FINAL {sender}")
+        assert mid == card_id
+    assert test_client.app[SESSIONS_KEY]["om_bob"].status == "failed"
+    assert "LATE BOB" not in str(feishu_client.updated)
+    assert len(feishu_client.sent) == 3
+
+
+@pytest.mark.parametrize("same_scope", [True, False])
+async def test_native_group_turns_use_gateway_execution_scope(client, same_scope):
+    test_client, feishu_client = client
+    for index in range(2):
+        payload = event_payload("message.started", 0, {
+            "execution_scope": hashlib.sha256(("gateway-alice" if index == 0 or same_scope else "gateway-bob").encode()).hexdigest(),
+        }, message_id=f"om_native_{index}", turn_id=f"om_native_{index}")
+        payload = identified(payload, f"turn:om_native_{index}:started")
+        response = await test_client.post("/events", json=payload)
+        assert response.status == 200, await response.text()
+        assert (await response.json())["applied"] is True
+    sessions = test_client.app[SESSIONS_KEY]
+    assert sessions["om_native_0"].status == ("failed" if same_scope else "thinking")
+    if not same_scope:
+        for index in (1, 0):
+            await test_client.post("/events", json=event_payload(
+                "message.completed", 1, {"answer": f"NATIVE FINAL {index}"},
+                message_id=f"om_native_{index}", turn_id=f"om_native_{index}",
+            ))
+            mid, card = await wait_for_card_update(feishu_client, f"NATIVE FINAL {index}")
+            assert mid == f"feishu-message-{index + 1}"
+
+
+async def test_health_responds_while_integrity_source_scan_is_blocked():
+    from hermes_feishu_card.integrity import RuntimeIntegrityCoordinator
+
+    entered, release = threading.Event(), threading.Event()
+    def detect(_root):
+        entered.set()
+        assert release.wait(5)
+        return object()
+
+    app = create_app(FakeFeishuClient())
+    coordinator = RuntimeIntegrityCoordinator(
+        mode="safe", hermes_root="/sanitized-in-test",
+        supervisor=SimpleNamespace(snapshot=lambda: {
+            "status": "degraded", "reason": "runtime_heartbeat_missing",
+        }),
+        detector=detect,
+        planner=lambda _: SimpleNamespace(state="installed"),
+    )
+    app[sidecar_server.RUNTIME_INTEGRITY_COORDINATOR_KEY] = coordinator
+    async with TestClient(TestServer(app)) as client:
+        check = asyncio.create_task(asyncio.to_thread(coordinator.check_once))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            response = await asyncio.wait_for(client.get("/health"), timeout=2)
+            assert response.status == 200
+            body = await response.json()
+            assert body["integrity"]["last_status"] == "idle"
+            assert not release.is_set()
+            assert not check.done()
+        finally:
+            release.set()
+            await check
+        body = await (await client.get("/health")).json()
+        assert body["integrity"]["last_reason"] == "recovery_not_required"
+
+
+@pytest.mark.parametrize("session_count", [1, 5, 20])
+@pytest.mark.parametrize("round_number", [1, 2, 3])
+async def test_slow_loopback_downstream_keeps_terminal_and_interaction_live(
+    tmp_path, monkeypatch, session_count, round_number, record_property,
+):
+    """Exercise real HTTP on both sides while each session's PATCH is blocked.
+
+    For N streaming sessions, N isolated pending-choice probes run alongside.
+    ACKs and interaction results must arrive before downstream is released;
+    after release, each message must end with its own authoritative answer.
+    Three independent rounds also check cleanup of actual asyncio workers.
+    """
+    from aiohttp import ClientSession, web
+
+    release = asyncio.Event()
+    release.set()
+    consume_final = asyncio.Event()
+    completion_waiter = None
+    entered = set()
+    deliveries = []
+    active_updates = 0
+    peak_updates = 0
+    prefix = f"load-{round_number}-"
+
+    async def update_endpoint(request):
+        nonlocal active_updates, peak_updates
+        payload = await request.json()
+        entered.add(payload["message_id"])
+        active_updates += 1
+        peak_updates = max(peak_updates, active_updates)
+        try:
+            await release.wait()
+            await asyncio.sleep(0.01)
+            deliveries.append(payload)
+            return web.json_response({"ok": True})
+        finally:
+            active_updates -= 1
+
+    downstream = web.Application()
+    downstream.router.add_post("/update", update_endpoint)
+    downstream_server = TestServer(downstream)
+    await downstream_server.start_server()
+    try:
+        baseline_tasks = set(asyncio.all_tasks())
+        background = []
+        monkeypatch.setattr(sidecar_server, "UPDATE_MIN_INTERVAL_SECONDS", 0)
+
+        async with ClientSession() as transport:
+            class SlowHTTPClient(FakeFeishuClient):
+                async def update_card_message(self, message_id, card):
+                    async with transport.post(
+                        downstream_server.make_url("/update"),
+                        json={"message_id": message_id, "card": card},
+                    ) as response:
+                        assert response.status == 200
+                        await response.json()
+                    if f"FINAL_{prefix}" in str(card):
+                        await consume_final.wait()
+                    self.updated.append((message_id, card))
+
+            feishu = SlowHTTPClient()
+            app = create_app(
+                feishu,
+                native_handoff_store=NativeHandoffStore(tmp_path / "handoffs"),
+                card_config={"flush_interval_ms": 0, "final_drain_timeout_ms": 20},
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+
+            def payload(index, event, sequence, data=None):
+                return event_payload(
+                    event, sequence, data,
+                    conversation_id=f"{prefix}conversation-{index}",
+                    message_id=f"{prefix}message-{index}",
+                    chat_id=f"oc_load_{index}",
+                )
+
+            async def post(index, event, sequence, data=None):
+                response = await asyncio.wait_for(
+                    client.post("/events", json=payload(index, event, sequence, data)), 5
+                )
+                body = await response.json()
+                assert response.status == 200, body
+                return body
+
+            try:
+                await asyncio.gather(*(post(i, "message.started", 0) for i in range(2 * session_count)))
+                # Create genuine pending choices before saturating display updates.
+                await asyncio.gather(*(post(i + session_count, "interaction.requested", 1, {
+                    "interaction_id": f"{prefix}choice-{i}", "kind": "clarify",
+                    "prompt": f"Choose {i}", "options": [{"label": "A", "value": "a"}],
+                }) for i in range(session_count)))
+                choices = {}
+                for chat, card, _, _ in feishu.sent:
+                    buttons = interaction_buttons(card)
+                    if buttons:
+                        choices[chat] = buttons[0]["value"]
+                assert len(choices) == session_count
+                release.clear()
+                entered.clear()
+                deliveries.clear()
+                await asyncio.gather(*(post(i, "answer.delta", 2, {"text": "begin "}) for i in range(session_count)))
+                deadline = asyncio.get_running_loop().time() + 3
+                while len(entered) < session_count and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.005)
+                assert len(entered) >= session_count
+                # Long stream frames contend with blocked outgoing HTTP, not sleep mocks.
+                await asyncio.wait_for(asyncio.gather(*(
+                    post(i, "answer.delta", seq, {"text": f"frame-{seq} " + "x" * 256})
+                    for seq in range(3, 27) for i in range(session_count)
+                )), 10)
+                started = asyncio.get_running_loop().time()
+                async def choose(i):
+                    response = await client.post("/card/actions", json={"event": {
+                        "context": {"open_chat_id": f"oc_load_{i + session_count}"},
+                        "operator": {"open_id": "ou_user"},
+                        "action": {"value": choices[f"oc_load_{i + session_count}"]},
+                    }})
+                    assert response.status == 200
+                    await response.json()
+                    result = await client.get(f"/interactions/{prefix}choice-{i}")
+                    assert (await result.json())["choice"] == "a"
+                await asyncio.wait_for(asyncio.gather(*(choose(i) for i in range(session_count))), 5)
+                choice_elapsed = asyncio.get_running_loop().time() - started
+                started = asyncio.get_running_loop().time()
+                terminal = await asyncio.wait_for(asyncio.gather(*(
+                    post(i, "message.completed", 27, {"answer": f"FINAL_{prefix}{i}_END"})
+                    for i in range(session_count)
+                )), 5)
+                ack_elapsed = asyncio.get_running_loop().time() - started
+                assert all(item.get("applied") is True for item in terminal)
+                assert not release.is_set() and deliveries == []
+                controllers = list(app[FLUSH_CONTROLLERS_KEY].values())
+                background = [controller._task for controller in controllers if controller._task]
+                # One coalescing display task per controller, not one task per frame.
+                assert len(background) <= 3 * session_count
+                assert len(set(background)) == len(background)
+                release.set()
+                async def wait_for_client_completion():
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while asyncio.get_running_loop().time() < deadline:
+                        if all(f"FINAL_{prefix}{i}_END" in str(feishu.updated) for i in range(session_count)):
+                            return
+                        await asyncio.sleep(0.005)
+                    raise AssertionError("client did not consume every terminal response")
+
+                completion_waiter = asyncio.create_task(wait_for_client_completion())
+                deadline = asyncio.get_running_loop().time() + 5
+                while asyncio.get_running_loop().time() < deadline:
+                    if all(f"FINAL_{prefix}{i}_END" in str(deliveries) for i in range(session_count)):
+                        break
+                    await asyncio.sleep(0.005)
+                assert all(f"FINAL_{prefix}{i}_END" in str(deliveries) for i in range(session_count))
+                # Force server receipt to precede client completion. The old
+                # server-only predicate returns here and fails this assertion.
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(completion_waiter), 0.02)
+                consume_final.set()
+                await asyncio.wait_for(completion_waiter, 5)
+                for i in range(session_count):
+                    own = [message for message, card in feishu.updated if f"FINAL_{prefix}{i}_END" in str(card)]
+                    assert own
+                    for message in own:
+                        last = [card for mid, card in feishu.updated if mid == message][-1]
+                        assert f"FINAL_{prefix}{i}_END" in str(last)
+                        assert sum(f"FINAL_{prefix}{j}_END" in str(last) for j in range(session_count)) == 1
+                assert len(deliveries) < session_count * 24
+                record_property("stream_sessions", session_count)
+                record_property("interaction_probe_sessions", session_count)
+                record_property("choice_ack_seconds", choice_elapsed)
+                record_property("terminal_ack_seconds", ack_elapsed)
+                record_property("downstream_requests", len(deliveries))
+                record_property("peak_active_downstream", peak_updates)
+                record_property("display_tasks_at_terminal", len(background))
+            finally:
+                consume_final.set()
+                if completion_waiter is not None and not completion_waiter.done():
+                    completion_waiter.cancel()
+                    await asyncio.gather(completion_waiter, return_exceptions=True)
+                release.set()
+                background = [controller._task for controller in app[FLUSH_CONTROLLERS_KEY].values()
+                              if controller._task and not controller._task.done()]
+                if background:
+                    await asyncio.wait_for(asyncio.gather(*background, return_exceptions=True), 5)
+                await client.close()
+    finally:
+        await downstream_server.close()
+    await asyncio.sleep(0)
+    remaining = [task for task in asyncio.all_tasks() - baseline_tasks if not task.done()]
+    assert not remaining, [repr(task) for task in remaining]
+
+
+@pytest.mark.parametrize("runtime", [False, True])
+@pytest.mark.parametrize("sticky", [False, True])
+async def test_interaction_placement_matches_state_and_actual_send(client, runtime, sticky):
+    """Both transport paths must deliver to the same place their owner records."""
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        started = await test_client.post("/events", json=event_payload(
+            "message.started", 0,
+            {"reply_to_message_id": "om_original", "reply_in_thread": sticky},
+            turn_id="turn-runtime", created_at=time.time(),
+        ))
+        assert started.status == 200
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        if not runtime:
+            payload["data"].pop("_hfc_runtime_admission")
+        payload["thread_id"] = "omt_new_topic"
+        payload["data"].update(reply_to_message_id="om_event_anchor", reply_in_thread=False)
+        expected = ("omt_new_topic", "om_original" if sticky else "om_event_anchor", sticky)
+        original_send = feishu_client.send_card
+        observed = []
+
+        async def inspect_send(*args, **kwargs):
+            interaction = test_client.app[SESSIONS_KEY]["turn-runtime"].active_interaction
+            observed.append((
+                interaction.thread_id, interaction.reply_to_message_id,
+                interaction.reply_in_thread,
+                test_client.app[MESSAGE_LOCKS_KEY]["turn-runtime"].locked(),
+            ))
+            return await original_send(*args, **kwargs)
+
+        feishu_client.send_card = inspect_send
+        response = await test_client.post("/events", json=payload)
+        assert response.status == 200
+        assert observed == [(*expected, not runtime)]
+        assert (*feishu_client.sent[-1][2:], feishu_client.sent_reply_in_thread[-1]) == expected
+        interaction = test_client.app[SESSIONS_KEY]["turn-runtime"].active_interaction
+        assert (interaction.thread_id, interaction.reply_to_message_id, interaction.reply_in_thread) == expected
+        assert len(feishu_client.sent) == 2
+    finally:
+        listener.close()
+
+
+def test_cleanup_state_adapter_borrows_each_live_app_registry():
+    from dataclasses import fields
+
+    app = create_app(FakeFeishuClient())
+    state = sidecar_server._cleanup_state_for_app(app)
+    keys = {
+        "sessions": SESSIONS_KEY, "aliases": SESSION_ALIASES_KEY,
+        "message_locks": MESSAGE_LOCKS_KEY, "lock_users": MESSAGE_LOCK_USERS_KEY,
+        "controllers": FLUSH_CONTROLLERS_KEY, "message_ids": FEISHU_MESSAGE_IDS_KEY,
+        "bot_ids": MESSAGE_BOT_IDS_KEY, "card_configs": SESSION_CARD_CONFIGS_KEY,
+        "summary_owners": CARD_SUMMARY_SESSION_KEYS_KEY, "summaries": CARD_SUMMARIES_KEY,
+        "interaction_owners": INTERACTION_RESULT_SESSION_KEYS_KEY,
+        "interaction_results": INTERACTION_RESULTS_KEY,
+        "metrics": METRICS_KEY, "diagnostics": DIAGNOSTICS_KEY,
+    }
+    assert set(keys) == {field.name for field in fields(state)}
+    for name, key in keys.items():
+        assert getattr(state, name) is app[key]
+    replacement = {}
+    app[SESSION_ALIASES_KEY] = replacement
+    refreshed = sidecar_server._cleanup_state_for_app(app)
+    assert refreshed.aliases is replacement
+    assert state.aliases is not replacement
+
+
+@pytest.mark.parametrize("state", ["diagnosed", "preparing", "executing", "restarting", "failed", "completed"])
+def test_operations_handoff_warning_refresh_keeps_report_identity_and_budget(state):
+    from hermes_feishu_card.card_limits import serialize_card_for_delivery
+
+    snapshot = {
+        "records": 512,
+        "delivery_states": {"pending": 511, "acked": 0, "uncertain": 1},
+        "manual_review_required": True,
+        "raw_identifier": "oc_do_not_disclose",
+        "next_action": "PRIVATE_ACTION",
+    }
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=SimpleNamespace(safe_status=lambda: snapshot),
+    )
+    report = operations_report()
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private", profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False, transport_secret=b"c" * 32,
+    )
+    operation.report = report
+    operation.state = state
+    before = (report.fingerprint, operation.report_fingerprint, operation.recovery_fingerprint)
+    card = sidecar_server._render_operations_for_app(app, report, operation)
+    content = serialize_card_for_delivery(card)
+    assert "native_handoff.records: 512" in content
+    assert "native_handoff.uncertain: 1" in content
+    assert "先确认飞书原生会话是否已收到答案" in content
+    assert "oc_do_not_disclose" not in content
+    assert "PRIVATE_ACTION" not in content
+    assert inspect_card_limits(card).safe
+    snapshot.update(records=2, delivery_states={"pending": 1, "acked": 1, "uncertain": 0}, manual_review_required=False)
+    updated = str(sidecar_server._render_operations_for_app(app, report, operation))
+    assert "native_handoff.records: 2" in updated
+    assert "native_handoff.records: 512" not in updated
+    assert "先确认飞书原生会话是否已收到答案" not in updated
+    snapshot.update(records=0, delivery_states={}, manual_review_required=False)
+    cleared = str(sidecar_server._render_operations_for_app(app, report, operation))
+    assert "原生投递状态" not in cleared
+    assert "native_handoff." not in cleared
+    assert before == (report.fingerprint, operation.report_fingerprint, operation.recovery_fingerprint)
+
+
+def test_operations_handoff_unavailable_is_safe_manual_review_warning():
+    def unavailable():
+        raise OSError("oc_private_identifier secret-path")
+
+    app = create_app(FakeFeishuClient(), native_handoff_store=SimpleNamespace(safe_status=unavailable))
+    report = operations_report()
+    store = app[sidecar_server.OPERATIONS_STORE_KEY]
+    operation = store.create(
+        chat_id="oc_private", profile_id="default",
+        report_fingerprint=report.fingerprint,
+        recovery_fingerprint=report.recovery_fingerprint,
+        group=False, transport_secret=b"c" * 32,
+    )
+    operation.report = report
+    card = sidecar_server._render_operations_for_app(app, report, operation)
+    content = str(card)
+    assert "native_handoff.manual_review_required: true" in content
+    assert "先确认飞书原生会话是否已收到答案" in content
+    assert "oc_private_identifier" not in content
+    assert "secret-path" not in content
+    assert inspect_card_limits(card).safe
+
+
+@pytest.mark.parametrize("tokens,available", [
+    ({"output_tokens": 100, "output_tps": 42, "rate_basis": "decode"}, True),
+    ({"output_tokens": 100, "output_tps": 0.2, "rate_basis": "request"}, True),
+    ({"output_tokens": 100, "output_tps": 10 ** 400, "rate_basis": "decode"}, False),
+    ({"output_tokens": 100, "output_tps": 42, "rate_basis": "estimate"}, False),
+    ({"output_tps": 42, "rate_basis": "decode"}, False),
+])
+async def test_health_counts_only_valid_retained_invocation_rates(tokens, available):
+    app = create_app(FakeFeishuClient())
+    session = CardSession("synthetic-conversation", "synthetic-turn", "synthetic-chat")
+    session.status = "completed"
+    session.tokens = tokens
+    app[SESSIONS_KEY]["synthetic-turn"] = session
+    response = await sidecar_server._health(make_mocked_request("GET", "/health", app=app))
+    timing = json.loads(response.body)["timing"]
+    assert timing["token_rate_status"] == ("available" if available else "unavailable")
+    assert timing.get("token_rate_samples", 0) == int(available)

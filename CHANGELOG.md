@@ -1,0 +1,1800 @@
+# Changelog
+
+## v5.0.12 — 2026-10-28
+
+- Restrict HFC source-anchor publication to Feishu, preserving LOCAL and other platform sources (#474).
+- Bound the Feishu terminal source-anchor exception to a verified current turn while preserving all other source, claim and routing checks (#469).
+- Validate existing managed-patch upgrade and restore independently of package installation. See the release notes for final evidence and remaining limits.
+- Thanks to @Alex-HJY and @leavrcn for the reports, analysis and retest evidence; existing credits and release history remain intact.
+
+## v5.0.11 — 2026-10-28
+
+- Verify the original admitted owner before the first card decision and again after policy lookup, preventing a stale automation profile/route from starting a card that cannot accept its terminal handoff (#471). Keep native fallback and terminal identity checks intact.
+- Add an exact admission-completion source cohort for Hermes `9b904dcc22c23fe8b82834339bbdd96495072e59` (#471), retaining full source, claim, route, epoch/generation and single-use acknowledgement checks. The installer adapter has a separately verified, restricted existing-PM migration path; fresh installs, old v1 receipts and unpreservable manual SDKs remain rejected. Arbitrary main revisions are not supported.
+- Thanks to @lv86snorlax for the #471 report and source analysis, credited separately from code authorship. See [Chinese release notes](docs/release-notes-v5.0.11.md) and [English release notes](docs/release-notes-v5.0.11.en.md) for evidence and remaining gates.
+
+## v5.0.10 — 2026-10-27
+
+- Verify internal asynchronous completion against the original admission record and retain source, owner, generation, epoch and profile boundaries (#469).
+- Treat an explicitly accepted terminal response as a single-use acknowledgement of that exact submission, preserving strict authority checks before submission and preventing a later generation change from duplicating the same native text.
+- Preserve unrelated Hermes config edits while inspecting and reversing HFC-owned configuration changes; conflicts and unverifiable records remain fail-closed (#470).
+- Add bounded rejection diagnostics for #451; the reporter's locally modified multi-profile deployment remains a separate field-validation boundary.
+- Exact candidate, platform, ordinary-wheel, API and public-install evidence is recorded separately in the [release notes](docs/release-notes-v5.0.10.en.md). Thanks to @leavrcn and @kludgezol for issue evidence and analysis; historical releases and credits remain intact.
+
+## v5.0.9 — 2026-10-26
+
+- Separate verified native admission user identity from Feishu mention open IDs; retain native delivery before card acceptance when identity is unknown (#451).
+- Correct raw Windows byte I/O, isolated official config children and verified recovery transactions (#463).
+- Recover provable PR458 schema-1 flat wheels while preserving workspace schema-1 and content-addressed schema-2 ownership; add fixed recovery acknowledgement categories and migration guidance (#459/#462).
+- Integrate audited Ruff/CodeQL/setup-python updates and deterministic concurrent repair confirmation tests (#464/#465/#466/#467).
+- Candidate verification and remaining boundaries are recorded in the [release notes](docs/release-notes-v5.0.9.en.md); previous tags, assets, commits and credits remain intact.
+
+## v5.0.8 — 2026-10-25
+
+- Combine owned external PM wheels and verified legacy observer rebinding (#458/#459/#461), preserving original authors and recovery evidence.
+- Address actual PM launcher/install-root and official-image writer compatibility (#462) without relaxing unknown-source or unrelated-config guards.
+- Exact acceptance and remaining limits are tracked in the [release notes](docs/release-notes-v5.0.8.en.md).
+
+## v5.0.7 — 2026-10-24
+
+- Verify Hermes v0.22.5 completion ownership and per-turn callback ordering (#456, #453), retaining pinned v0.22.4 and historical regressions.
+- Add bounded terminal-handoff diagnostics for the still-unreproduced multi-tool report (#451); acceptance evidence is tracked in the [release notes](docs/release-notes-v5.0.7.en.md).
+- Unsupported-source CLI returns 1 in local probes; the reported exit 0 is not reproduced.
+- Thanks to @coder-zhw, @Kevinzz224, @ywarmy, @coytus, @Lite-G and @leavrcn for issue evidence and analysis, separate from code authorship. Historical credits and releases remain intact.
+
+## v5.0.6 — 2026-10-23
+
+- Put each Linux/macOS tarball and Windows ZIP under its matching `hermes-feishu-card-v5.0.6-{linux,macos,windows}/` directory. Remove the extraction-target `.` entry; normalize tar uid/gid to 0, directories and shell installers to 0755, and other regular files to 0644 (#454).
+- Share archive construction and validation, requiring the exact nine-file inventory and byte contents. Reject unsafe paths, links, special files, duplicate entries and unexpected metadata. Actual extraction gates check the destination inode/uid/gid/mode and sentinels for 0700/1777 targets, with an old-layout negative control.
+- After unpacking an installer asset, enter its versioned platform directory before running `./install.sh` or `.\install.ps1`. Existing published tags/assets and historical release records are retained.
+- Thanks to @leavrcn for #454 and reproduction evidence, credited separately from code authorship. All prior credits remain intact.
+
+Local macOS evidence reproduced target-mode rewriting with the old archive under `tar -p`; Linux GNU tar/root acceptance, exact-commit full CI/CodeQL and public assets/install remain pending in the [readiness record](docs/release-readiness.md). See [Chinese](docs/release-notes-v5.0.6.md) and [English](docs/release-notes-v5.0.6.en.md) release notes.
+
+## v5.0.5 — 2026-10-22
+
+- Accept the reviewed admission source cohorts at cf4f3a7, rc.2-v0.22.3, v0.22.4 and pinned main 4e58c72. Verify full source/loaded topology and complete admission identity before accepting legitimate source reconstruction; preserve old source behavior, single-use completion and native fallback for unknown admission paths (#451, PR #452).
+- Verify readiness at the existing policy boundary before first card admission, including notice/interaction first events. Preserve already-pinned ordinary contexts, independent plugin owners, terminal ownership and failure behavior. Expose admission completion as a separate compatibility capability.
+- Add reviewed official config-writer families for those snapshots. Retain exact config-byte planning, prior families, drift rejection, PM generation wheel provenance and byte-for-byte recovery.
+- Include PR #448/#449 regression scope selection, complete duration-balanced shards and synchronized gates. Give upstream workers independent ordinary-wheel prefixes and measured timing weights to remove shared-runtime contention without dropping cases, platforms, required checks or the 25-minute timeout. Synchronize the changed-recheck test with actual diagnosis/publication before teardown; no runtime change.
+- Keep old d923/0ab compatibility baselines while pinning current stable/main independently. Preserve all earlier release history and credits.
+- Repairs and CI maintenance are authored by @baileyh8. Thanks to @coytus for #451 field evidence and @Lite-G for source analysis, credited separately from code authorship.
+
+See [Chinese release notes](docs/release-notes-v5.0.5.md) and [English release notes](docs/release-notes-v5.0.5.en.md). Exact release CI, Feishu API, package/public installation and asset acceptance are tracked separately; actual Gateway/model, reporter tool-heavy reproduction and desktop/Android visual/click acceptance remain unverified.
+
+## v5.0.4 — 2026-10-20
+
+- Keep completion preview read-only so legacy and queued terminal payloads retain observed rates; reuse the frozen payload for exact Base staging and terminal transport retries. Reject changed observation bindings/call sites through the pinned v0.22.2 AST contract.
+- Supply opt-in `output_rate` on eligible legacy Hermes installs through an observe-only official plugin. Legacy remains the sole event producer; rates use exact per-invocation usage independently of cumulative legacy footer counts. Bound observations by TTL/capacity, reclaim consumed entries under pressure, and hide unknown, mixed-route or isolated-host samples.
+- Roll back only verified official plugin-enable postimages for both legacy and Hybrid v3; preserve unknown or concurrently edited config bytes and recovery evidence. Support private atomic writes without `os.fchmod` on Windows. Preserve Hybrid bootstrap only when the observer marker is confirmed absent; disable admission on uninspectable metadata.
+- Own legacy plugin enablement in a versioned companion record using the official configuration preimage/restore flow; preserve reinstall idempotence and verified failure rollback. Support the config writer on Windows without weakening the existing POSIX source-recovery gate.
+- Thanks to @Lite-G for the report in #441 and the original implementation in #442.
+- Recall the exact native preflight-compression and compaction-complete notices after 15 seconds (#434, reported by Timeral). Preserve native send results, route ownership, compression heartbeats, Working updates, failure warnings and unknown text.
+- Thanks to JohnZhong505 for the #443 report/evidence and Lite-G for additional source analysis; these acknowledgements are separate from repair code authorship. All previous credits remain intact.
+
+- Preserve exact completion across the verified Session Authority admission/waiter Task boundary (#443), including drain-owned delivery after native extraction. Retain the original execution claim, Base ledger, native media/TTS and unknown-topology fallback.
+
+See [Chinese release notes](docs/release-notes-v5.0.4.md) and [English release notes](docs/release-notes-v5.0.4.en.md) for scope and verification limits.
+
+## v5.0.3 — 2026-10-19
+
+- Accept only the verified old/new Hermes channel-pin inheritance expressions while retaining strict binding, ordering and restore checks (#437, PR #438). Pin the compatibility matrix to main `0ab43d4f67e41be75f4f6c0fa14a86dbcfd3e5b3`.
+- Add opt-in `output_rate` completion-footer metrics from matching per-invocation usage/timing (PR #436, phase one of #392). Hide unavailable, malformed or mixed-model samples; preserve defaults and checkpoint schema.
+- Create a lazy continuation after an expired interaction so subsequent output follows the native fallback question, including sidecar-first expiry; preserve original resolution and stale/duplicate rejection (PR #430).
+- Update pinned official GitHub Actions and Ruff 0.17.1 (#388, #389, #390, #439).
+- Thanks to Lite-G and Thxzzzzz for their code, reports and tests, and Dependabot for dependency updates. Original commits and historical credits remain intact.
+
+See [Chinese release notes](docs/release-notes-v5.0.3.md) and [English release notes](docs/release-notes-v5.0.3.en.md) for verification scope.
+
+## v5.0.2 — 2026-10-17
+
+- Recall exact known en/zh redirect, interrupt and steer receipts (including active-subagent steering) through the same busy-entry and delay classifier; support the bare simplified-Chinese compression status (#434).
+- Match complete receipts so onboarding and appended guidance remain visible. Preserve queue/demoted-subagent messages, unknown translations and native Working heartbeat edit/cleanup behavior.
+- Thanks to Timeral for the reproduction and source analysis in #434; issue evidence is credited separately from code authorship, with all earlier credits retained.
+
+See [Chinese release notes](docs/release-notes-v5.0.2.md) and [English release notes](docs/release-notes-v5.0.2.en.md) for scope and verification boundaries.
+
+## v5.0.1 — 2026-10-16
+
+- Support verified inherited completion and approval-renderer seams in the two reported Hermes 0.22.x revisions (#428), retaining strict source checks, original interaction authority and exact restore. Optional split progress/provider capture remains outside this patch.
+- Register the exact HFC wheel through official PM plugin admission so future generations retain it (#431); re-resolve the selected runtime and verify source bytes, with owned rollback and uninstall.
+- Thanks to lanx214 and za8209 for issue evidence, and Lite-G for the independent compatibility analysis in PR #432 (code not incorporated). Earlier credits and authorship remain intact.
+
+See [Chinese release notes](docs/release-notes-v5.0.1.md) and [English release notes](docs/release-notes-v5.0.1.en.md) for compatibility, upgrade and verification boundaries.
+
+## v5.0.0 — 2026-10-15
+
+- Add opt-in task reading, continuation history folding, and verified continuation navigation. Resolve missing IM positions with one bounded exact-message lookup after confirmed delivery.
+- Preserve native interaction authority while displaying matched approval denials and natural clarify timeouts, including Hermes' specialized clarify executor. Keep confirmed clarification cards from duplicating native questions.
+- Restore observed per-turn model/provider, elapsed time, token and context footer data through the actual Gateway delivery chain.
+- Separate event, display, configuration, lifecycle and installer responsibilities while retaining identity checks, atomic ownership, fail-open boundaries and exact restore.
+- Expose loaded versus next-load reading configuration, minimal YAML and offline preview. Keep native tables opt-in with complete Markdown fallback.
+
+See [Chinese release notes](docs/release-notes-v5.0.0.md) and [English release notes](docs/release-notes-v5.0.0.en.md) for compatibility and verification boundaries.
+
+
+## v4.7.7 — 2026-10-12
+
+Add opt-in native body tables (PR #391, @ywarmy). Preserve oversized headers and cells by falling back to the complete Markdown table before native conversion. Preserve indivisible Markdown tables instead of replacing them with fold notices; final payload limits still trigger the existing full-content handoff. See [release notes](docs/release-notes-v4.7.7.md).
+
+## v4.7.6 — 2026-10-11
+
+Bind split source/process HOME installations through setup, authenticated heartbeats, PM selection and durable maintenance jobs (#384). Preserve ownership diagnostics; refuse split/shared-source card updates before mutation. Existing source-parent identities and persisted fences remain unchanged. Preserve credential-free bootstrap and refuse old maintenance jobs after instance reassignment. See [release notes](docs/release-notes-v4.7.6.md).
+
+## v4.7.5 — 2026-10-11
+
+Resolve the committed Hermes PM environment consistently in CLI and plugin binding (#382). Preserve the admitted DM actor/chat for command-card callbacks instead of applying the group-only gate (#374). Document the remaining separated source/HERMES_HOME maintenance restriction (#384). See [release notes](docs/release-notes-v4.7.5.md).
+
+## v4.7.4 — 2026-10-09
+
+Keep the sidecar independent of replaceable Hermes environments; bind readiness and maintenance proofs to the Gateway owner; retain Desktop activity without overwriting Gateway identity. Notify before Gateway hard exit and reclaim authenticated local observations only after verified process exit. See [release notes](docs/release-notes-v4.7.4.md) (PR #381).
+
+## v4.7.3 — 2026-10-08
+
+Bound repeated installed-state scans during missing heartbeats and publish health snapshots without waiting for source inspection (#378, PR #379). Clarify orphaned-fence recovery and its intermediate Gateway restart state (#372). Stabilize the callback-expiry regression using an explicit test clock. See [release notes](docs/release-notes-v4.7.3.md).
+
+## v4.7.2 — 2026-10-07
+
+Persistent-service update guards and pre-mutation restart recovery (#375); verified SDK CARD-frame dispatch (#374); explicit orphaned integrity target rebinding (#372); card configuration map (#370); Python 3.14 slice fingerprint support (PR #373, Nevoker). See [release notes](docs/release-notes-v4.7.2.md).
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
+
+## [4.7.1] - 2026-10-05
+
+- Repair slash-confirm callback installation after method rebinding or subclass overrides; inspect both actual callback methods and retain native fallback across earlier HFC wrapper identities.
+- Update the original confirmation card when a retained dispatcher resolves `/new` or another slash confirmation through the asynchronous fallback. Reuse the saved IM message ID and exactly-once confirmation path.
+- Verify the callback path against Hermes 0.19.0, official release 0.21.5 and main snapshot `af90026`; keep reporter-environment verification distinct from isolated SDK/source checks.
+- See [Chinese notes](docs/release-notes-v4.7.1.md) and [English notes](docs/release-notes-v4.7.1.en.md). Earlier contributor credits remain intact.
+
+## [4.7.0] - 2026-10-04
+
+Release scope approved on 2026-10-04: verified desktop flows and visuals. Android/iOS devices and real cancellation lasting more than five seconds remain unverified; delayed cancellation has automated coverage.
+
+- Reclaim read-only native capability source snapshots on success and construction failure; keep cleanup bound to owned directories without following symlinks or changing hardlinked file permissions.
+- Add opt-in `reading_preset: task`: one clear state/action, answer-first reading, consistent type roles, folded process details and compact metrics. Preserve existing presets and explicit configuration.
+- Add offline HTML/Card JSON previews for nine scenarios and explain appearance values with their configuration sources and next-load semantics.
+- Show optional subscription quota only on completed GPT turns attributed to `openai-codex`; omit unrelated, unknown and stale model routes.
+- Preserve complete parameters, permission scope and original interaction dialects while reducing repeated headings, waiting labels and approval details.
+- Close the original card from Hermes' explicit interrupted result or verified controlled stop cancellation, without blocking queued messages; retain bounded token-free auxiliary receipts so expiry and restart remove stale controls without restoring execution or consent.
+- Suppress duplicate Working heartbeats only after authenticated proof that the exact turn has an accepted task card; preserve classic and unknown-path behavior.
+- Preserve older verified Hermes inline-reply cancellation layouts. Mark expired task approvals as historical requests, omit redundant short single-choice lists only when full button labels preserve every option, and avoid repeating a source-identified generic interruption notice.
+- Observe cancellation that completes after Hermes' initial stop wait, within the existing delivery budget and owner checks. Support the verified older heartbeat executor alias while retaining the current split-source contract.
+- Improve task-answer code readability with native plain-text fences and separate language labels. Preserve code bodies and canonical answers; keep uncertain structures and unsafe long-line boundaries unchanged, including legacy owner and CardKit display paths.
+- Strengthen real-client visual release gates and pin Hermes main `c8301ea6c9b797184df16a9c5dd462400b264ff4` for source compatibility. See [Chinese notes](docs/release-notes-v4.7.0.md), [English notes](docs/release-notes-v4.7.0.en.md) and the [acceptance record](docs/reviews/2026-10-03-task-cards-acceptance.md).
+
+## [4.6.13] - 2026-10-02
+
+- Move managed sidecar control tokens from argv to private files; retain ownership handshake, authenticated stop and restart behavior, with no insecure fallback (#367, ffdxdynotable).
+- Stabilize live-spinner panel comparison (PR #366) and verify the 2026-10-02 Hermes main source snapshot.
+- See [release notes](docs/release-notes-v4.6.13.md) for upgrade and local-trust boundaries.
+
+## [4.6.12] - 2026-09-29
+
+- Add opt-in `card.width_mode` (`default`, `compact`, `fill`) for JSON 2.0 cards with global/profile/bot inheritance and explicit default reset; preserve existing default layout and JSON 1.0 behavior.
+
+- Integrate PR #351 with original authorship; retain thinking-tail budget checks, support the exact post-send reply-clock seam, and pin Hermes main `ea114c3e98c3339e13004adfc6098cf28ed7d754`.
+
+## [4.6.11] - 2026-09-28
+
+- Add the opt-in `thinking_body_tail_chars` live-body window and verified whole-card budget reduction without truncating answers or timeline content (#362, leavrcn).
+- Display observed background command/output/status for same-turn waits, with bounded nonpersistent process associations and no fabricated ETA (#361, mouyong).
+- Upgrade verified CodeQL pins and synchronize the CI allowlist (PR #363, Dependabot).
+- See [release notes](docs/release-notes-v4.6.11.md) for validation scope and credits.
+
+## [4.6.10] - 2026-09-27
+
+- Support guarded Hermes ledger release and split delivery adapter APIs; pin current stable/main source compatibility tests.
+- Isolate internal follow-ups and reopened create UUIDs so prior answers survive, including failed replacement creates.
+- Install into the PM-selected runtime venv without `--user`. Preserve original PR #355/#358 authorship.
+- See [release notes](docs/release-notes-v4.6.10.md) for contributors and validation boundaries.
+
+## [4.6.9] - 2026-09-24
+
+- Isolate concurrent group cards by requester or native Gateway execution scope; restrict redirects to the explicit source turn. Preserve independent final answers and terminal failure protection (#348, reported by [cainiaozp](https://github.com/cainiaozp)).
+- Merge [mouyong](https://github.com/mouyong)'s [PR #349](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/349), using compact rows for all single-select choices while preserving callback values and forms.
+- Rewrite Chinese/English onboarding; preserve contributor history, installation/configuration and recent releases, with a linked historical release index.
+- See [Chinese notes](docs/release-notes-v4.6.9.md) and [English notes](docs/release-notes-v4.6.9.en.md) for validation scope and remaining real-client boundaries.
+
+## [4.6.8] - 2026-09-22
+
+- Make macOS setup and persistent-service errors platform-specific instead of suggesting the Linux-systemd-only `enable` command; preserve Linux guidance.
+- Keep the unknown-owner branch when a running sidecar has no verified pidfile. Suggest launchd stop steps only after the actual owner and label are confirmed; retain all existing process ownership checks.
+- Document one-shot login-time `RunAtLoad` use of `start`, without `KeepAlive`, and distinguish the detached sidecar from externally managed runner processes. Synchronize both installer-safety languages and retain the README size limit.
+- Credit [coder-zhw](https://github.com/coder-zhw) for [PR #347](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/347), preserving the original contribution. No launchd management or card behavior change is introduced.
+- Validation scope: CLI platform branches and ordinary package installation. Exact release, public installation and deployment evidence are recorded separately; no new mobile acceptance is claimed. See [Chinese notes](docs/release-notes-v4.6.8.md) and [English notes](docs/release-notes-v4.6.8.en.md).
+
+## [4.6.7] - 2026-09-21
+
+- Preserve Working heartbeat messages so Hermes can edit them in place instead of repeatedly sending after timed recall; one-shot status expiry is unchanged.
+- Render approval choice buttons in compact auto-width columns while retaining full descriptions and legacy callback identity. Clarify layout and reading defaults are unchanged.
+- Selectively adapted from mouyong's PR #345. Keep timeline budgets and producer-based notice ownership; #344 remains unconfirmed on the reporter's version.
+- See [Chinese notes](docs/release-notes-v4.6.7.md) and [English notes](docs/release-notes-v4.6.7.en.md).
+
+## [4.6.6] - 2026-09-21
+
+- Compact duplicated terminal approval review blocks only after an explicit successful PATCH of the separate full question/scope/decision receipt; retain unproven, pending, sole-owner and failed-delivery cases (#337, PR #339).
+- Keep older running tool calls and their immediate predecessors in the bounded timeline window, matching body ordinals; terminal unfinished tools display as interrupted (#340).
+- Add 15-second expiry to owned restart notices, including Home and requester notifications; confirmed same-route delivery can wake an existing timer early. Restore deadlines across sidecar restart and retain failed-delete cooldowns.
+- Recognize exact native background-success and drain producers, preserve failures/output-bearing results, and color the native requester restart icon. Ordinary quoted text grants no recall authority; retain native expired-approval corrections that may be the sole record that no command ran (PR #338).
+- Terminal tool compaction retains unsuccessful tools. Existing reading defaults, timeline ordering and per-reasoning limits remain unchanged. Thanks to [mouyong](https://github.com/mouyong) for proposals, adapted code and #337/#340 evidence; original authorship is retained.
+- Retain tidytorch’s original PR #342 commit for delayed read-only confirmation after an ambiguous interaction POST; cap each lookup to the remaining grace budget and verify a real lost-response HTTP flow never replays the event.
+- See [Chinese notes](docs/release-notes-v4.6.6.md), [English notes](docs/release-notes-v4.6.6.en.md) and [acceptance](docs/wiki/feishu-acceptance-v4.6.6.md). Release and client gates are recorded separately.
+
+## [4.6.5] - 2026-09-20
+
+- Keep text-mode decision receipts static across consecutive questions and preserve interaction-first legacy dialects. Retire the previous schema-2 card after confirmed continuation delivery, preserving its pre-output snapshot and decision receipt. Use a neutral handoff state, preserve legacy dialects, and keep the new owner when the old PATCH fails (adapted from PR #339 after real desktop reproduction).
+
+- Persist bounded restart-notice ownership across sidecar restarts; recognize exact native startup/shutdown producers with profile, adapter, application and topic proof. Preserve unknown messages and failed deletions (continued adaptation of mouyong's PR #331).
+- Use explicit executor `call_id` to deduplicate repeated terminal events and reject late starts without changing legacy name-only counting. Preserve duration, history and ordinals.
+- Add opt-in `timeline_order: chronological` and `timeline_tools_per_reasoning`; defaults remain newest-first and unlimited per block. Keep failures/running work eligible for the existing global display budget.
+- Suppress the duplicate native provider-error warning only after an explicit sidecar acknowledgement; timeout, unknown formats and unavailable routes retain native fallback.
+- Accept exact known hooks reapplied onto verified current Git sources only with explicit upstream-upgrade consent, preserving staged state and unrelated customizations; isolate proxy variables in preflight child processes.
+- See [Chinese notes](docs/release-notes-v4.6.5.md) and [English notes](docs/release-notes-v4.6.5.en.md). A later real desktop clarify selection and chronological continuation passed on 4.6.4 after the initial DeepSeek 503; the old card remaining live was reproduced. Final 4.6.5 client acceptance remains separate.
+
+## [4.6.4] - 2026-09-20
+
+- Wire the first Feishu turn/interaction callback without slash-card warmup, including generated TurnRunner closures; preserve live SDK dispatcher identity and exact profile/adapter ownership (#335, sthnow; patch by babypanda).
+- Open a same-route continuation only after selection and real subsequent output for clarify and approval; keep question/decision receipts, canonical history and turn metrics. Retain the existing owner on failed/uncertain create and preserve a sole legacy owner's dialect through fallback and display recovery (informed by PR #331 and #335).
+- Add optional `classic` / `focused` / `detailed` reading presets and read-only `card-config` explanations. Preserve existing defaults and explicit settings (#328, jackwude; #333, leavrcn).
+- Retire registered transient restart notices only after successful same-scope delivery, with exact profile/bot/chat/thread and generation checks; preserve failed deletion records and native home notices whose provenance is unknown (adapted from mouyong's PR #331).
+- Add isolated contributor preflight checks and explicit focused/full pytest runs with real exit codes, fixture validation, private state and safe summaries (#330, mouyong).
+- Desktop/mobile first-click acceptance and the production upgrade remain unverified; this release does not claim them as passed. See [Chinese notes](docs/release-notes-v4.6.4.md), [English notes](docs/release-notes-v4.6.4.en.md) and the [current acceptance checklist](docs/wiki/feishu-acceptance-v4.6.4.md). PR #331 is absorbed by topic, not merged as a whole.
+
+## [4.6.3] - 2026-09-19
+
+- Add opt-out `card.stream_thinking_to_body` (default `true`) with a bounded live panel preview; preserve terminal content and card-limit fallback (#333, leavrcn).
+- Adapt tool ordering, terminal duration and interrupted-turn metrics from mouyong's #331; preserve measured values and validate actual generated-hook execution.
+- Keep 4.6.2 terminal-tool defaults unchanged. Notice retirement, timeline reordering and ambiguous reused-tool-ID counting from #331 remain separate.
+
+## [4.6.2] - 2026-09-18
+
+- Fix native-plugin/Gateway maintenance proof sharing. Native observers retain their own activity counts but rely on a present Gateway owner for admission/home evidence; missing or unknown owners still refuse automated stop.
+- Add opt-in `card.hide_completed_tool_activity` (default `false`) for completed/failed content tool rows, preserving live progress, timeline, answer and footer. Adapted from mouyong's #331 for jackwude's #328; other #331 changes remain separate.
+- Credit jackwude's #329 evidence for the 4.6.1 independent-notice footer fix.
+
+## V4.6.1 — 2026-09-18
+
+### Fixed
+- Bind lifecycle hooks outside the later muted-notification branch; reject unproven conditional anchors (#326, PR #325).
+- Recall only known transient status templates on their original profile/chat route; preserve answers and queue/error acknowledgements.
+- Keep restart text fallback, auxiliary approval controls, chronological body reasoning and meaningful footer metrics.
+- Keep two recent tool steps, safe timestamped diagnostics and profile-aware interrupt/steer recall; retain onboarding guidance.
+- Retain @mouyong's original commits through `bf7409a`; add maintainer isolation, failure, redaction and control-flow regression checks.
+
+## V4.6.0 — 2026-09-17
+
+### Fixed
+- Route transient recall through the sending profile/chat binding; reject ambiguous multi-profile routes (#323).
+- Wire structured reasoning once per agent turn, preserve repeated stream tokens, and omit exact post-response duplicates (#319).
+- Bound terminal request and lock waits within the retry deadline; redact retry logs (PR #310).
+- Restore owned card display checkpoints after sidecar restart without recreating approvals or execution; wait for sidecar policy during known startup-resume dispatch (#320).
+- Preserve queued-final metrics and distinguish empty successful answers from interruption; improve tool detail budgets and timeline display order (PR #310).
+
+### Boundaries
+- Private checkpoints are bounded and expire after 24 hours. No retroactive recovery of cards without a checkpoint; native handoff retains its own ledger.
+- Original contributions by @mouyong are retained; @zhangzq and @qqqq560204-maker supplied the #319/#323 evidence.
+
+## V4.5.2 — 2026-09-17
+
+### Fixed
+- Preserve queued-turn failure outcomes and streamed answers, preferring finalized Hermes delivery results (#318).
+- Recall successful fresh heartbeat notices through a unique, reversible source contract; preserve ordinary replies and owned answer cards (#321).
+- Move concrete tool work to the subtitle and order ordinal before duration, retaining approval and terminal states (PR #310, @mouyong).
+
+## V4.5.1 — 2026-09-17
+
+### Fixed
+- Preserve in-progress reasoning on early failures, improve tool activity rows, and recall transient redirect acknowledgements with bounded deduplication and reversible patches (latest PR #310 through `a9fd806`).
+- Support the extracted Hermes clarify helper with its `(response, answered)` contract, reject call/async drift, and pin the real upstream source in CI (#316/#317).
+- Normalize CardKit element IDs to unique stable values of at most 20 characters before create, incremental updates and full updates. Reproduce and verify the long timeline ID failure against real unsent Feishu entities (#306).
+- Preserve source-message anchors for background work and resolve missing topic anchors for attachments and cards (#305/#313, based on @mouyong's PR #310).
+- Retain streamed text on failed completion, and retain approval questions, operation scope and outcomes (#307/#312).
+- Reuse paused approval cards, keep the original waiter alive, and explain expired/orphaned approvals without manufacturing a new live request (#314). Add an explicit mobile expand-versus-consent hint (#282; device acceptance remains open).
+- Distinguish restart rejection and restart completion notices from running heartbeats; preserve completed conversation cards when transient heartbeats expire (#311).
+- Improve execution titles, tool activity and collapsible-panel affordances (#304).
+
+## V4.5.0 — 2026-09-15
+
+### Added
+- Opt-in CardKit entity streaming with ordered cumulative text updates, UUID-bound delivery reuse and explicit stream shutdown (#293).
+- Live synchronous Gateway approvals pause on expiry, rotate consent tokens and require fresh review before resolving the original approval request (#295).
+- Resolve known requester names in answer mentions and offer in-card completion mention placement (#262/#279).
+
+### Fixed
+- Preserve the original bound conversation ID through active-turn redirects; execute the actual upstream redirect function through the sidecar and verify final delivery to the new card (#283).
+- Route home-channel onboarding and Chinese deferred-compaction notices through the correct topic anchor (#275/#278).
+- Bound callback acknowledgement independently of slow card PATCH operations; show long mobile questions in the body (#258/#282).
+- Describe successful model turns as response completion rather than business-task completion (#274).
+- Pin compatibility tests to the reported Hermes 0.17 and Docker 0.21 sources, exercise integrity migration, and test real root/non-root container ownership (#73/#263/#264/#265/#266/#277).
+
+## V4.4.6 — 2026-09-15
+
+### Fixed
+- Accept both verified attachment-delivery call shapes on Hermes 0.21.1+, rejecting duplicate, unknown and ambiguous calls. Preserve tidytorch's PR #291 implementation and Jentlezhi's PR #292 regressions, with additional contract execution tests.
+- Recognize installed split-ledger hooks at runtime so final delivery uses the staged Base contract. Pin upstream compatibility CI to Hermes 0.21.3 commit `2179a279ae04bfadf8efbc49a01ca0abfb738000`.
+- Recover an accepted terminal card with one UUID-bound replacement when all PATCH retries fail; keep the original topic and full answer, suppress native duplicates, and expose unsuccessful recovery through health diagnostics (#298).
+- Interpret explicit iteration/budget exits in both legacy and native completion paths; terminate native incomplete turns without claiming success (#301). Preserve visible partial answers on `message.failed` (#289).
+- Keep the question, numbered options and result visible after interaction completion/expiry, including on mobile (#280). Explain rejected and uncertain callbacks without inviting repeat approval (#282).
+- Print a copyable, shell-quoted diagnostic command for integrity review using the current config, environment and Hermes paths (#276).
+
+### Maintenance
+- Upgrade CodeQL init/analyze together to 4.38.0, update pinned SHA checks, and group future CodeQL updates (#299/#300).
+- See the [issue and PR review](docs/issue-triage-2026-09-15.md) for coverage, remaining cases and real-client acceptance boundaries.
+
+### Credits
+- [tidytorch](https://github.com/tidytorch) and [Jentlezhi](https://github.com/Jentlezhi): installation fixes and regression tests in #291/#292; original commit authorship is preserved.
+- [sp960817](https://github.com/sp960817), [Cyber-Yichen](https://github.com/Cyber-Yichen), [shichenshuo-star](https://github.com/shichenshuo-star), and [ywarmy](https://github.com/ywarmy): installation failure isolation and cross-version evidence in #288/#294/#296.
+- [7360403-coder](https://github.com/7360403-coder): terminal delivery failure evidence and recovery analysis in #298. [mouyong](https://github.com/mouyong): execution-state, interaction, readability and diagnostic reports.
+
+## V4.4.5 — 2026-09-10
+
+### Fixed
+- Preserve unsuccessful Gateway outcomes in the final card and suppress success notifications for failed, interrupted or incomplete turns.
+- End superseded cards without claiming that the interrupted task completed; retain partial content and keep late events isolated from the new turn.
+- Recognize the reported decomposed Hermes split-ledger contract, with strict delivery-order, adapter, arguments and reversible ownership checks. Based on tidytorch's PR #286, with additional rejection and execution regressions.
+
+### Maintenance
+- Require scenario-based stability evidence, failure/late-event regressions and explicit real-client acceptance boundaries in the maintainer policy and PR template.
+
+## V4.4.4 — 2026-09-08
+
+See [release notes](docs/release-notes-v4.4.4.md) and [English notes](docs/release-notes-v4.4.4.en.md).
+
+### Fixed
+- Preserve Hermes' synthetic `reply_to_message_id` in Feishu topic metadata so restart and shutdown notices use the reply API with `reply_in_thread=true` instead of falling back to the parent chat.
+- Install HFC's Feishu routing wrappers before current Hermes `start()` runs boot notifications and delivery redelivery.
+
+### Safety
+- The wrapper applies only when the platform is Feishu and both a topic id and a reply anchor are present. Other platforms and unanchored sends retain their existing metadata.
+- Hermes source remains modified only through the owned, reversible patcher block.
+
+### Validation
+- Focused hot-file regressions passed with `943 passed, 1 skipped`; documentation/package metadata regressions passed with `101 passed`; full pytest passed with `3533 passed, 9 skipped in 752.17s`, followed by `git diff --check`.
+- PEP 517 sdist/wheel and a fresh Python 3.12 regular-wheel install passed package/distribution `4.4.4`, single-entrypoint, 24-slice provenance, and CLI checks.
+- Local production Hermes 0.21.0 loaded the candidate from its runtime venv and returned to `runtime_ready / integrity=safe`. A real Feishu group-topic `/restart` kept its success notice in the original topic; the exact active-work shutdown path remains automation-backed.
+
+### Credits
+- [mouyong](https://github.com/mouyong): [#270](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/270) restart/shutdown notice routing report.
+
+## V4.4.3 — 2026-09-08
+
+See [release notes](docs/release-notes-v4.4.3.md) and [English notes](docs/release-notes-v4.4.3.en.md).
+
+### Fixed
+- Accept explicitly approved Hermes upgrades that still contain older HFC-owned primary hook blocks, after strict manifest/backup proof and bounded lenient removal both succeed.
+- Let explicit integrity migration bind a healthy reversible local Git customization to installation-only snapshot provenance; it still cannot authorize automatic upstream repair.
+- Hide the empty “思考与工具 · 0 次工具调用” panel and redundant zero-tool summary while retaining the timeline as soon as a real reasoning, tool, subagent, or notice entry exists.
+- Add the current local production Hermes source snapshot to the pinned compatibility gate.
+
+### Validation
+- Full pytest passed with `3530 passed, 9 skipped in 843.13s`; `git diff --check`, PEP 517 package build, and a fresh Python 3.12 wheel-only `site-packages`/entrypoint/CLI provenance check passed.
+- Local production Hermes 0.21.0 loaded the candidate wheel from its runtime venv, completed safe integrity migration, restarted the sidecar and Gateway, and reached `healthy / runtime_ready`.
+- A real Feishu DM smoke and an inbound Hermes turn both reached the sidecar; observed sends and event applications completed without send failure.
+- Real multi-bot multiplex remains unverified because the available production Gateway has only the `default` profile; two named bot/profile/topic identities are covered by the executable upstream-handler regression.
+
+### Credits
+- [mouyong](https://github.com/mouyong): [#268](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/268) multiplex production report and [#269](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/269) empty timeline feedback.
+
+## V4.4.2 — 2026-09-08
+
+See [release notes](docs/release-notes-v4.4.2.md) and [English notes](docs/release-notes-v4.4.2.en.md).
+
+### Fixed
+- PR #267: complete ownership verification, decomposed integrity migration and conservative source-only snapshots, including metadata rollback on source drift.
+- Wrap secondary multiplex adapters while retaining Hermes transport ownership.
+- Number interaction buttons, retain full option descriptions, deny expired accepted approvals, and reject oversized requests before admission.
+- Add pinned upstream Hermes compatibility gates on Python 3.12/3.13 and Docker/s6 deployment guidance.
+
+### Credits
+- [ywarmy](https://github.com/ywarmy): [#261](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/261), Hermes 0.21 completion-marker report.
+- [Ricadre](https://github.com/Ricadre): [#265](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/265), stale integrity migration reproduction.
+- [mouyong](https://github.com/mouyong): [#83](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/83), [#263](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/263), [#264](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/264), [#266](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/266), Docker/source-only and multiplex evidence; [#258](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/258), approval readability feedback.
+
+## V4.4.1 — 2026-09-07
+
+See also: [Chinese release notes](docs/release-notes-v4.4.1.md) and [English release notes](docs/release-notes-v4.4.1.en.md).
+
+### Fixed
+- PR #257 / Issues #254, #255, #256: support Hermes 0.21 facade/mixin source layouts with validated multi-file ownership, reversible patching, and conservative handling of stale or edited installations.
+- PR #251 / Issue #252: preserve topic reply anchors for follow-up, queued, redirected, and cron messages while keeping explicit turn identity authoritative.
+- Issues #83 and #259: preserve message-level profile identity for single-process multiplexing and avoid assuming that every configuration contains a profile named `default`.
+- Issue #258: remove silent 3,000-character approval-command truncation, escape command markup, use wrapping text, and return oversized authorization requests to native Hermes approval before creating a card.
+- PRs #247 and #248: update CodeQL init/analyze together and align the workflow contract tests.
+
+### Added
+- Issue #253: opt-in `card.reasoning_format: code` displays recorded reasoning outside the collapsed tool panel; the default `panel` layout and card limits are retained.
+- Issue #250: footer model labels include the provider reported by the runtime, preserving fallback attribution and avoiding duplicate prefixes.
+
+### Validation
+- Focused renderer/config/runtime tests and server rendering integration passed. Full-suite and built-wheel results are recorded during the release gate; no current real Feishu/Lark client acceptance is claimed.
+- Historical Issue #73 still requires the reporter's current environment evidence; do not infer its exact cause or close it solely from compatibility tests.
+
+## V4.4.0 — 2026-08-31
+
+See also: [docs/release-notes-v4.4.0.md](docs/release-notes-v4.4.0.md)
+
+### Added
+- `/commands` now becomes a live Hermes capability center on Feishu/Lark. It reads the running Hermes `COMMAND_REGISTRY`, groups core/plugin/skill commands, and exposes category navigation, command details, aliases, subcommands, argument modes, and busy policies without a copied HFC allowlist.
+- Safe read-only actions (`/status`, `/context`, `/usage`, `/agents`, `/sessions`, `/profile`, `/version`) and the existing native `/model` and `/resume` pickers can be launched from the capability card. The copied event re-enters the Hermes adapter so access control, busy policy, plugin hooks, and original handlers remain authoritative.
+- Native Hermes results such as `/status`, `/context`, `/usage`, `/agents`, `/sessions`, and `/reasoning` gain KPI columns when stable `Label: Value` fields are present while retaining the complete original output below.
+
+### Changed
+- V4.4.0 targets Hermes `v2026.8.27` / `0.20.6` and is forward-validated against `main@4f225435`, including the new `/bg`, `/btw`, `/plan`, gateway `/busy`, and command argument metadata.
+- `FlushController.pending_count` and `update_queue_peak` now report the actual number of updates coalesced while a PATCH is active instead of a boolean 0/1 signal.
+- Markdown tables whose header or row framing cannot fit inside a legal card block now render an explicit safe-fold notice instead of falling back to character-based row fragments that Feishu/Lark can expose as broken raw Markdown.
+- Ordinary long tables and oversized cells still use the existing structure-preserving split with repeated headers; the five-table `compact` / `truncate` policy and terminal native-answer handoff are unchanged.
+
+### Safety
+- Capability-card callbacks are bound to chat, expiry, Hermes admission, and the initiating operator in group chats. State-changing or destructive commands such as `/update`, `/new`, `/stop`, and `/undo` are never one-click actions.
+- If the live Hermes registry, card create, or card PATCH is unavailable, the exact original Hermes text path remains the fallback.
+
+### Tests
+- Added live-registry compatibility, capability-center structure, copied-event dispatch, state-changing-command rejection, KPI preservation, real backlog depth, and adversarial Markdown table coverage.
+
+## V4.3.8 — 2026-08-29
+
+See also: [docs/release-notes-v4.3.8.md](docs/release-notes-v4.3.8.md)
+
+### Fixed
+- Issue #244: guided `setup` now enables the owned persistent systemd user service by default when the configured user manager and linger are already available. Unsupported hosts or missing linger fall back to the existing transient sidecar with an explicit reboot warning and exact recovery command; `--transient` remains an explicit opt-out.
+- Issue #245: authenticated card actions no longer consume the Hermes transport sequence number. A batch clarify action can therefore finish concurrently with the next `interaction.requested` event without that event being rejected as a duplicate or leaking the next prompt into the first callback response.
+- PR #242: remote Feishu/Lark HTTP requests now honor standard proxy environment variables, while loopback and private test/service endpoints continue to bypass environment proxies.
+
+### Safety
+- `setup` never enables linger, invokes sudo, crosses into the system manager, or silently creates persistence when the full owned systemd-user contract is unavailable.
+- Transport events retain strict monotonic sequence checks. Only the authenticated out-of-band card callback avoids advancing the transport watermark.
+- Proxy environment trust is disabled for loopback, private, link-local, and unspecified destinations so local acceptance and sidecar tests remain isolated.
+
+### Credits
+- Thanks @PureWhiteWu for PR #242's proxy implementation and regression coverage, @nasvip for Issue #244's persistent-setup production report, and @Timeral for Issue #245's batch-clarify race reproduction.
+
+## V4.3.7 — 2026-08-26
+
+See also: [docs/release-notes-v4.3.7.md](docs/release-notes-v4.3.7.md)
+
+### Fixed
+- Issue #240 / PR #241: the exact Base delivery anchor now accepts Hermes' session-scoped media/local filter calls with exactly `session_key=session_key`, while preserving the legacy single-positional-argument call.
+- `install`, `setup`, `doctor`, and installer detection no longer report `exact_delivery_contract: missing_or_unsupported` for the verified Hermes 2026-08-25 call shape.
+
+### Safety
+- Extra keywords, wrong keyword names or values, `**kwargs`, and missing or extra positional arguments remain rejected. Apply/remove/restore stays idempotent and byte-exact.
+- Feishu API payloads, card ownership, runtime events, callback authentication, delivery UUIDs, and the archived `legacy/` runtime are unchanged.
+
+### Credits
+- Thanks @lanx214 for the Linux reproduction and @PureWhiteWu for PR #241's strict matcher and regression coverage.
+
+## V4.3.6 — 2026-08-25
+
+See also: [docs/release-notes-v4.3.6.md](docs/release-notes-v4.3.6.md)
+
+### Added
+- PR #228: pending approval/clarify cards and the opt-in completion notification can `@` mention the initiating Feishu user. `card.mentions_in_cards` is the master off switch, with `card.interaction_mentions.{approval,clarify}` and `card.completion_notify.mention` for finer control.
+
+### Fixed
+- Issue #237 / PR #238: unanchored topic delivery no longer calls Feishu's create-message API with the unsupported `receive_id_type=thread_id`, which was rejected with `99992402`. The create fallback now targets the parent `chat_id`; anchored topic delivery continues using the reply API.
+- `completion_notify.mention: false` now permits a plain completion notification when a system/background turn has no valid requester `open_id`. Mention-enabled notifications still reject missing or malformed identities.
+
+### Safety
+- The original schema 2.0 streaming card remains the sole PATCH owner. Legacy approval/clarify cards stay auxiliary, and mention rendering never promotes them into the main update rail.
+- Native-handoff route identity and UUID derivation retain the logical topic context even when the actual unanchored create falls back to the parent chat. Warning throttling remains outside this release.
+
+### Credits
+- Thanks @leavrcn for the production Issue #237 evidence, Feishu API comparison, and local hotfix validation.
+- Thanks @Cassius0924 for PR #228 and its configuration, card-rendering, completion-notification, and regression-test work.
+
+## V4.3.5 — 2026-08-24
+
+See also: [docs/release-notes-v4.3.5.md](docs/release-notes-v4.3.5.md)
+
+### Fixed
+- PR #235: the HFC Feishu `edit_message` wrapper no longer forwards its internal `metadata` routing keyword to the Hermes v2026.8.3 Feishu adapter when the original method does not accept it, preventing the completion/streaming fallback `TypeError`.
+
+### Safety
+- Signature-aware forwarding preserves `metadata` for adapters that explicitly support it or accept `**kwargs`; unrelated unknown keywords are not swallowed and continue to raise `TypeError`.
+- Card ownership, thread placement, callback authentication, Feishu API payloads, Hermes patch ownership, and the archived `legacy/` runtime are unchanged.
+
+### Credits
+- Thanks @Lite-G for reporting, reproducing, testing, and implementing PR #235.
+
+## V4.3.4 — 2026-08-24
+
+See also: [docs/release-notes-v4.3.4.md](docs/release-notes-v4.3.4.md)
+
+### Fixed
+- PR #229: runtime interaction listener startup no longer performs reverse DNS, and its `serve_forever` thread is a daemon so a short-lived CLI process can exit without explicitly closing the listener.
+- Issue #233: `doctor --json` validates `manifest_version: 3` Hybrid installs through the V3 runtime binding, plugin entrypoint, and fixed-tag inspector instead of emitting Legacy manifest/hash/path diagnostics.
+- Hosted macOS now verifies blocked-delivery close with a bounded Future deadline rather than a raw wall-clock threshold that included runner scheduling overhead; the production close timeout is unchanged.
+
+### Safety
+- V3 phase/config/target/backup/runtime-identity drift fails closed with V3-specific findings and never exposes Legacy automatic repair for a V3 manifest.
+- Runtime interaction authentication, loopback binding policy, callback ownership, Feishu card/API delivery semantics, and the archived `legacy/` runtime are unchanged.
+
+## V4.3.3 — 2026-08-24
+
+See also: [docs/release-notes-v4.3.3.md](docs/release-notes-v4.3.3.md)
+
+### Fixed
+- First replies that explicitly request `reply_in_thread` before Feishu supplies a concrete `thread_id` now retain their verified reply anchor and placement for the streaming card, ordinary/repeated/runtime-admission interaction cards, and opt-in completion notification.
+- `send_text_message` now rejects any text thread placement requested by `reply_in_thread` or a non-empty `thread_id` when `reply_to_message_id` is missing; it no longer silently falls back to a top-level chat text message. The default path with no thread-placement intent remains compatible.
+
+### Safety
+- The original schema 2.0 streaming message remains the only PATCH owner; legacy interaction-card dialect, callback authentication/binding, expiry, idempotency, Hermes patch ownership, and archived `legacy/` runtime are unchanged.
+- Real Feishu/Lark client acceptance for first-reply thread creation and the missing-anchor rejection remains unverified at release-candidate preparation time.
+
+## V4.3.2 — 2026-08-23
+
+See also: [docs/release-notes-v4.3.2.md](docs/release-notes-v4.3.2.md)
+
+### Fixed
+- Issue #227: schema 2.0 streaming messages remain the stable PATCH owner while legacy clarify/approval messages remain on Feishu's callback-card rail, preventing `230099/200800` after a selection.
+- Completed and expired interaction callbacks return noninteractive legacy terminal cards without callback credentials; both standard and runtime-admission flows resume updates on the original schema 2.0 message.
+- Gateway direct-select and form-submit paths suppress an accidental schema 2.0 raw callback card and return a success toast instead, preventing `200673`.
+
+### Safety
+- Callback authentication, chat/operator/profile binding, expiry, idempotency, fail-open behavior, Hermes patch ownership, and the archived `legacy/` runtime are unchanged.
+- A dialect-aware Feishu fake rejects cross-dialect PATCH operations and covers standard/runtime interaction ownership, repeated interactions, expiry, predecessor failure, and streaming resume.
+- Empty-value `/card` fallback remains a separate follow-up.
+
+### Credits
+- Thanks @saulgoodmanngabriel for the complete Issue #227 reproduction and decisive ordinary-card versus interaction-card API comparison.
+- Thanks @lyp88997 for the toast-only `200673` fix direction and contrasting update evidence.
+
+## V4.3.1 — 2026-08-20
+
+See also: [docs/release-notes-v4.3.1.md](docs/release-notes-v4.3.1.md)
+
+### Fixed
+- Issue #216: Hermes 0.20 Hybrid clarify/approval cards now use a Feishu WebSocket callback-compatible interactive-card payload, carry the exact profile identity through `interaction.select`, and wake the original pending Hermes interaction on the first click. Streaming answer/thinking updates continue after the choice instead of appearing frozen until the terminal refresh.
+- Explicit `card.interaction_mode: text` declines runtime callback ownership before session mutation, so Hermes' native numbered/text interceptor consumes the first reply instead of leaving an expired interaction card.
+- PR #226: persistent service enable accepts the package's canonical `python-sha256:` runtime identity, renders a systemd-safe `WorkingDirectory`, and reconciles tokenless `/health` with an explicit empty `process_token_hash`.
+- Runtime interaction callback attempts, successes, failures, and a sanitized last outcome are exposed in health diagnostics without callback tokens, identities, choices, or answer text.
+
+### Safety
+- Pending choice cards remain single-owner: callback resolution validates the exact session, profile, interaction, operator/chat binding, expiry, and opaque descriptor before terminal mutation. Text mode does not create a second waiter.
+- Systemd service paths reject relative/control-character input and escape specifiers/backslashes; health never echoes the process token.
+- The fixed Hermes `v2026.8.3` source and PluginManager evidence remain mandatory. `legacy/` and PR #203 remain outside the active runtime.
+- Local release gate: full pytest `3245 passed, 6 skipped`; sdist/wheel build; fresh Python 3.12 wheel-only `site-packages` provenance; exactly one Hermes plugin entrypoint; 24 provenance slices; main CLI and `enable/disable --help` exit 0.
+
+### Credits
+- Thanks to @saulgoodmanngabriel for Issue #216 and to @zhangzq for the Hermes 0.20 retest that distinguished a resolved interaction from the missing streaming/thinking refresh.
+- Thanks to @RanHuang for PR #226. The accepted implementation keeps the contribution's three root-cause findings while tightening systemd escaping and adversarial tests.
+- The README contributor audit was reconciled against historical release notes, merged and materially absorbed PRs, accepted issue evidence, commit authors, and co-author trailers so earlier-version contributors remain credited.
+
+## V4.3.0 — 2026-08-19
+
+See also: [docs/release-notes-v4.3.0.md](docs/release-notes-v4.3.0.md)
+
+### Added
+- A source-proven Hermes Agent `v2026.8.3` Hybrid integration combines verified native Plugin hooks with 17 exact patch groups across seven targets. Capability selection binds fixed source hashes/call sites and real PluginManager subprocess evidence rather than trusting a version string.
+- Signed runtime bootstrap, event-id single-flight replay fences, direct original-pending-handle interaction callbacks, terminal ownership, profile/status routing, and distinct subagent timelines keep the sidecar as the only Feishu card owner.
+- `manifest_version: 3` binds Hermes home, venv/runtime identity, plugin entrypoint, official config preimage, source backups, and transaction phase. Install is idempotent, incomplete phases are repairable, and restore/uninstall recover config and sources byte-for-byte.
+- Issue #212: `enable` / `disable` manage a real linger-verified systemd user service with SHA-256-bound unit ownership and safe transient-service migration.
+- PR #213 completed-interaction hover context and PR #220 opt-in completion notifications are incorporated with stricter identity and delivery boundaries; CodeQL action updates from PRs #218/#219 are aligned.
+
+### Fixed
+- Issues #210/#211: predecessor-card terminal statistics and consecutive clarify selected-option context remain attached to the correct interaction.
+- Issue #214: fixed Hermes `2026.8.3` installations can activate the verified Hybrid card path instead of silently remaining native-only.
+- Issue #215: verified Hermes upgrades can restore old ownership and re-probe through `--accept-hermes-upgrade`; drift still refuses automation.
+- Issue #217: approval uses one UI owner and exact turn/tool-call/pending-handle correlation, preventing duplicate authorization cards and ineffective choices.
+- Issue #221: stable tool callbacks are anchored after Hermes core's final callback assignment, so tool entries reach terminal state.
+- Issue #222 / PR #223 goal: transient `interaction.select` forwards use bounded retry without replaying canonical success, conflicts, or unknown outcomes.
+- Stale cross-boot or confirmed reused-PID sidecar records self-heal without killing or adopting unknown processes.
+
+### Safety
+- Fixed-tag install, patch detection/removal, runtime callbacks, event replay, native handoff, interaction expiry, and persistent-service ownership all use closed schemas and fail closed on malformed, spoofed, ambiguous, or drifting evidence.
+- Issue #216 remains a platform-delivery boundary: when Feishu sends no `card.action.trigger`, HFC cannot infer a missing click and does not claim a local fix.
+- PR #203 remains excluded because it changes only archived `legacy/`; V4.3.0 does not restore dual runtime ownership.
+- Real fixed-tag installer acceptance passed install/idempotence/restore with 17 groups, seven targets, compile checks, Git-clean source recovery, exact config SHA-256, and evidence cleanup. Focused installer gate: `340 passed, 5 skipped`; persistent process/CLI gate: `302 passed`.
+- Local candidate gate: full pytest `3227 passed, 6 skipped in 378.84s`; sdist/wheel build; fresh Python 3.12 wheel-only `site-packages` provenance; exactly one Hermes plugin entrypoint; 24 provenance slices; main CLI and `enable/disable --help` exit 0.
+
+## V4.2.12 — 2026-08-11
+
+See also: [docs/release-notes-v4.2.12.md](docs/release-notes-v4.2.12.md)
+
+### Added
+- PR #206: approval cards derive their available choices from Hermes `smart_denied`, `allow_session`, and `allow_permanent` capabilities, while `allow_custom_input` explicitly separates approval from clarify input semantics.
+- PR #205: when reasoning display is enabled, zero-tool cards keep the same collapsed “思考与工具 · 0 次工具调用” timeline throughout running, completed, and failed states.
+
+### Safety
+- Approval cards default to protocol-defined choices only. The sidecar rejects forged choice values and custom form input unless the active interaction explicitly allows custom input; callback token, chat/operator binding, expiry, and idempotency remain unchanged.
+- Clarify keeps single-select, multi-select, and custom “Other” answers. Hidden raw thinking remains hidden, and `show_reasoning: false` keeps the compact non-timeline fallback.
+- This release does not modify the archived `legacy/` runtime or expand Hermes patch ownership.
+
+### Credits
+- Thanks @Cassius0924 for both PR #205 and PR #206.
+
+## V4.2.11 — 2026-08-10
+
+See also: [docs/release-notes-v4.2.11.md](docs/release-notes-v4.2.11.md)
+
+### Fixed
+- Issue #202: after a replacement interaction card is delivered, the superseded streaming card is finalized as a green read-only `已转入交互卡片` history snapshot instead of retaining a transient clarify/tool header forever.
+- Repeated interactions finalize each predecessor once and remove pending buttons and callback tokens from old cards while only the newest card stays interactive.
+
+### Safety
+- Replacement delivery still succeeds before predecessor finalization starts; send failure restores the original session and card authority exactly as before.
+- Predecessor animation cancellation completes before the final PATCH. A failed predecessor PATCH uses existing bounded retry/diagnostic metrics and remains fail-open for the delivered interaction.
+- Callback authentication, chat/operator binding, expiry, sequence, topic/reply, native suppression, `legacy/`, and Hermes patch ownership are unchanged.
+
+## V4.2.10 — 2026-08-10
+
+See also: [docs/release-notes-v4.2.10.md](docs/release-notes-v4.2.10.md)
+
+### Added
+- Non-loopback sidecar callbacks and result reads use a domain-separated HMAC proof that binds the HTTP method, canonical path, and raw body.
+- Interaction state records an absolute sidecar-owned deadline and the cleanup loop expires stale pending interactions before normal retention cleanup.
+- CI runs full pytest on Ubuntu Python 3.9–3.12 and macOS 3.12. Windows 3.12 runs a fixed portable runtime/server suite plus dedicated PowerShell and migration contracts; POSIX `dir_fd`, mode-bit, systemd, and bash-only tests remain covered on POSIX runners. CodeQL and weekly Dependabot configuration are included.
+
+### Fixed
+- Late direct buttons and clarify form submits can no longer complete an expired interaction; the original card is refreshed with an expired result.
+- Gateway poll timeout sends one distinct `interaction.failed` event and never replays the original `interaction.requested`.
+- Official GitHub Actions are pinned to immutable Node 24-capable release SHAs, removing the Node 20 deprecation path.
+
+### Safety
+- Missing, expired, cross-method, cross-path, cross-body, and replayed sidecar proofs fail closed with a generic response and bounded rejection metric.
+- Default loopback deployments remain compatible, and callback token/chat checks remain defense in depth.
+
+## V4.2.9 — 2026-08-09
+
+See also: [docs/release-notes-v4.2.9.md](docs/release-notes-v4.2.9.md)
+
+### Added
+- PR #199: agent clarify cards support native multi-select, numbered single-select choices, and a free-text “Other” form while preserving in-progress input until the interaction resolves.
+- Pending interaction cards show their configured expiry in the footer.
+
+### Fixed
+- Issue #197: completed card quote summaries use a bounded normalized answer excerpt instead of the fixed “已完成” status.
+- PR #196: slow slash-command confirmations resolve outside Feishu's callback deadline, atomically consume pending state, update the original card, and fall back without losing the click when loop submission fails.
+- Clarify hook injection reads optional `multi_select` safely on both older and newer Hermes callback signatures.
+
+### Safety
+- Form submits require the exact unguessable callback token and an exact non-empty chat binding; interaction IDs are not accepted as credentials.
+- Ambiguous interaction-event delivery is checked with a read-only lookup and never replays `/events`.
+- Interaction diagnostics omit raw IDs, URLs, user choices, response bodies, and error text.
+
+### Credits
+- Thanks @zayn-0101 for PR #196 and @Cassius0924 for PR #199.
+
+## V4.2.8 — 2026-08-05
+
+See also: [docs/release-notes-v4.2.8.md](docs/release-notes-v4.2.8.md)
+
+### Fixed
+- `install.sh`, `install-docker.sh`, and `install.ps1` now persist Feishu credentials supplied through the process environment into the selected dotenv file.
+- PowerShell dotenv replacement recognizes normalized and `export`-style assignments instead of appending a conflicting duplicate.
+
+### Safety
+- POSIX installers create or normalize the credential file with mode `0600`.
+- Installer logs do not print persisted credential values; newline-bearing or ambiguous dual-quote PowerShell values are rejected instead of serialized unsafely.
+
+## V4.2.7 — 2026-08-05
+
+See also: [docs/release-notes-v4.2.7.md](docs/release-notes-v4.2.7.md)
+
+### Fixed
+- Issue #193: Windows SDK and HFC runtime probes now allow 30 seconds for cold imports instead of failing after 8 seconds.
+- Ownership manifests and recovery plans write portable POSIX relative paths; exact legacy Windows backslash paths remain readable while absolute, traversal, and extra-suffix paths stay rejected.
+- PR #180: config discovery accepts the parent `HERMES_HOME` layout used by Windows installations.
+- PR #181: a Windows detached venv launcher may rebind the owned pidfile from its verified parent to the exact runner child.
+- `install.ps1` propagates native `pip` and `setup` failures and never prints `done` after a failed command.
+
+### Safety
+- PID rebinding remains restricted to Windows detached mode with exact process token, manager, and parent evidence, followed by a strict read-back check.
+- Legacy path compatibility is narrow and does not accept absolute paths, path traversal, or additional components.
+
+## V4.2.6 — 2026-08-04
+
+See also: [docs/release-notes-v4.2.6.md](docs/release-notes-v4.2.6.md)
+
+### Fixed
+- Issue #187: every repeated `interaction.requested` now creates a fresh latest-position choice card, promotes that message as the update target, and rolls back exactly when creation fails.
+- Issue #188: a substantial streamed answer remains visible when completion adds only a short terminal postscript; ordinary final answers still replace short progress prefaces.
+- Issue #189 / PR #190: Hermes Agent 0.20's awaited `asyncio.to_thread(...)` delivery-ledger writes are patched only at the verified exact Base anchors.
+- Bare private-chat `/update` accepts lexical venv Python symlinks, preserves the independent maintenance runtime, and allows slow read-only check/fetch operations up to five minutes.
+- Hermes 0.20 version detection reads the literal `hermes_cli.__version__` assignment before Git fallback, preventing stale calendar-tag reporting.
+
+### Safety
+- Unknown, unawaited, reordered, or inexact Hermes ledger shapes remain fail-closed, and apply/remove is verified byte-for-byte.
+- Existing update evidence, target, drain, ownership, rollback, and exact-merge release gates remain unchanged.
+
+## V4.2.5 — 2026-08-02
+
+See also: [docs/release-notes-v4.2.5.md](docs/release-notes-v4.2.5.md)
+
+### Fixed
+- Canonical `turn_id` now fences quoted-turn session, sequence, terminal, native-handoff, and delivery-policy state while preserving legacy alias fallback.
+- Duplicate maintenance resume is non-destructive; maintenance commands stay bound to the confirmed Hermes checkout, and persisted resume phases reconcile external drain before readiness.
+- Doctor suggests integrity acknowledgement only for a jointly verified eligible plan, and installer `latest` resolves to a pinned stable tag or fails before mutation.
+- Package, public config template, Compose, and CI release markers are checked as one version contract.
+
+### Safety
+- Release Assets require an exact tested annotated tag and reverify the same peeled commit immediately before upload.
+- Unknown event paths remain fail-open, durable maintenance ownership remains fail-closed, and no installed Hermes source is edited by hand.
+
+## V4.2.4 — 2026-08-01
+
+See also: [docs/release-notes-v4.2.4.md](docs/release-notes-v4.2.4.md)
+
+### Fixed
+- Consecutive Feishu/Lark topic replies quoting the same message now create independent cards instead of overwriting the first reply card.
+- `message.started` uses the real incoming message ID, with the reply anchor only as a fallback; in-turn streaming deltas and tool events continue to resolve through the reply alias.
+
+### Safety
+- New-turn routing bypasses an active reply alias only for `message.started`; existing session correlation for streaming events is unchanged.
+- Unknown or unsupported event paths remain fail-open, and native duplicate suppression boundaries are unchanged.
+
+## V4.2.3 — 2026-08-01
+
+See also: [docs/release-notes-v4.2.3.md](docs/release-notes-v4.2.3.md)
+
+### Fixed
+- Feishu/Lark WebSocket update actions now forward `update_evidence_fingerprint` from the signed card value to the sidecar, so confirm and cancel can pass the existing evidence-bound transition checks.
+- Real card clicks no longer stop at the Gateway hook with an unchanged confirmation card and zero sidecar update attempts.
+
+### Safety
+- The sidecar remains fail-closed: missing or mismatched update evidence is still rejected instead of inferred or weakened.
+- The native card action keeps its fast empty acknowledgement, and cancel still never schedules the updater.
+
+## V4.2.2 — 2026-08-01
+
+See also: [docs/release-notes-v4.2.2.md](docs/release-notes-v4.2.2.md)
+
+### Fixed
+- Feishu/Lark WebSocket `/update` confirmation actions now asynchronously PATCH the original confirmation card after the callback has been acknowledged.
+- Cancel now renders the durable terminal `已取消更新` state on the original card instead of leaving an apparently clickable confirmation card behind.
+- Confirm publishes the locking/preparing transition before the independent maintenance updater starts, keeping the visible card aligned with the durable operation state.
+
+### Safety
+- The native card-action callback still returns its empty acknowledgement immediately; Feishu API work stays outside the callback deadline.
+- Cancel never schedules the updater, and confirm schedules it only after the transition-card update attempt. Existing initiator, chat, profile, expiry, preflight, drain, and fail-closed checks are unchanged.
+
+## V4.2.1 — 2026-07-31
+
+See also: [docs/release-notes-v4.2.1.md](docs/release-notes-v4.2.1.md)
+
+### Fixed
+- Gateway startup now registers the live runner before runtime control starts, so the first authenticated heartbeat can prove the complete `_active_work_count()` aggregate immediately.
+- The first bare private-chat `/update` after a Gateway restart no longer needs an unrelated warm-up message before its maintenance preflight can accept complete active-work evidence.
+
+### Safety
+- Complete active-work evidence still comes from one `_active_work_count()` sample. Missing, invalid, or failing aggregates remain fail-closed and are never treated as zero work.
+
+## V4.2.0 — 2026-07-31
+
+See also: [docs/release-notes-v4.2.0.md](docs/release-notes-v4.2.0.md)
+
+### Added
+- A bare `/update` in a Feishu private chat now opens an evidence-bound confirmation card instead of immediately mutating Hermes.
+- A private, independent maintenance runtime caches the exact HFC wheel, journals each phase, runs only `hermes update --yes`, reinstalls the same HFC version, restores hooks and services, and verifies the final runtime.
+- `maintenance provision`, `maintenance status`, `maintenance run`, and `maintenance resume` expose the recovery boundary locally.
+
+### Safety
+- Confirmation is bound to the exact initiator, chat, profile, target evidence, and 120-second window. Group, non-Feishu, alias, and parameterized update commands retain Hermes' original behavior.
+- Unrelated tracked changes, incomplete Git operations, missing maintenance evidence, version drift, CI-independent runtime drift, and verification failure stop before unsafe mutation. Untracked files are preserved and no custom Git rollback is used.
+
+## V4.1.4 — 2026-07-31
+
+See also: [docs/release-notes-v4.1.4.md](docs/release-notes-v4.1.4.md)
+
+### Fixed
+- Official `install` / `setup` can migrate a manifestless legacy owned Gateway hook when lenient removal restores the clean backup byte-for-byte, including the portable install path used on Windows (Issue #171).
+- Optional Cron and required exact Base evidence are validated independently; a missing legacy Base hook is added through the current manifest-v2 install transaction.
+- User edits outside owned blocks, mismatched backups, symlinks, missing targets, and invalid source remain fail-closed.
+
+## V4.1.3 — 2026-07-30
+
+See also: [docs/release-notes-v4.1.3.md](docs/release-notes-v4.1.3.md)
+
+### Fixed
+- `integrity acknowledge-review` can now atomically move a bound manual-review fence to the current verified integrity plan after an official Hermes upgrade, but only when the old and current bindings identify the same Hermes target, the fence CAS snapshot is unchanged, the installed plan is verified twice, and the sidecar is confirmed stopped twice.
+- A different target identity, stale fence snapshot, running sidecar, unsafe legacy fence, or unverifiable current plan still fails closed. An independent restart fence and its pre-repair runtime hash remain intact.
+- `doctor --explain` now points integrity migration to `integrity migrate-safe` and prints the complete explicit `integrity acknowledge-review` command for other manual-review fences.
+- The answer-delta hook now selects the native `_stream_consumer.on_delta` callback when Hermes also defines a same-name streaming-TTS fallback, and relocates an older managed hook during upgrade (PR #168, thanks @dake6767).
+- Hermes' `TurnRunner` refactor no longer drops stable tool, answer, thinking, clarify, approval, or status hooks. Managed blocks use the verified `TurnContext` seam, remain idempotent and removable, and compatibility detection now fails closed when named TurnRunner callbacks cannot actually be patched (Issue #169).
+
+## V4.1.2 — 2026-07-29
+
+See also: [docs/release-notes-v4.1.2.md](docs/release-notes-v4.1.2.md)
+
+### Fixed
+- A verified `installed` Hermes plan no longer turns a transient `runtime_heartbeat_stale` window during a normal Gateway restart into a persistent restart fence. Readiness remains degraded while the heartbeat is stale, then returns to ready when the new matching `runtime.hello` arrives.
+- Stable Hermes tool lifecycle callbacks now suppress the parallel legacy progress path by checking the callbacks actually installed on the agent. An explicit fallback marker preserves fail-open native progress when card delivery is unavailable, while one real tool call no longer renders as two timeline entries.
+- Generation/package mismatches, unavailable control authentication, manual-review fences, and actual integrity repair remain fail-closed; HFC still never restarts Hermes Gateway automatically.
+
+## V4.1.1 — 2026-07-28
+
+See also: [docs/release-notes-v4.1.1.md](docs/release-notes-v4.1.1.md)
+
+### Fixed
+- `setup/install` now probes the detected Hermes runtime venv with isolated Python, verifies that the package comes from that venv's `site-packages`, and compares the package/Python identity reported by `/health`. Plain `start` also requires an isolated matching import; `start/status/stop` now share the selected env source.
+- Waiting for the first authenticated runtime heartbeat no longer creates a persistent restart/manual-review fence when the on-disk install is already verified.
+- Added `integrity acknowledge-review`, which works only with a twice-verified `installed` plan, a stopped sidecar, no pidfile, a matching target-bound fence, and an unchanged CAS snapshot. The known V4.1.0 unbound fence migrates only in its exact empty-hash form; non-empty legacy fences stay fail-closed.
+- A legacy `0644` pidfile is accepted only inside a private, owned `0700` state directory and is tightened through an open-file identity binding. A running pidfile-less sidecar is never silently adopted or killed.
+- Detached sidecars stop through a loopback-only, process-token-authenticated self-shutdown request. HFC no longer sends TERM/KILL to a numeric detached PID/PGID; unsupported legacy processes and shutdown timeouts remain running for manual handling.
+- Recovery instructions now require an operator to stop and review first, acknowledge only when eligible, then manually restart sidecar and Hermes Gateway. Automated, package, Linux/Docker, and real Feishu acceptance remain release gates rather than pre-declared results.
+
+## V4.1.0 — 2026-07-28
+
+See also: [docs/release-notes-v4.1.0.md](docs/release-notes-v4.1.0.md)
+
+### Added
+- Exact, profile-scoped `bindings.native_chats` policy plus masked `chats use-native`, `chats use-card`, and `chats list` commands. Hook and sidecar enforce the policy independently through domain-separated, replay-resistant authentication.
+- Authenticated `runtime.hello` / `runtime.heartbeat` readiness monitoring and strict, evidence-bound `integrity.mode: safe` repair. Existing configs without the section remain `notify`; HFC never restarts Hermes Gateway automatically.
+- Explicit `service.manager` values `auto`, `systemd-user`, `systemd-system`, and `detached`. `auto` probes only user systemd and never crosses into system privileges.
+
+### Changed
+- `card.table_overflow_mode: compact` preserves table six onward as ordered field lists. `truncate` remains available explicitly, and fenced code no longer counts as tables.
+- The shared card serializer enforces five tables, 200 tagged elements, and a 28,000-byte JSON budget. Terminal overflow hands the complete answer back to Hermes native delivery instead of sending a partial card.
+- On the exact Hermes 0.19 final-answer path, terminal overflow now returns a stable descriptor bound to the Base delivery ledger's obligation, content hash, delivery-plan fingerprint, and canonical route. Per-chunk Feishu UUIDs, ledger-first `delivered`, and signed ACK keep retries bounded without claiming forever exactly-once semantics. Cron, direct-command, and incomplete-binding paths remain ordinary native fail-open and do not claim this ACK contract.
+- Multi-bot groups that depend on bot-to-bot mentions can opt into native creation through `native_chats`; the target app still needs Feishu's include-bot mention permission.
+- Docker Compose remains an ordinary unprivileged runtime flow and explicitly selects `detached` rather than systemd. The setup container runs `install-docker.sh` as root to prepare the shared volumes; the sidecar, Gateway, and probe run as non-root while CI exercises the patched Gateway, signed readiness, and signed event path.
+
+### Compatibility and safety
+- Hermes 0.19.0 / `v2026.7.20` remains compatible through AST-owned `gateway/run.py` and `gateway/platforms/base.py` hooks. V4.1 `manifest_version: 2` manages run, required Base, and optional Cron as one verified transaction; runtime monitoring and strict repair replace broader import-time patching.
+- Credits: @shutdown-awa (#157), @Jasonsun77 (#158), @Redeemer-w (#159), @zyq2552899783-lgtm (#162), @Cyber-Yichen (#156), and @wholegale39 (#160). The release retains their requirements and environment evidence without adopting implicit privilege escalation or an import-hook monkey patch.
+
+## V4.0.21 — 2026-07-28
+
+See also: [docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)
+
+### Fixed
+- Fixed Issue #155: completion reconciliation archives streamed text only after an explicit `answer -> tool` boundary. A prior tool no longer causes a later `tool -> answer -> completed` final answer to move into the reasoning timeline.
+- Locked the Issue #147 image/notice combination with an automated regression: an accepted completed card suppresses matching native media text once, retains the native image delivery, and an accepted queued notice does not produce an uncertain-delivery warning.
+
+### Compatibility
+- This narrow hotfix does not change the card UI or configuration. Existing media handoff, notice acknowledgement, fail-open behavior, and Issue #96 completion-suffix compatibility remain in place.
+
+### Verification
+- Task 1 focused ordering coverage passed `74 passed`; Task 2 image/notice combination coverage passed `277 passed` without requiring a production runtime change.
+- Real Feishu acceptance on 2026-07-28 confirmed the image and answer-ordering paths with zero matching native duplicates or uncertain-delivery warnings; this is not a screenshot or desktop/mobile visual-QA claim.
+- The candidate runtime was observed in Hermes venv `site-packages` as `4.0.21`. Public tagged-installer and Release-asset verification remain pending post-tag.
+- Final local release gate passed: full pytest reported `1526 passed, 4 skipped in 53.56s`; `uv build` produced `hermes_feishu_streaming_card-4.0.21.tar.gz` and `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`.
+- A clean Python 3.12 venv installed the wheel with imports resolving from `site-packages`; package and distribution versions were both `4.0.21`, `hermes-feishu-card = hermes_feishu_card.cli:main` was present, and CLI `--help` exit 0.
+
+## V4.0.20 — 2026-07-22
+
+See also: [docs/release-notes-v4.0.20.md](docs/release-notes-v4.0.20.md)
+
+### Fixed
+- Existing-card `system.notice` updates now return `delivery.outcome=accepted` only after the event is applied and the asynchronous PATCH task is queued, preventing the hook from emitting a false unknown-delivery warning.
+- Initial independent notice create/reply semantics remain `delivered`, `not_sent`, or `unknown`; the fix does not wait for every PATCH or weaken create-delivery confirmation.
+
+### Diagnostics
+- `/health.metrics.notice_update_failures` counts accepted notice update tasks that still fail after internal PATCH retries.
+- `last_update_error` may include only validated `status_code` and `api_code` fields in addition to the exception type; response bodies, tokens, URLs, and credentials remain excluded.
+
+### Tests
+- Added hook and sidecar regressions for explicit `accepted + applied=true`, rejection of incomplete acknowledgements, queued update responses, retry exhaustion, and redacted diagnostics.
+- Full automation passed with `1517 passed, 4 skipped`; the package also passed sdist/wheel and isolated `site-packages` import checks.
+
+## V4.0.19 — 2026-07-22
+
+See also: [docs/release-notes-v4.0.19.md](docs/release-notes-v4.0.19.md)
+
+### Fixed
+- The macOS/Linux one-line installer no longer passes `pip --user` when it selects a Python interpreter inside the Hermes venv.
+- A failed package installation now preserves the real pip exit status and stops before setup, preventing an older checkout or installed package from making an upgrade appear successful.
+
+### Tests
+- Added regression coverage for Hermes-venv pip arguments and fail-fast package-install behavior.
+- A fresh public-install fixture completed without `HFC_PIP_USER`, then imported the tagged package from the Hermes venv `site-packages`.
+
+## V4.0.18 — 2026-07-22
+
+See also: [docs/release-notes-v4.0.18.md](docs/release-notes-v4.0.18.md)
+
+### Fixed
+- Hermes Feishu SDK compatibility now follows the adapter's actual `extra_ua_tags` requirement and the installed `lark_oapi.ws.Client` constructor signature instead of assuming a running Gateway means Feishu is connected.
+- `setup/install` repairs stale Gateway venvs with the verified `lark-oapi==1.6.8` and rechecks the constructor capability before patching Hermes.
+
+### Diagnostics
+- `doctor` reports a dedicated `feishu_sdk` section and `feishu_sdk_incompatible` finding; the operations card includes localized recovery guidance.
+- Older Hermes adapters that do not use `extra_ua_tags` remain untouched, while already-compatible newer SDKs are accepted without forced replacement.
+
+### Tests
+- Added red/green regression coverage for stale SDK repair and read-only doctor reporting.
+- Full automation passed with `1511 passed, 4 skipped`; the real Hermes v0.19.0 Gateway recovered its Feishu WebSocket connection after the SDK correction.
+
+## V4.0.17 — 2026-07-22
+
+See also: [docs/release-notes-v4.0.17.md](docs/release-notes-v4.0.17.md)
+
+### Fixed
+- Parallel tools with the same name now use Hermes' stable `tool_start_callback` / `tool_complete_callback` call IDs, so each query, argument set, status, and duration stays on its own timeline row.
+- The timeline header counts tool invocations once instead of counting both started and completed lifecycle events.
+- Rendering removes every duration metadata line from the detail body and keeps only the first valid duration on the compact tool headline.
+
+### Compatibility
+- Existing Hermes tool callbacks are preserved and wrapped without retaining stale per-turn HFC closures on cached agents.
+- Hermes layouts without compatible stable callback anchors retain the established progress-callback fallback and fail-open behavior.
+
+### Tests
+- Added regression coverage for parallel same-name tools, invocation counting, duplicate-duration cleanup, stable patch insertion, idempotency, compilation against the current Hermes Gateway source, and exact restore.
+- Full automation passed with `1508 passed, 4 skipped`; package build, isolated install, public tagged-install, release assets, and local runtime provenance are verified during release.
+
+## V4.0.16 — 2026-07-22
+
+See also: [docs/release-notes-v4.0.16.md](docs/release-notes-v4.0.16.md)
+
+### Fixed
+- Initial loading keeps `Hermes Agent` as the only Header text while the animated `正在加载上下文…` placeholder remains in the body.
+- Once a tool starts, its current action moves to the Header subtitle and an empty model body no longer repeats the loading placeholder.
+- Tool completion now reads Hermes progress-callback `kwargs.duration`, preserves the started-event query and arguments, and renders the duration on the compact tool headline.
+
+### Reliability
+- Explicit upstream duration remains authoritative; a started/completed event-time delta is used only when Hermes omits duration, while terminal-only events never invent elapsed time.
+- Added regression coverage for loading-state transitions, callback duration extraction, detail preservation, explicit-duration precedence, and terminal-only compatibility.
+
+### Tests
+- Full automation passed with `1504 passed, 4 skipped`; release metadata, package build, isolated install, and public tagged-install checks are recorded in the release notes.
+
+## V4.0.15 — 2026-07-22
+
+See also: [docs/release-notes-v4.0.15.md](docs/release-notes-v4.0.15.md)
+
+### Added
+- Fixed Issue #141 with a compact semantic tool-event timeline: the first line shows status, tool name, and duration while arguments, results, and failure details stay on a smaller second line without blockquote backgrounds.
+- The initial card displays an animated `正在加载上下文…` state, and running tools advance the same spinner through the existing serialized PATCH controller without creating a second card.
+
+### Reliability
+- `status` and `start` now detect a verified Hermes upgrade that replaced the injected hook while leaving safe installer evidence. They report `upgrade_repair_required`; `start` refuses the silent broken state and prints the explicit recovery plus Gateway-start commands.
+- User-edited, corrupt, unsupported, or incomplete Hermes source stays fail-closed as `manual_review_required`; the CLI never suggests upgrade acceptance for those states.
+- Hook installation now prints `gateway.restart_required: hermes gateway start` whenever patched Gateway or cron source changed.
+
+### Tests
+- Added render/server animation coverage, first-event compatibility, terminal drain checks, safe upgrade-recovery lifecycle coverage, and real Hermes/Feishu validation with the configured model.
+- Full automation, package build, isolated `site-packages` import, tagged install, and release-asset results are recorded in the release notes.
+
+## V4.0.14 — 2026-07-20
+
+See also: [docs/release-notes-v4.0.14.md](docs/release-notes-v4.0.14.md)
+
+### Fixed
+- Fixed Issue #142: orphaned long-running `Working` heartbeats are explicitly non-terminal, so standalone cards remain in the running state instead of combining a “运行中” title with an “已完成” subtitle.
+- Consecutive heartbeat updates now derive one stable independent card identity from the chat and original message anchor rather than changing heartbeat text or a five-minute bucket. Separate user-message anchors remain isolated.
+- A later `message.completed` event still resolves the original reply-anchor alias and completes the same card. The existing `unknown` delivery warning and fail-open rules remain unchanged.
+
+### Tests
+- Added regression coverage for non-terminal heartbeat classification, stable per-anchor identity, orphaned 6/9-minute updates, final completion, and recovery after an unknown delivery outcome.
+- Thanks to @ati121 for reporting the long-task duplicate-card and contradictory-status symptom in Issue #142.
+
+## V4.0.13 — 2026-07-20
+
+See also: [docs/release-notes-v4.0.13.md](docs/release-notes-v4.0.13.md)
+
+### Added
+- All non-empty Feishu/Lark slash-command feedback now enters a generic command-card context, covering built-ins, aliases, plugin/quick commands, and unknown-command feedback without a fixed allowlist.
+- Manual `/compress` creates an in-place running card before invoking the original Hermes handler, then updates the same card with the unchanged success, no-op, or aborted result.
+
+### Changed
+- The first feedback creates one interactive card; later feedback for the same command is serialized and PATCHed into that card. Long Markdown uses the existing structural splitter, and topic/reply anchors are preserved.
+- Existing `/model`, bare `/resume`, destructive-confirmation, and `/hfc` cards retain priority. Agent turns, native media delivery, and post-restart `/update` status notices keep their established paths.
+
+### Reliability
+- Native gray text is suppressed only after confirmed card create/PATCH success. Any failed card operation returns the exact original Hermes feedback through the native adapter.
+
+## V4.0.12 — 2026-07-18
+
+See also: [docs/release-notes-v4.0.12.md](docs/release-notes-v4.0.12.md)
+
+### Added
+- Fixed Issue #133's silent context-compaction gap by forwarding Hermes' exact `Compacting context` status callback into a `context-compaction` card phase. Existing cards stay visible, and a missing primary card is created without timeout inference or fabricated progress.
+- Added closed-schema `card.text_sizes` configuration for `body`, `reasoning`, `tool`, `notice`, and `footer`, with scalar values or deterministic `default` / `pc` / `mobile` mappings. Physical card dimensions remain controlled by Feishu/Lark clients.
+
+### Fixed
+- Fixed Issue #136: `setup` / `start --env-file` credentials now reach the sidecar runner and operations diagnostics with precedence YAML < sibling `.env` < selected env file < process environment; no implicit global env fallback was added.
+- Credential-free Noop mode now logs a warning, reports `degraded` health with `noop_mode: true`, returns `not_sent`, and records `feishu_noop_attempts` / failures instead of fake message IDs and successes.
+
+### Credits
+- Thanks to @tianxia3111 for Issue #133's production compaction and mobile-readability report, @Jasonsun77 for reinforcing the configurable-font request, and @nasvip for Issue #136's complete Linux/systemd credential-chain diagnosis and health evidence.
+
+## V4.0.11 — 2026-07-18
+
+See also: [docs/release-notes-v4.0.11.md](docs/release-notes-v4.0.11.md)
+
+### Fixed
+- Fixed issue #135: initial Feishu create/reply delivery now uses a stable UUID and at most three attempts for retryable HTTP/network failures, while sidecar `/events` requests remain single-shot.
+- System notices now distinguish `delivered`, `not_sent`, and `unknown`: only definite non-delivery falls back to the original text, while uncertain outcomes use a generic warning without repeating private notice content.
+
+### Operations and safety
+- Added retry, unknown-outcome, native-fallback, and uncertain-warning metrics plus redacted send-error diagnostics; raw IDs, UUIDs, response bodies, URLs, and credentials are excluded.
+
+## V4.0.10 — 2026-07-17
+
+See also: [docs/release-notes-v4.0.10.md](docs/release-notes-v4.0.10.md)
+
+### Security
+- Non-loopback sidecar listeners now require explicit `server.allow_non_loopback: true`; accidental `0.0.0.0`, private-address, or named-host exposure fails before binding.
+- Every enabled non-loopback `/events` request requires a timestamped, nonce-bound HMAC-SHA256 proof over the exact raw body using the private operations transport root. Missing, invalid, stale, and replayed proofs return a generic 401.
+- Loopback listeners remain backward compatible with unsigned hook events. HMAC authenticates but does not encrypt; cross-host deployments still require a trusted private network plus TLS or mTLS.
+
+### Operations and documentation
+- `/health`, CLI `status`, and card-safe diagnostics expose bounded `event_auth_required` / `event_auth_rejections` state without exposing proof headers or secret material.
+- Replaced stale architecture claims with the current V4 event flow and added a maintainer fail-open boundary matrix for authentication, native suppression, delivery, and installer recovery.
+
+## V4.0.9 — 2026-07-16
+
+See also: [docs/release-notes-v4.0.9.md](docs/release-notes-v4.0.9.md)
+
+### Fixed
+- Fixed issue #130: the startup hook no longer rebuilds and replaces the live `EventDispatcherHandler` owned by an already-connected Lark WebSocket client.
+- HFC now updates only the `p2.card.action.trigger` processor callback, scheduled through the SDK WebSocket thread with `call_soon_threadsafe(...)`; message, reaction, bot lifecycle, drive, meeting, and other registered processors keep the same handler object.
+
+### Compatibility and safety
+- Unsupported or changed Lark handler internals fail open without falling back to whole-handler replacement.
+- Added a dedicated Ubuntu/Python 3.11 compatibility job for `lark-oapi==1.6.8` and `websockets==15.0.1`, matching the reported production stack.
+- The separate upstream Hermes reconnect-exhaustion bug remains tracked by NousResearch/hermes-agent#64712 and #64741; this release removes HFC's live-handler mutation instead of rewriting Hermes reconnect ownership.
+
+### Credits
+- Thanks to @Jasonsun77 for issue #130's clean-versus-patched Linux A/B, complete 3–6 minute disconnect timeline, SDK versions, sidecar health evidence, and upstream reconnect correlation.
+
+## V4.0.8 — 2026-07-16
+
+See also: [docs/release-notes-v4.0.8.md](docs/release-notes-v4.0.8.md)
+
+### Fixed
+- Fixed issue #127: cron completion cards no longer return before Hermes extracts and uploads native attachments. The card owns the text and attachment summary while the original `media_files` path continues with an empty `cleaned_delivery_content`, avoiding duplicate native text.
+- Cron events now recognize Hermes `(path, is_voice)` media tuples and report `native_delivery=required`; `/health` records that policy instead of always reporting attachments as `allowed`.
+
+### Compatibility and safety
+- Existing V4.0.7 cron hook blocks are recognized and moved from the function entry to the post-media-extraction anchor while remaining idempotent and exactly removable.
+- Text-only cron jobs still stop after a successful card, sidecar failure remains fail-open, and Hermes versions without the media extraction anchor retain the established fallback hook.
+
+### Credits
+- Thanks to @zyq2552899783-lgtm for reporting issue #127's exact symptom: regular conversations uploaded files correctly while cron delivery showed only the attachment filename.
+
+## V4.0.7 — 2026-07-16
+
+See also: [docs/release-notes-v4.0.7.md](docs/release-notes-v4.0.7.md)
+
+### Fixed
+- Fixed issue #125 on Linux/systemd: `start` and `setup` now launch the sidecar in a restartable transient user service, keeping it outside the Hermes Gateway cgroup so `systemctl --user restart hermes-gateway` does not kill both processes.
+- A verified sidecar started by the previous detached-process path is migrated into the systemd user unit during upgrade; PID changes caused by systemd restarts remain safely tied to the existing process token and unit identity.
+- `install.sh` now prefers the Python interpreter from the Hermes venv and uses `HFC_PYTHON` as the explicit override, avoiding split installs between Hermes Python and an externally managed system Python.
+- Merged PR #124 so orphaned session-scoped self-improvement notices retry as independent cards instead of claiming the next conversation's primary card.
+
+### Compatibility
+- macOS, Windows, containers without a working systemd user manager, and Linux fallback environments retain the existing detached sidecar process path.
+
+### Credits
+- Thanks to @nasvip for issue #125's systemd cgroup, PID, Python-environment, and health evidence.
+- Thanks to @hzy for PR #124's self-improvement card lifecycle fix and regression coverage.
+
+## V4.0.6 — 2026-07-15
+
+See also: [docs/release-notes-v4.0.6.md](docs/release-notes-v4.0.6.md)
+
+### Fixed
+- Fixed issue #118 by adding an explicit `--accept-hermes-upgrade` recovery path for a verified Hermes upgrade that replaced unpatched `gateway/run.py` and/or cron source while leaving an older HFC backup and manifest behind.
+- `repair`, `install`, and `setup` can now clear only the verified stale HFC install artifacts, preserve the upgraded Hermes source, and then install a fresh hook and backup from that source.
+- Fixed issue #120 / PR #121 on Hermes 0.18.x: streamed turns now emit `message.completed` before the `already_sent` early return, use the same explicit reply anchor as started/delta events, and install the queued-completion hook across the newer multiline delivery block.
+- Merged PR #119 so background-process and `/background` running/final notifications use stable Feishu `system.notice` cards, preserve topic routing, and avoid duplicate native gray output.
+- Release-candidate Feishu E2E exposed and fixed the remaining `/background` start path: Hermes' immediate `Background task started` envelope is now claimed by the card runtime, and the anchored background-task notice uses an independent lifecycle so the same card reaches a terminal state instead of keeping a gray native reply or a `生成中` footer.
+
+### Safety
+- The default remains fail-closed when current Hermes source differs from the verified backup. Upgrade recovery requires explicit `--accept-hermes-upgrade --yes`, supported current hook anchors, a valid manifest, and an unchanged matching backup.
+- Missing or corrupt backups, invalid manifests, symlinks, unreadable files, unknown markers, unsupported current source, and remaining owned patches are still refused.
+- Completion-hook migration recognizes the previous owned rendering and remains removable/idempotent; older Hermes strategies keep their established insertion path.
+- Concurrent background notices keep separate stable identities, terminal cleanup is bounded, and card failure retains the existing native fail-open path.
+- Malformed or future background-start envelopes remain fail-open; only the exact Hermes task id and envelope shape are claimed.
+
+### Credits
+- Thanks to @nasvip for issue #118's upgrade transcript and the exact recovery refusal that exposed the stale-state ambiguity.
+- Thanks to @hzy for PR #119's background-notification implementation.
+- Thanks to @lRoccoon for issue #120's production diagnosis and PR #121's Hermes 0.18.x completion-hook fix.
+
+## V4.0.5 — 2026-07-13
+
+See also: [docs/release-notes-v4.0.5.md](docs/release-notes-v4.0.5.md)
+
+### Fixed
+- Fixed issue #115 by comparing the plugin version installed in the Hermes Gateway venv with the invoking CLI package instead of treating any successful `hook_runtime` import as current.
+- An importable but outdated Gateway runtime package is now upgraded from the same install source, then checked again for the expected version and module path.
+
+### Safety
+- Matching runtime versions remain idempotent and skip pip installation.
+- A failed metadata read or post-install version mismatch now fails explicitly instead of reporting a successful setup with a stale Gateway runtime.
+
+### Credits
+- Thanks to @blakejia for the issue #115 upgrade transcript, sidecar metrics, screenshot, and the earlier Gateway venv output showing that version 3.6.3 was still loaded.
+
+## V4.0.4 — 2026-07-13
+
+See also: [docs/release-notes-v4.0.4.md](docs/release-notes-v4.0.4.md)
+
+### Fixed
+- Fixed issue #110 by excluding fenced and inline Markdown code from `MEDIA:` and local-path extraction, card cleanup, native-delivery policy, and native-media-only response rewriting.
+- Fixed issue #112's stale bound-callback path: when lark SDK retained the original `_on_card_action_trigger`, background `interaction.select` handling now forwards to the sidecar instead of falling through to a synthetic `/card button` command.
+- Adapted issue #107's footer to an upstream Codex usage response with only one ambiguous primary window: it now uses a neutral `limit` label instead of incorrectly claiming the value is a five-hour window.
+
+### Safety
+- Real media directives outside Markdown code and structured Hermes media fields retain native image/file delivery.
+- Background callback forwarding runs off the adapter event loop and retains duplicate-action protection.
+
+### Credits
+- Thanks to @tianqiii for promptly reporting the temporary upstream Codex usage-window change in issue #107.
+- Thanks to @sthnow for issue #110's precise reproduction and parser diagnosis.
+- Thanks to @zkyken for issue #112's logs and bound-method analysis, which exposed the missing background compatibility path.
+- Issue #111 is the duplicate follow-up to #106; @ShakuOvO and @blakejia remain credited for the original report, retesting, and screenshots.
+
+## V4.0.3 — 2026-07-13
+
+See also: [docs/release-notes-v4.0.3.md](docs/release-notes-v4.0.3.md)
+
+### Fixed
+- Fixed the remaining issue #106 path where upgrading the runtime package and restarting services left a V4.0.0 completion hook that still sent the card answer as native gray text.
+- After a media completion is accepted by the sidecar, the Feishu runtime suppresses exactly one matching native text send for the same chat while native image/file delivery continues.
+
+### Safety
+- Unrelated text, other chats, repeated later messages, sidecar failure, non-media completions, and non-Feishu platforms remain on the original fail-open path.
+
+### Credits
+- Thanks to @blakejia for retesting V4.0.2 and providing the screenshot that exposed the stale-hook upgrade path; the original #106 report and confirmation remain credited to @ShakuOvO and @blakejia.
+
+## V4.0.2 — 2026-07-12
+
+See also: [docs/release-notes-v4.0.2.md](docs/release-notes-v4.0.2.md)
+
+### Fixed
+- Allowed the installer recovery planner to upgrade a verified older owned hook when the current file and backup both match the install manifest and removing owned markers exactly restores the backup.
+- Kept user edits, hash mismatches, invalid backups, corrupt markers, and unsupported reapplication fail-closed.
+
+### Added
+- Added opt-in `subscription_usage` footer support from issue #107, using Hermes native Codex account usage in the compact `5h 26% · weekly 89%` format and silently omitting unavailable data.
+
+### Included
+- Includes the V4.0.1 fix for duplicate native answer text after `MEDIA:` image/file cards, with credit to @ShakuOvO and @blakejia for reporting and confirming issue #106.
+- Issue #107's requirements, native-interface direction, and display format were contributed by @tianqiii.
+
+## V4.0.1 — 2026-07-12
+
+See also: [docs/release-notes-v4.0.1.md](docs/release-notes-v4.0.1.md)
+
+### Fixed
+- Fixed issue #106: successful Feishu cards with explicit `MEDIA:` or local output paths now leave only media directives for Hermes native delivery, preventing a second native copy of the answer text.
+- Removed internal media directives and local delivery paths from the completed card body while retaining attachment summaries and native image/file delivery.
+
+### Compatibility
+- Card delivery failure, non-Feishu platforms, and structured-media responses without explicit delivery paths retain the original fail-open response.
+- Existing V4.0.0 completion hook blocks are recognized and upgraded instead of being reported as corrupt markers.
+
+### Credits
+- Issue #106 was reported by @ShakuOvO and independently confirmed on Hermes 0.18.2 by @blakejia.
+
+## V4.0.0 — 2026-07-12
+
+See also: [docs/release-notes-v4.0.0.md](docs/release-notes-v4.0.0.md)
+
+### Added
+- Added a live runtime Header that keeps the configured title and turns Hermes tool names plus `tool.updated.detail` into a deterministic subtitle action summary while public `thinking.delta` continues in the body.
+- Pending interactions temporarily use the Hermes prompt as the Header and restore the cached tool preview after the choice completes.
+- Failed cards retain the last tool preview; completed normal-chat cards use the native Feishu reply quote as their only header and remove the duplicate Card JSON Header.
+- Feishu `/model` now mirrors Hermes CLI's provider tree with Provider → Model navigation, Back, Cancel, upstream counts/current markers, and the original Hermes switch callback.
+
+### Changed
+- Public interim-assistant text is visible in the body until `answer.delta` begins; the answer remains primary afterward.
+- Running, waiting, and failed Footers contain status only. Completed native-reply cards show `已完成` followed by final model, token, duration, and context metrics.
+- Normal-chat card delivery now replies directly to the triggering Feishu message; legacy paths without a valid reply anchor retain the configured-title fallback.
+
+### Security and compatibility
+- Runtime summaries use deterministic action labels, reduce URLs/search operators/private paths, and remain single-line, bounded, Markdown-cleaned, and redacted before Card JSON serialization.
+- The Hermes hook protocol is unchanged, and versions without preview data retain the previous header/layout fallback.
+
+## V3.10.0 — 2026-07-11
+
+See also: [docs/release-notes-v3.10.0.md](docs/release-notes-v3.10.0.md)
+
+### Added
+- Bare Feishu/Lark `/resume` now opens a native `select_static` picker for up to ten visible named sessions. Topic reply metadata is preserved, and unavailable/empty/unsupported paths fail open to Hermes' existing text list.
+- Topic pickers retain an explicit reply anchor when Hermes represents the topic with an `om_...` root id, preventing Feishu field-validation fallback to the native numbered list.
+- Selecting a session ACKs immediately, then invokes the original Hermes resume handler in the runner loop. This preserves ownership checks, continuation resolution, agent release, boundary cleanup, and model/reasoning override reset.
+- Completed-card model labels use escaped semantic color for recognized provider prefixes while preserving footer element order, fields, separators, and text size.
+
+### Security
+- Group/topic resume cards can only be confirmed by the initiating Feishu `open_id`; private-chat callbacks do not add a second identity comparison. If the initiating `open_id` cannot be verified for a group, the picker is not sent and Hermes text fallback remains available.
+- Picker callbacks validate expiry, chat, visible session ids, and adapter authorization before executing exactly once.
+
+### Credits
+- Issue #94 by @colinaaa defined the native resume-picker workflow and fail-open/security acceptance criteria.
+- PR #98 by @charles5g, authored by jackmim, contributed the semantic model-color idea; mainline adds HTML escaping and layout-invariant tests.
+
+## V3.9.1 — 2026-07-11
+
+See also: [docs/release-notes-v3.9.1.md](docs/release-notes-v3.9.1.md)
+
+### Fixed
+- Preserved the complete final answer when a completed event contains a substantial suffix, fixing issue #96 without reintroducing duplicated native replies (PR #97 by @colinaaa).
+- Serialized interrupted-session terminal updates so a late coalesced PATCH cannot overwrite the abandoned card state, fixing issue #92 (PR #93 by @colinaaa).
+- ACKed model-picker callbacks immediately and performed the switch asynchronously; the original card is updated first and a single fallback card is sent only when needed (PR #98 by @charles5g).
+- Recovered issue #82's verified marker-only hook damage from the owned backup/manifest while continuing to reject unknown edits; source-stripped Hermes diagnostics now report `version: unknown (source-stripped metadata)` instead of a misleading version.
+- Made local health checks bypass ambient HTTP proxies and repaired the tools package syntax, adopting the loopback diagnosis from PR #52 by @wjiemin49-ux.
+
+### Compatibility
+- Normal streaming-card footer/layout remains unchanged.
+- Unknown or unverifiable installer states remain fail-closed; unsupported runtime paths remain fail-open.
+
+### Credits
+- @colinaaa: PR #93 and PR #97.
+- @charles5g: PR #98.
+- @wjiemin49-ux: PR #52 diagnosis and repair direction.
+
+## V3.9.0 — 2026-07-11
+
+See also: [docs/release-notes-v3.9.0.md](docs/release-notes-v3.9.0.md)
+
+### Added
+- Added the operations and reliability foundation: Feishu/Lark operations cards guide diagnosis, two-step safe repair, recheck, and Gateway restart while retaining CLI fallback when operations cards are unavailable.
+- Operations cards preserve ownership boundaries: private chats do not compare operators; group cards require the initiating operator for repair/restart confirmation. Transport authentication uses a zero-configuration secret rooted in the private sidecar state directory.
+- Added profile-aware setup, environment diagnostics, lifecycle cleanup metrics, automatic known-safe repair (with `--no-repair` opt-out), and Hermes/Docker compatibility coverage. `doctor` shows the full redacted identity/profile/event-endpoint route chain; `status` summarizes runtime routing/profile events and `/health` reports routing health.
+
+### Fixed
+- Operations-card WebSocket clicks now ACK Feishu immediately, then use a bounded background dispatcher with retry to forward authenticated actions to the sidecar. Slow local callbacks no longer surface Feishu's target-callback timeout toast.
+- Every authenticated operations response now PATCHes the original card through the sidecar delivery mapping. Transition-card publishing is independent from recheck/repair/restart execution, so a slow or failed Feishu PATCH cannot prevent an accepted operation from starting.
+- Restored verified Python 3.9 support for operations diagnostics: asynchronous semaphore and publish-lock state is now created only on first use inside the active event loop. The test suite no longer relies on Python 3.10-only `zip(strict=...)` behavior.
+
+### Credits
+- PR #84 by @Zanetach contributed card progress-status routing and `.env` allowlist expansion for profile environment support.
+
+### Validation
+- Automated release gate: `1172 passed, 3 skipped` on both Python 3.9 and Python 3.12.
+- Real Feishu private-chat acceptance passed on 2026-07-11: `/hfc doctor` produced one operations card without a gray native unknown-command reply; details and two consecutive rechecks (including a background successor) ACKed in 156–201 ms without a callback-timeout toast and PATCHed the same card; sandboxed two-step safe repair, card-triggered Gateway restart, and the normal streaming-card footer also passed with zero send/update failures.
+- Existing-container Docker smoke plus group ownership and topic smoke remain pending acceptance.
+
+## V3.8.18 — 2026-07-10
+
+See also: [docs/release-notes-v3.8.18.md](docs/release-notes-v3.8.18.md)
+
+### Fixed
+- Fixed issue #90, contributed by @colinaaa in PR #91: cron cards created from Feishu topic-group threads now preserve `thread_id` and post back into the originating thread instead of creating a new topic.
+- Cron thread routing now prefers scheduler-resolved Feishu targets, then Feishu origins, then the explicit environment fallback; thread ids from non-Feishu origins are ignored.
+
+### Tests
+- Added unit coverage for cron thread-id source priority, empty values, environment fallback, legacy id formats, and cross-platform isolation.
+- Added integration coverage proving cron cards with a Feishu `thread_id` reach the target thread while ordinary cron cards still target the chat.
+
+## V3.8.17 — 2026-07-09
+
+See also: [docs/release-notes-v3.8.17.md](docs/release-notes-v3.8.17.md)
+
+### Fixed
+- Fixed cron Feishu/Lark card delivery for routing-intent `deliver` values such as `origin`, `all`, and `origin,all`, contributed by @zayn-0101 in PR #77.
+- Cron completions now use scheduler-resolved targets or Feishu origins before falling back to explicit delivery settings, so routing intents no longer short-circuit the platform check into plain-text delivery.
+- `deliver=local` remains local-only/no-delivery, and dict-shaped `deliver` configs continue to support explicit `platform` / `chat_id` values.
+- The installed cron hook pre-resolves delivery targets only when the Hermes scheduler exposes `_resolve_delivery_targets`, keeping the hook fail-open across Hermes versions.
+
+### Tests
+- Added cron coverage for `deliver=origin`, `deliver=all`, `origin,all`, `origin,feishu:...`, dict `deliver`, non-Feishu origins, and `deliver=local`.
+- Updated patcher coverage for optional cron target pre-resolution in the installed hook block.
+
+## V3.8.16 — 2026-07-09
+
+See also: [docs/release-notes-v3.8.16.md](docs/release-notes-v3.8.16.md)
+
+### Fixed
+- Fixed issue #89, contributed by @colinaaa in PR #88: Feishu/Lark topic groups that reuse the same `message_id` across consecutive turns now send a fresh card for the second and later messages.
+- Completed or failed sessions with a reused topic `message_id` now discard stale per-key delivery state before creating the new card, so clarify/approval turns do not hang without an interaction card.
+- Duplicate `message.started` events while the current turn is still active remain ignored, preventing spurious extra cards.
+
+### Tests
+- Added integration coverage for reused completed topic `message_id` values creating a new card.
+- Added a guard proving active duplicate `message.started` events still do not send a second card.
+
+## V3.8.15 — 2026-07-09
+
+See also: [docs/release-notes-v3.8.15.md](docs/release-notes-v3.8.15.md)
+
+### Fixed
+- Fixed issue #82 follow-up recurrence where a completed card with an input `.docx` / `files` context could still be followed by a duplicate native Feishu/Lark final reply.
+- Structured `files` / `file` locals now remain card attachment summaries only; they no longer force `native_delivery=required` unless the final answer itself references an output path.
+- Real output delivery remains fail-open for explicit `MEDIA:/tmp/...`, local file paths in the final answer, and structured output media fields such as `media_files`, `image_files`, `audio_files`, and `video_files`.
+
+### Tests
+- Added regression coverage for card-only input file context while keeping explicit media/file output paths on native delivery.
+
+## V3.8.14 — 2026-07-09
+
+See also: [docs/release-notes-v3.8.14.md](docs/release-notes-v3.8.14.md)
+
+### Added
+- Added WebSocket-native handling for agent clarify/approval `interaction.select` card-action clicks, contributed by @colinaaa in PR #87 and closing issue #86.
+- Feishu/Lark WebSocket deployments can now keep agent interaction choices in card buttons by forwarding native card actions to the sidecar `/card/actions` endpoint without requiring a public callback URL.
+
+### Fixed
+- Rejected or expired WebSocket interaction clicks now return an empty Feishu callback response instead of crashing or falling through to the original adapter handler.
+
+### Tests
+- Added hook runtime regression coverage for successful `interaction.select` forwarding, incomplete action guards, and sidecar rejection behavior.
+
+## V3.8.13 — 2026-07-08
+
+See also: [docs/release-notes-v3.8.13.md](docs/release-notes-v3.8.13.md)
+
+### Fixed
+- Fixed Hermes upgrade compatibility for `v2026.7.7.2` / `0.18.2`, where the installer could reject a valid Gateway only because the upstream Git tag used four numeric components.
+- Version detection now extracts numeric tokens from descriptive metadata such as `Hermes Agent v0.18.2 (...)` and falls back to verified `gateway/run.py` anchors when readable version metadata is unparseable.
+- Reinstall and repair now handle stale install state left by a Hermes upgrade that replaced `gateway/run.py` with an unpatched upstream file, allowing the hook to be safely installed again without restoring an old Hermes file.
+
+### Tests
+- Added regression coverage for four-component Hermes tags, descriptive version metadata, unparseable-version anchor fallback, and stale unpatched install-state repair/reinstall paths.
+
+## V3.8.12 — 2026-07-08
+
+See also: [docs/release-notes-v3.8.12.md](docs/release-notes-v3.8.12.md)
+
+### Fixed
+- Fixed issue #82 recurrence where completed cards with attachment summaries such as `colors.csv` / `styles.csv` could still be followed by a duplicate native Feishu/Lark reply containing the full final answer.
+- Completed events now distinguish card attachment summaries from native file/media delivery requirements via `native_delivery`, so generic `attachments` stay card-only after successful Feishu delivery.
+- Native Hermes file/media paths remain fail-open: `MEDIA:/tmp/...`, local file paths, `files`, `media_files`, and image/audio/video file locals still allow Hermes' native attachment delivery path instead of being swallowed by card suppression.
+
+### Tests
+- Added regression coverage for generic attachment summaries suppressing the native Feishu final reply.
+- Added coverage proving real media/file delivery paths still bypass native response suppression.
+- Updated patcher and integration coverage for the new `native_delivery` completion guard.
+
+## V3.8.11 — 2026-07-08
+
+See also: [docs/release-notes-v3.8.11.md](docs/release-notes-v3.8.11.md)
+
+### Fixed
+- Fixed `/hfc` diagnostics in real Feishu/Lark Gateway flows where `/hfc status` could render the Hermes Agent card and still fall through to Feishu's gray native `Unknown command /hfc` reply when card delivery took longer than the Gateway hook timeout.
+- `/commands` now ACKs accepted `/hfc` requests before slow Feishu card delivery finishes, then sends the command card in the background with failure logging.
+- The Gateway patch intercepts accepted `/hfc` commands before Hermes' native slash-command fallback, and the hook runtime reads command text from `event.text` / `event.content` when Gateway metadata does not expose the command helper.
+
+### Tests
+- Added regression coverage for slow Feishu command-card delivery proving `/commands` returns before the send completes.
+- Added hook runtime and patcher coverage for real Gateway event text extraction and early `/hfc` slash-command interception.
+
+## V3.8.10 — 2026-07-07
+
+See also: [docs/release-notes-v3.8.10.md](docs/release-notes-v3.8.10.md)
+
+### Added
+- Added safe `bindings.group_rules` diagnostics for group chats. Hermes Gateway still owns real @bot and allowlist admission; the sidecar reports the configured counts, mention policy, binding state, and routing reason without leaking raw chat/user ids.
+- Added group-aware `/hfc status` guidance. In an unbound group it now explains that the chat is using fallback/default routing, prints the suggested `bots bind-chat ...` command, and documents that `/new`, `/model`, `/reset`, and similar slash commands first pass Hermes group admission before rendering command cards.
+- Tool timeline details now include compact argument summaries, duration, and failure reason when Hermes exposes those values in `tool.updated` locals.
+
+### Fixed
+- issue #79: `install.sh` and `install-docker.sh` now suppress pip's root-user warning by default and keep recoverable `externally-managed-environment` output from looking like a fatal install failure.
+- Docker installs now retry PEP 668 externally managed Python environments with `--break-system-packages`, matching the macOS/Linux installer behavior.
+
+### Tests
+- Added installer regression coverage for pip root-user warning suppression and Debian/Ubuntu externally managed Python retry output.
+- Added regression coverage for tool detail extraction/rendering, hook-runtime tool metadata extraction, safe group diagnostics, route metadata, and group `/hfc status` binding guidance.
+
+## V3.8.9 — 2026-07-04
+
+See also: [docs/release-notes-v3.8.9.md](docs/release-notes-v3.8.9.md)
+
+### Fixed
+- Fixed Feishu/Lark topic replies where the initial card appeared but later `answer.delta`, `thinking.delta`, `tool.updated`, or `system.notice` events could fail to update the same card when Hermes used a different streaming `message_id`.
+- Session-scoped native Hermes notices in topics now resolve back to the active card by `reply_to_message_id`, so accepted notices return `applied: true` and do not fall through to duplicate gray native messages.
+- Recognized Hermes system notices no longer fall back to native gray Feishu/Lark text when card delivery times out. This suppresses the duplicate external notice while the active topic card continues to own the run state.
+- Hook runtime stream events now preserve the original Feishu reply anchor from Relay `source.message_id`, allowing topic updates to stay associated with the triggering user message even when Hermes' internal stream id changes.
+
+### Tests
+- Added Feishu topic regression coverage for stream/tool updates and `system.notice` updates that use a different event `message_id` but the same `reply_to_message_id`.
+- Added hook runtime coverage for topic stream events carrying `reply_to_message_id` from Relay source metadata.
+- Added a timeout regression for native Feishu adapter `send()` proving classified system notices are suppressed instead of being resent as gray text when the card attempt misses its deadline.
+
+## V3.8.8 — 2026-07-03
+
+See also: [docs/release-notes-v3.8.8.md](docs/release-notes-v3.8.8.md)
+
+### Added
+- Added `system.notice` event support for native Hermes runtime/status notices that previously appeared as separate gray Feishu/Lark text messages.
+- Added card/timeline rendering for session-scoped notices and compact standalone notice cards for task-external notices.
+- Added runtime classification for covered Hermes notices: `Working` heartbeats, context-window/auto-compaction notices, automatic session reset notices, skill-loading notices, self-improvement review notices, and context-compression notices.
+
+### Fixed
+- Long-running heartbeat notices now update the same timeline entry via `notice_id` instead of appending repeated entries.
+- Native Feishu adapter `send()` and `edit_message()` wrappers now try notice card delivery first and fall back to Hermes native text/edit paths if the sidecar is unavailable or the notice is not recognized.
+- Fixed an empty slash-command parsing edge case in the Feishu adapter patch path so normal Feishu messages with `get_command() == ""` do not trip command-card installation.
+
+### Tests
+- Added unit and integration coverage for `system.notice` schema parsing, session timeline updates, independent notice cards, compact notice rendering, sidecar card creation, Feishu adapter send interception, independent fallback, and heartbeat edit updates.
+
+## V3.8.7 — 2026-07-02
+
+See also: [docs/release-notes-v3.8.7.md](docs/release-notes-v3.8.7.md)
+
+### Fixed
+- Fixed issue #75 for newer Hermes event streams that can start with `answer.delta`, `thinking.delta`, `tool.updated`, or `message.completed` without a prior `message.started`. The sidecar now creates the card session and sends the initial Feishu/Lark card from those first events instead of ignoring the whole stream.
+- Preserved the existing cron completion behavior while sharing the same first-event session creation path, including card summary and terminal diagnostics.
+
+### Tests
+- Added regression coverage for missing-`message.started` first events across answer delta, thinking delta, tool update, and completed answer cases.
+
+## V3.8.6 — 2026-07-02
+
+See also: [docs/release-notes-v3.8.6.md](docs/release-notes-v3.8.6.md)
+
+### Fixed
+- Fixed issue #70 Docker/source-stripped installs where Hermes has `gateway/run.py` but no top-level `VERSION` file and no local `.git` tag metadata. `doctor --explain`, `install`, and `setup` now fall back to verified Gateway code anchors instead of failing with `Hermes VERSION missing, unknown, or invalid`.
+- When the fallback is used, diagnostics now report `version_source: gateway anchors`, `version: unknown`, and the inferred `hook_strategy` (`gateway_run_013_plus` for modern Hermes anchors, `legacy_gateway_run` for legacy anchors).
+- Added Hermes v0.18.0 / `v2026.7.1` compatibility coverage; it stays on `gateway_run_013_plus`.
+
+### Changed
+- Docker examples now default to `HFC_VERSION=v3.8.6`.
+- README showcase image now uses the combined horizontal real-UI card collage for command cards, command result feedback, and the answer/tool timeline.
+
+### Tests
+- Added regression coverage for missing-`VERSION` Hermes roots with legacy and modern Gateway anchors, explicit invalid VERSION rejection, and parent-git-tag isolation while still accepting verified anchors.
+
+## V3.8.5 — 2026-07-02
+
+See also: [docs/release-notes-v3.8.5.md](docs/release-notes-v3.8.5.md)
+
+### Fixed
+- Fixed the always-allowed slash-command path: when Hermes executes `/new`, `/reset`, `/clear`, `/undo`, `/stop`, or direct `/model <model>` without asking for confirmation, Feishu/Lark now receives the command result as an interactive card instead of gray native text.
+- Removed the extra direct `message.update` attempt for interactive command-card callbacks. Feishu callback responses now own the in-place card update, avoiding invalid `msg_type=interactive` update warnings.
+- Updated the Gateway hook patch so Feishu command-card installation receives the current `event`, allowing command result cardification without touching unrelated normal replies.
+
+### Changed
+- `/update` remains intentionally outside command-result cardification, preserving Hermes' background upgrade behavior.
+- Patcher upgrade handling accepts the V3.8.4 command-card hook block and rewrites it to the V3.8.5 `event=event` form during install.
+
+### Tests
+- Added regression coverage for always-allowed `/new` command result cards, one-shot command-result context consumption, `/update` plain-text preservation, callback-only command-card updates, and legacy command-card hook upgrade compatibility.
+
+## V3.8.4 — 2026-07-01
+
+See also: [docs/release-notes-v3.8.4.md](docs/release-notes-v3.8.4.md)
+
+### Fixed
+- Fixed the Feishu/Lark WebSocket long-connection path for standalone slash command cards. Local/private sidecar deployments no longer have to fall back to gray Hermes native text for `/new`, `/reset`, `/undo`, and similar slash confirmations.
+- Added a native Feishu adapter `send_slash_confirm(...)` monkeypatch that renders interactive cards and resolves clicks through Hermes `tools.slash_confirm.resolve(...)`.
+- Added a native Feishu adapter `/model` picker path for WebSocket deployments. Model choices render as Feishu interactive card buttons and call Hermes' original `on_model_selected` callback.
+- Skipped the sidecar `interaction.requested` pre-card whenever Feishu WebSocket-native command cards are available, preventing `/new` from showing both a sidecar choice card and a native button card.
+- Repaired stale in-process install markers so an upgraded Gateway class cannot silently keep missing `send_slash_confirm(...)` and fall back to text.
+
+### Changed
+- Command-card action handling now wraps Feishu `_on_card_action_trigger` and only consumes plugin-owned `hfc_action` values; existing Hermes approval/update card actions continue to use the original adapter path.
+- Release and installer documentation now explicitly describe Feishu/Lark WebSocket long-connection behavior instead of implying that slash command cards require a public HTTP callback.
+- Failed native slash-card sends now emit a local warning instead of silently degrading, making real-environment diagnosis clearer.
+
+### Tests
+- Added regression coverage for native Feishu slash confirmation card sending, sidecar-skip behavior, stale install-marker repair, slash card action resolution, native model picker card sending, and model picker action resolution.
+
+## V3.8.3 — 2026-07-01
+
+See also: [docs/release-notes-v3.8.3.md](docs/release-notes-v3.8.3.md)
+
+### Added
+- Added standalone Feishu command-card handling for Hermes slash confirmations such as `/new`, `/reset`, `/undo`, and high-cost `/model <model>` confirmation prompts.
+- Added a Feishu-only `send_model_picker(...)` adapter method when Hermes asks the Feishu adapter to render `/model` choices and the native adapter has no picker implementation.
+- Added async command-card polling and terminal command-card completion updates without blocking the Hermes Gateway event loop.
+
+### Changed
+- Slash-command cards are intentionally separate from active Agent streaming cards. Approval, clarify, and Agent-turn options remain attached to the active card; independent slash commands render their own command surfaces.
+- `/update` remains Hermes's background upgrade command and does not render an interactive command card.
+
+### Fixed
+- If command-card posting, polling, or completion updates fail, Hermes falls back to its native text path instead of swallowing command results.
+- Local/private text fallback no longer creates a residual command card before handing slash confirmation back to Hermes native text prompts.
+- Gateway patching now installs Feishu command-card adapter methods before slash command dispatch while preserving idempotent patch/remove behavior.
+
+### Tests
+- Added unit/integration coverage for async slash-confirm card requests, model picker callbacks, command-card completion events, text-mode native fallback non-application, patch insertion/removal, and fallback-preserving slash confirm flow.
+
+## V3.8.2 — 2026-07-01
+
+See also: [docs/release-notes-v3.8.2.md](docs/release-notes-v3.8.2.md)
+
+### Fixed
+- Pre-tool `answer.delta` blocks now stay in the primary card body while tools run, and are archived into the auxiliary timeline only when the next answer block or terminal answer arrives.
+- Terminal cards strip archived intermediate-answer prefixes from completed answers, keeping the final response clean in the primary content area.
+- Raw `thinking.delta` remains internal stream state instead of leaking into the main content area or auxiliary timeline.
+
+### Changed
+- Auxiliary timeline rendering now separates reasoning and tool entries into compact elements: reasoning uses `small`, tools use `x-small` quoted markdown, with lighter visual hierarchy for long command details.
+- README screenshots now use the latest V3.8.2 collapsed and expanded real Feishu card examples.
+- E2E preview generation now reads all timeline panel elements after per-entry rendering.
+
+### Tests
+- Added regression coverage for delayed pre-tool answer folding, terminal prefix stripping, compact timeline hierarchy, and updated server/render/preview expectations.
+
+## V3.8.1 — 2026-07-01
+
+See also: [docs/release-notes-v3.8.1.md](docs/release-notes-v3.8.1.md)
+
+### Added
+- Added read-only Feishu-side diagnostics commands: `/hfc help`, `/hfc status`, `/hfc doctor`, and `/hfc monitor`.
+- Added Gateway runtime knobs for high-frequency delta coalescing: `HERMES_FEISHU_CARD_DELTA_COALESCE_MS`, `HERMES_FEISHU_CARD_DELTA_COALESCE_CHARS`, and `HERMES_FEISHU_CARD_DELTA_COALESCE_MAX_PENDING`.
+
+### Fixed
+- issue #74: high-frequency `thinking.delta` / `answer.delta` bursts are now coalesced inside the Hermes Gateway process before reaching the sidecar, reducing stream-reader thread pressure that could trigger `Stream stale for 180s`.
+- Terminal events now flush pending coalesced deltas before rendering `message.completed` / `message.failed`, preventing missing tail content at finalization.
+- Existing installed hook blocks from V3.8.0 and earlier are still recognized during upgrade/remove even though V3.8.1 adds command handling to the hook.
+- `/messages/{message_id}/summary` now returns hashed diagnostic ids instead of raw `chat_id` or Feishu message ids.
+
+### Tests
+- Added regression coverage for DeepSeek/Qwen-style high-frequency delta coalescing, terminal pre-flush, `/hfc` command interception, patcher upgrades, sidecar command cards, and summary redaction.
+
+## V3.8.0 — 2026-07-01
+
+See also: [docs/release-notes-v3.8.0.md](docs/release-notes-v3.8.0.md)
+
+### Added
+- Separated the primary answer area from the reasoning/tool timeline so the card keeps the final response prominent while auxiliary progress remains readable.
+- Added card update metrics for queue depth, burst coalescing, terminal drain latency, and Feishu update latency to make streaming regressions easier to observe.
+- Added a V3.8.0 card screenshot to the README homepage and refreshed install, upgrade, and Docker examples for the new release.
+
+### Fixed
+- Burst update coalescing now merges queued card refreshes more aggressively, reducing duplicated PATCH churn during fast thinking/tool bursts.
+- Terminal completion now drains pending updates before rendering the final card, preventing stale intermediate content from winning the last PATCH.
+- Long Markdown tables and fenced code blocks keep safe structural boundaries across card chunking, reducing raw Markdown leaks and half-open fences.
+- The bottom tool-call summary is hidden when the auxiliary timeline is visible, preventing duplicate "N tool calls" sections.
+- Runtime import diagnostics now execute from the Hermes project root, preventing current-repo `PYTHONPATH` false positives.
+
+### Docs
+- Added `docs/release-notes-v3.8.0.md` and refreshed release-planning notes for the V3.8.x line.
+
+## V3.7.0 — 2026-06-29
+
+### Added
+- issue #70: added `install-docker.sh` for existing Hermes Docker containers with `/opt/hermes`, `/opt/data`, and Hermes venv Python assumptions.
+- Added `docker-compose.example.yml` as a non-official Compose example for bind/volume layout and non-interactive installer execution.
+- Release packages now include Docker install assets.
+
+### Tests
+- Added Docker installer script coverage, Compose example checks, release packaging coverage, and docs assertions.
+
+## V3.6.6 — 2026-06-26
+
+### Fixed
+- issue #67: terminal Hermes events now ACK before slow Feishu card PATCH calls finish, while the card update continues in the background. This prevents interrupted or backlogged sessions from making Hermes fall back to a duplicate native text reply while the streaming card still updates.
+- issue #67: `emit_from_hermes_locals_async()` now reads the sidecar JSON response and only reports delivery when `ok` and `applied` are not false, so stale or unapplied terminal events no longer masquerade as successful card delivery.
+- issue #68: when `--hermes-dir` points to a directory without `gateway/run.py`, Hermes detection reads `hermes -V`, extracts the CLI `Project:` path, and surfaces a concrete `Use --hermes-dir ...` recommendation in `doctor --explain` / install diagnostics.
+
+### Tests
+- Added regression coverage for slow terminal Feishu PATCH ACK behavior, sidecar `applied` handling in the Hermes async hook, and wrong `--hermes-dir` diagnostics using a mocked Hermes CLI.
+
+## V3.6.5 — 2026-06-23
+
+### Fixed
+- issue #64: `gateway_run_013_plus` now emits `message.started` with the same Feishu reply anchor used by streaming callbacks, so thread sessions no longer split across different `message_id` values and increment `events_ignored` with `events_applied=0`.
+- issue #65: completed-only / burst-output models such as DeepSeek can now backfill the final answer from `agent_result.final_response` when no `thinking.delta` or `answer.delta` events were emitted before `message.completed`.
+- Added sidecar regression coverage proving a card created by `message.started` updates and completes correctly when the only content-bearing event is `message.completed`.
+
+### Docs
+- Added V3.6.5 release notes and refreshed install/readiness examples for the new tag.
+
+## V3.6.4 — 2026-06-22
+
+### Fixed
+- issue #61: Feishu thread messages now keep the initial streaming card inside the originating thread by carrying `thread_id` through the event protocol and using the Feishu reply API with `reply_in_thread: true` when a reply anchor is available.
+- issue #62: cron jobs with `deliver: "feishu:oc_xxx"` now parse the chat id from the `deliver` field, allowing scheduled Feishu deliveries to render as cards instead of falling back to plain text.
+
+### Docs
+- Added V3.6.4 release notes and documented the optional event `thread_id` field used for Feishu thread routing.
+
+## V3.6.3 — 2026-06-21
+
+### Fixed
+- issue #59: patcher now prefers Hermes v0.17.0+ / `v2026.6.19+` `_run_agent_inner` when injecting streaming callbacks, so tool, answer, thinking, clarify, and approval hooks are no longer skipped when `_run_agent` is only a wrapper.
+- issue #57: `card.interaction_mode: auto` now switches localhost/private sidecars to text-choice fallback, and the Hermes hook stops polling for unreachable Feishu Card Action callbacks in that mode.
+- issue #56: non-Feishu platforms such as Telegram are ignored before runtime event construction, keeping native Telegram delivery untouched after hook installation.
+- issue #58: Windows `HERMES_HOME` profile paths under both `hermes/profiles/<id>` and `.hermes/profiles/<id>` now resolve the correct profile id.
+- Extracted PR #52's useful Windows/proxy fixes: local/private sidecar calls bypass system proxies while public sidecar URLs keep default proxy behavior, and sidecar PID stop/status uses a Windows-specific path instead of POSIX process groups.
+
+### Docs
+- Added V3.6.3 release notes, README compatibility guidance for Hermes v0.17.0+ / `v2026.6.19+`, and `card.interaction_mode` config documentation.
+
+## V3.6.2 — 2026-06-16
+
+### Fixed
+- issue #53: `install` / `setup` now detects the Hermes Gateway runtime venv Python and installs `hermes-feishu-streaming-card` into that interpreter before patching `gateway/run.py`.
+- Hermes hook import/emit failures are no longer completely silent; injected hook blocks still fail open, but now write a diagnostic `[hermes-feishu-card] hook failed: ...` warning to Hermes stderr.
+- `doctor --json` and `doctor --explain` now report `runtime_import`, including whether Hermes runtime Python can import `hermes_feishu_card.hook_runtime`.
+
+### Docs
+- Documented Hermes venv deployment behavior and installer safety expectations in README and installer safety docs.
+- Kept `.env` search expansion out of this release scope; it remains a separate follow-up item from the venv runtime installation fix.
+
+## V3.6.1 — 2026-06-06
+
+### Fixed
+- issue #47: Hermes semver `VERSION` values without a `v` prefix, such as `0.15.1`, are now parsed correctly instead of being reported as unsupported.
+- Hermes `0.15.x` / `v0.15.x` now uses the existing `gateway_run_013_plus` hook strategy when the required `gateway/run.py` anchors are present.
+
+### Tests
+- Added release-matrix coverage for `0.13.0`, `0.14.0`, `0.15.1`, and `v0.15.1`.
+- Added a `doctor --explain` regression test for Hermes `0.15.1` without the `v` prefix.
+
+## V3.6.0 — 2026-06-04
+
+### Added
+- Read-only `doctor --json` and `doctor --explain` diagnostics covering config, sidecar, Hermes version/anchors, streaming settings, install state, and actionable recommendations.
+- Safe `repair --hermes-dir ... --yes` and `setup --repair` flows for verifiable hook state recovery without overwriting user edits.
+- Structured attachment extraction for Hermes locals such as `attachments`, `files`, `media_files`, image/audio/video file objects, and URL/file dictionaries.
+- Profile-scoped operations: `smoke-feishu-card --profile-id`, `bots test --profile-id`, clearer CLI `status` routing output, and `/health.routing.profiles`.
+- Hermes compatibility release matrix coverage for `v2026.4.23`, `v2026.5.7`, `v2026.5.16+`, `v2026.5.29`, `0.13.x`, and `0.14.x`.
+- `docs/release-notes-v3.6.0.md` and refreshed release-readiness docs for operations-focused publishing.
+
+### Fixed
+- Repairable missing manifest/backup states are now detected and explained instead of leaving users with opaque `run.py changed since install` failures.
+- Cards retain attachment summaries while the hook keeps Hermes native media/file delivery paths unsuppressed.
+- Multi-profile routing diagnostics now show profile-level bot counts, chat bindings, last route, last route error, and event counters.
+
+### Tests
+- Added regression coverage for doctor JSON/explain output, repair refusal/recovery paths, structured media/file events, profile-targeted smoke commands, health routing grouping, Hermes release matrix fixtures, release asset dry-run guards, and documentation constraints.
+
+## V3.5.2 — 2026-06-04
+
+### Added
+- Cross-platform installers: `install.sh` for macOS/Linux and `install.ps1` for Windows PowerShell.
+- One-line install entry points in the Chinese and English README homepages.
+- GitHub Release asset packaging workflow for macOS/Linux tarballs, Windows zip packages, and SHA-256 checksums.
+- `README-install.md` and `docs/release-notes-v3.5.2.md` for packaged installer usage and release publishing.
+- V3.6.0 roadmap documentation focused on repair diagnostics, media/file delivery, multi-profile operations, and release/E2E matrices.
+
+### Fixed
+- `install.sh` no longer sources the whole `.env` file. It now reads only Feishu/sidecar-related variables, so unrelated values with spaces such as browser paths do not break macOS installs.
+- `install.sh` detects uv/PEP 668 `externally-managed-environment` Python errors and retries pip installation with `--break-system-packages`, keeping the failure mode explicit while allowing one-line installs on uv-managed macOS Python.
+
+### CI
+- Added a Windows GitHub Actions job that parses `install.ps1` with PowerShell AST validation.
+- Added installer regression tests for safe `.env` parsing and externally managed Python retry behavior.
+- Added documentation tests for one-line install commands and Release asset workflow coverage.
+
+## V3.5.1 — 2026-06-01
+
+### Fixed
+- Feishu card updates are now ordered end-to-end for the same message id, covering Hermes runtime sends, interaction requests, sidecar state updates, and terminal card patches so thinking/answer text no longer rolls back or truncates under backlog.
+- Sidecar non-terminal updates are coalesced and acknowledged quickly while terminal events remain awaited, improving perceived streaming speed and preventing a long update backlog from outliving `message.completed`.
+- Feishu JSON 2.0 interaction buttons now use direct `button` elements with `behaviors.callback`, fixing card PATCH failures when approval/choice buttons render inside an active card.
+- Queued follow-up completions now emit `message.completed` into the card path and suppress native resend once the Feishu card is delivered, preventing final answers from spilling into gray plain-text messages.
+- Runtime delta extraction preserves raw boundary spaces for `thinking.delta` and `answer.delta`, preventing sentence/code spacing loss while streaming.
+- `load_config()` reads a `.env` file next to the selected config file before applying real process environment variables, preventing manual sidecar restarts from silently entering no-op mode when Feishu credentials live beside Hermes config.
+
+### Docs
+- Reorganized the Chinese README homepage around the V3.5.x value proposition, live user scenarios, installation/upgrade flow, troubleshooting, and version history.
+
+### Tests
+- Added regression coverage for ordered runtime sends, interaction event retries on transient sidecar state, Feishu JSON 2.0 button callback payloads, queued follow-up suppression, `.env` config fallback, and update coalescing.
+
+## V3.5.0 — 2026-06-01
+
+### Added
+- Feishu card interaction loop for Hermes approval and choice prompts: `interaction.requested` renders buttons in the active card, `/card/actions` records the user's selection, and the Hermes hook polls `/interactions/{interaction_id}` so the original task can continue.
+- Patcher support for Hermes `v0.14.0` / `v2026.5.16+` approval and clarify callbacks.
+
+### Fixed
+- issue #41: multi-reply/newer Hermes streaming flows keep final answers on the card path instead of falling back to native text after the first reply.
+- PR #42: cron card delivery now prioritizes `job['deliver']` and scheduler-resolved Feishu targets over stale `origin.platform` metadata.
+- Long single Markdown tables and fenced code blocks are split into valid repeated table/code chunks when they exceed `MAIN_CONTENT_CHUNK_CHARS`, preventing raw Markdown rendering in Feishu.
+- Thinking/interim assistant text is emitted as complete `append_block` chunks so sentences are not truncated, glued, or dropped by delta-style accumulation.
+
+### Tests
+- Added regression coverage for interaction event parsing, session state, card buttons, Feishu callback resolution, Hermes hook polling, cron deliver precedence, long table/code chunking, and thinking append-block behavior.
+
+## V3.4.3 — 2026-05-27
+
+### Fixed
+- issue #39: blank or whitespace-only `message.completed` answers no longer clear an answer that already arrived through `answer.delta`, preventing DeepSeek V4 Pro tool-call flows from ending with an empty Feishu card.
+- Long Markdown card content is split at paragraph, table, and fenced-code boundaries instead of raw character offsets, so Feishu does not render split table/code fragments as broken raw Markdown.
+- issue #34 follow-up: compatibility tests now cover Hermes `v0.14.0` / `v2026.5.16+` selecting the `gateway_run_013_plus` strategy, while `v2026.4.x` remains on `legacy_gateway_run`.
+
+### Tests
+- Added regression coverage for blank completed answers after streamed deltas, Markdown-aware card splitting, Hermes `v0.14.0`, and Hermes `v2026.4.30`.
+
+## V3.4.2 — 2026-05-21
+
+### Fixed
+- issue #31: Feishu card PATCH updates are now serialized per session so older card snapshots cannot land after newer content and cause thinking/answer text to flicker or roll back.
+- Concurrent Hermes callback events now allocate per-message sequence numbers under a lock, preventing duplicate sequence ids that could make valid `thinking.delta` / `answer.delta` chunks look stale.
+
+### Tests
+- Added regression coverage for out-of-order PATCH completion and concurrent runtime sequence allocation.
+
+## V3.4.1 — 2026-05-14
+
+### Fixed
+- issue #25: Hermes v2026.5.7 started hooks now treat `event_message_id` as an explicit message id, keeping `message.started` and `message.completed` on the same card lifecycle.
+- Fallback preview now reuses the active fallback cache, so `_preview_fallback_message_id` and `_create_active_fallback_message_id` do not drift when `created_at` is missing.
+
+### Tests
+- Added regression coverage for Hermes v2026.5.7-style started locals and untokened fallback preview/create lifecycle consistency.
+
+## V3.4.0 — 2026-05-10
+
+### Added
+- Hermes 0.13+ compatibility strategy: installer and `doctor` select/report the `gateway_run_013_plus` hook strategy from Hermes version and code anchors.
+- Per-bot/profile titles: card titles can be set globally, per profile, or per bot, with bot-level titles taking precedence.
+- Cron final card delivery for scheduled Hermes runs.
+- Attachment summaries with native media delivery, keeping summaries in cards while media uses Feishu-native delivery.
+- Card reply context so reply cards retain the routing/context needed by the sidecar.
+
+### Fixed
+- issue #23: multi Hermes profile + multi Feishu bot deployments now preserve explicit profile identity and route to the intended bot.
+
+### Compatibility
+- Older Hermes strategy preserved: Hermes `v2026.4.23` through `0.12.x` continues to use `legacy_gateway_run`.
+- `doctor` now exposes `hook_strategy`, `compatibility`, and anchor diagnostics to make install decisions auditable before writing hooks.
+
+## [3.3.0] - 2026-05-01
+
+### Fixed
+- **#15 - COMPLETE_PATCH platform check**: `_render_complete_hook_block` and `_render_previous_async_complete_hook_block` now gate `return None` behind `source.platform.value == "feishu"`, preventing the complete hook from swallowing responses on QQ/WeChat/DingTalk etc. (`install/patcher.py`)
+- **#18b - Tool count accuracy**: `CardSession.tool_count` now returns actual cumulative call count instead of deduplicated unique tool count. Added `_tool_call_count` field that increments on every `tool.updated` event. (`session.py`)
+- **#10 - Card table limit**: Markdown tables exceeding Feishu's 5-table-per-card limit are now truncated with a notice appended. Added `count_markdown_tables()` and `MAX_CARD_TABLES` constant. (`text.py`, `render.py`)
+
+### Added
+- **#18a - DeepSeek `<thinking>` tag support**: `THINK_TAG_RE` and `THINK_TAGS` now include `<thinking>`/`</thinking>` tags alongside `<think>`/`</think>` for DeepSeek-compatible reasoning content normalization. (`text.py`)
+- **#18c - Footer spinner animation**: Non-terminal card footer now shows a rotating braille spinner instead of static "生成中". Frame driven by `time.time()`, no extra API calls. (`render.py`)
+- **#16 - Multi-profile support**: A single sidecar process can now serve multiple Hermes profiles with independent Feishu credentials, session isolation, and per-profile bot routing. Backward compatible — single profile behavior unchanged. (`config.py`, `runner.py`, `server.py`)
+
+### Changed
+- `_render_footer()`: "生成中" static text replaced with `_spinner_text("生成中")`
+- `CardSession`: `_tool_call_count` field tracks actual call count; `tool_count` property reflects cumulative count while `tools` dict retains unique tool states
+- `_render_complete_hook_block` / `_render_previous_async_complete_hook_block`: platform check added before `return None`
+- `build_feishu_boundary()`: now detects profiles and delegates to `_build_multi_profile_boundary()` when configured
+- `_apply_event_locked()`: uses composite `profile_id:message_id` session keys when profiles are active
+- `_resolve_route()` / `_client_for_bot()`: profile-aware routing with dict-based factory selection
+
+## [3.2.1] - 2026-04-29
+
+### Fixed
+- **HTTP Accept-Encoding header**: Add `Accept-Encoding: gzip, deflate` to Feishu API requests to avoid `ClientPayloadError: Can not decode content-encoding: br` when Feishu returns brotli-compressed responses (aiohttp limitation). Fix in `feishu_client.py` by setting request headers, not relying on server's `content-encoding` auto-decoding.
+
+### Changed
+- `feishu_client.py`: HTTP client now explicitly requests gzip/deflate encoding; brotli responses from Feishu are avoided at the server side by this header.
+
+## [3.2.0] - 2026-04-29
+
+### Added
+- **Multi-bot registry**: `bots` section in config to define multiple Feishu bots with `app_id`/`app_secret`
+- **Chat-to-bot bindings**: `bindings.chats` maps `chat_id` → `bot_id`, with `fallback_bot` for unbound sessions
+- **Group rules framework**: `bindings.group_rules` section reserved for future group trigger filtering (V3.2 no-op)
+- **Bot management CLI**: `hermes_feishu_card.cli bots` with `list`, `show`, `add`, `remove` commands
+- **Sidecar routing diagnostics**: `/health.routing` exposes `bot_count`, `chat_binding_count`, `last_route`, `bots[]` details
+- **Optional routing context extraction**: `hook_runtime._event_data()` now extracts `chat_type`, `tenant_key`, `agent_id`, `profile_id` from `message.started` for future features
+
+### Changed
+- `runner.py`: Uses `FeishuBoundary` with `BotRegistry.resolve()` to route events to bot-specific `FeishuClient`
+- `server.py`: Adds bot lookup via `registry.resolve(RoutingContext(...))` before sending card updates
+- `config.py`: Adds `bots`, `bindings`, `group_rules` schema validation with defaults
+- `cli.py`: New `bots` command group with management subcommands and `--config` flag
+- Package version: `3.1.0` → `3.2.0`
+
+### Fixed
+- `runner.py`: Ensure `NoopFeishuClient` path respects absent credentials without breaking
+- `cli.py`: Default bot name resolution respects config-defined default item name
+- `server.py`: Bot resolution gracefully falls back to `default_bot` when no binding matches
+
+### Docs
+- `README.md` / `README.en.md`: New "V3.2 多 bot 与群聊" section with config examples and CLI usage
+- `config.yaml.example`: Full `bots` + `bindings` + `group_rules` sample
+- Test suite updated to 398 tests (unit + integration coverage for bots, routing, config)
+
+## [3.1.0] - 2026-04-XX
+
+### Added
+- Sidecar architecture: standalone aiohttp server for Feishu CardKit HTTP client
+- Streaming card updates: `thinking.delta`, `answer.delta`, `tool.updated`, `message.completed/failed`
+- Health endpoint (`/health`) with metrics and diagnostics
+- Auto-recovery: retry with exponential backoff on transient failures
+- Fail-open: Hermes continues with plain text if sidecar unavailable
+- Installation wizard with version and structure guardrails
+- Uninstall/restore hooks preserving user modifications
+
+### Changed
+- `feishu_streaming_card.mode: sidecar` in Hermes config (replaces `enabled: true`)
+- Card rendering offloaded from Hermes process to sidecar
+- Footer fields configurable via `card.footer_fields` (default: duration/model/tokens/context)
+
+### Fixed
+- Long card body splitting into multiple Markdown elements for 16k+ Chinese characters
+- `<think>`/`</think>` tags stripped from streaming content
+- Duplicate native text message suppression on completion
+
+(Placeholder entries below for future minor/patch releases)
+
+## [3.1.1] - TBD
+- Patch notes...
+
+## [3.0.0] - 2026-04-XX
+Initial public release of the sidecar architecture. (Previous versions were v2.x monolith hook inside Hermes.)

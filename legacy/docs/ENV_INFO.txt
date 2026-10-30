@@ -1,0 +1,25 @@
+# Hermes Environment Info
+# Generated: 2026-04-17
+
+HERMES_HOME: /Users/bailey/.hermes
+HERMES_AGENT_DIR: /Users/bailey/.hermes/hermes-agent
+VENV: /Users/bailey/.hermes/hermes-agent/venv/bin/python3
+
+# Config
+config.yaml: /Users/bailey/.hermes/config.yaml
+.env: /Users/bailey/.hermes/.env
+
+# Sidecar
+sidecar_config: /Users/bailey/.hermes/feishu-sidecar.yaml
+sidecar_log: /Users/bailey/.hermes/logs/feishu-sidecar.log
+
+# Gateway
+gateway_pid: /Users/bailey/.hermes/gateway.pid
+gateway_logs: /tmp/hermes-gateway-*.log
+
+# Processes (current)
+gateway: PID 87647
+sidecar: PID 28851
+
+# Ports
+sidecar: 8765

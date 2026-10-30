@@ -1,0 +1,1117 @@
+from __future__ import annotations
+
+from .observations import TurnObservation
+from .turn_metrics import RATE_MIN_OUTPUT_TOKENS, completion_output_rate, metric_count
+
+from dataclasses import dataclass, field, replace
+from copy import deepcopy
+import json
+import math
+import re
+import secrets
+import time
+from typing import Any, Dict, Optional
+from types import MappingProxyType
+from urllib.parse import urlsplit
+
+from .card_timeline import CardTimeline, TERMINAL_TOOL_STATUSES
+from .events import SidecarEvent
+from .native_handoff import NativeHandoffRecord
+from .status import StatusConfig, resolve_display_status
+from .text import StreamingTextNormalizer, normalize_stream_text
+from .display_segments import append_answer, begin_continuation, record_terminal, update_thinking
+
+
+MIN_COMPLETED_SUFFIX_CHARS = 20
+MIN_COMPLETED_SUFFIX_RATIO_DENOMINATOR = 5
+MIN_PRESERVED_STREAMED_ANSWER_CHARS = 64
+MAX_SHORT_COMPLETION_POSTSCRIPT_CHARS = 240
+MIN_STREAMED_ANSWER_TO_POSTSCRIPT_RATIO = 3
+
+# Unsuccessful turn outcomes (the gateway reports these once the provider/API call
+# failed, the turn was interrupted, or no completion was confirmed).  On these the
+# completed "answer" is only an error notice, so it must be appended to whatever
+# already streamed instead of replacing it — otherwise the card blanks out the
+# answer the user was watching.  The notices double as the membership set so the
+# two can never drift apart.  (#307)
+_UNSUCCESSFUL_TURN_OUTCOME_NOTICES = {
+    "failed": "本轮执行失败，任务完成情况请以实际结果为准。",
+    "interrupted": "本轮已中断，任务尚未确认完成。",
+    "incomplete": "本轮已结束，但 Hermes 未报告执行完成。",
+}
+_UNSUCCESSFUL_TURN_OUTCOMES = frozenset(_UNSUCCESSFUL_TURN_OUTCOME_NOTICES)
+
+_RUNTIME_ACTION_PREFIX_RE = re.compile(
+    r"^(?:正在)?(?:读取|执行(?:终端)?|编辑|写入|搜索|查询|浏览|访问|打开)\s*[:：]?\s*",
+    re.IGNORECASE,
+)
+_SEARCH_SITE_OPERATOR_RE = re.compile(r"(?:^|\s)site:\S+", re.IGNORECASE)
+_FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _truthy_flag(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return False
+
+
+def _exact_feishu_open_id(value: object) -> str:
+    return (
+        value
+        if type(value) is str and _FEISHU_OPEN_ID_RE.fullmatch(value)
+        else ""
+    )
+
+
+@dataclass
+class ToolState:
+    tool_id: str
+    name: str
+    status: str
+    detail: str = ""
+    started_at: float | None = None
+    # Which tool call this is, 1-based, counted across the session. Rendered as #N so a card
+    # showing one row out of many says WHICH call the reader is looking at.
+    ordinal: int = 0
+    # Retained after completion and in private display checkpoints.
+    duration_ms: float | None = None
+    # Explicit executor identity; a legacy tool name is not a call identity.
+    call_id: str = ""
+
+
+@dataclass
+class InteractionOption:
+    label: str
+    value: str
+    style: str = "default"
+
+
+@dataclass
+class InteractionState:
+    interaction_id: str
+    kind: str
+    prompt: str
+    description: str = ""
+    status: str = "pending"
+    options: list[InteractionOption] = field(default_factory=list)
+    callback_token: str = ""
+    multi_select: bool = False
+    allow_custom_input: bool = False
+    timeout_seconds: float = 300.0
+    requested_at: float = field(default_factory=_now)
+    choice: str = ""
+    choice_label: str = ""
+    user_name: str = ""
+    error: str = ""
+    pause_on_timeout: bool = False
+    pause_generation: int = 0
+    pause_notified_generation: int = 0
+    pause_retry_after: float = 0.0
+    last_waiter_poll_at: float = 0.0
+    thread_id: str = ""
+    reply_to_message_id: str = ""
+    reply_in_thread: bool = False
+    runtime_admission: object | None = field(default=None, repr=False)
+    runtime_turn_id: str = field(default="", repr=False)
+    # Ephemeral delivery evidence; active_interaction is excluded from checkpoints.
+    runtime_delivery_fingerprint: str = field(default="", repr=False)
+    # The approval card's own Feishu message id, recorded when the card is delivered. A timed-out
+    # approval refreshes THAT card in place instead of sending a second paused card (#314).
+    feishu_message_id: str = ""
+    # Set only after an explicit successful PATCH of the complete standalone receipt.
+    receipt_fingerprint: str = ""
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "InteractionState":
+        admission = self.runtime_admission
+        copied_admission = (
+            MappingProxyType(deepcopy(dict(admission), memo))
+            if admission is not None
+            else None
+        )
+        copied = replace(
+            self,
+            options=deepcopy(self.options, memo),
+            runtime_admission=copied_admission,
+        )
+        memo[id(self)] = copied
+        return copied
+
+    @property
+    def expires_at(self) -> float:
+        return self.requested_at + max(0.0, float(self.timeout_seconds))
+
+    def is_expired(self, now: float | None = None) -> bool:
+        checked_at = _now() if now is None else float(now)
+        return self.status == "pending" and checked_at >= self.expires_at
+
+    def expire(self, now: float | None = None) -> bool:
+        checked_at = _now() if now is None else float(now)
+        if not self.is_expired(checked_at):
+            return False
+        if self.pause_on_timeout and self.kind == "approval" and self.runtime_admission is None:
+            self.status = "paused"
+            self.error = "审批窗口已过期，任务已暂停。请查看完整操作后继续审批。"
+            self.callback_token = secrets.token_urlsafe(16)
+            self.pause_generation += 1
+        else:
+            self.status = "failed"
+            self.error = "交互已过期"
+        self.runtime_admission = None
+        return True
+
+
+@dataclass
+class CardSession:
+    conversation_id: str
+    message_id: str
+    chat_id: str
+    created_at: float = field(default_factory=_now)
+    updated_at: float = field(default_factory=_now)
+    status: str = "thinking"
+    display_status: str = ""
+    display_status_source: str = "session"
+    # Rendering-only context, never event authority or persisted execution state.
+    presentation_state: str = ""
+    last_sequence: int = -1
+    thinking_text: str = ""
+    answer_text: str = ""
+    # Event-sourced terminal notice when no real answer has arrived. Reasoning
+    # may be promoted for canonical/classic compatibility. Keep this field name
+    # for existing display checkpoints; never infer provenance from body text.
+    terminal_reasoning_notice: str = ""
+    latest_tool_preview: str = ""
+    runtime_phase_text: str = ""
+    tools: Dict[str, ToolState] = field(default_factory=dict)
+    tokens: Dict[str, Any] = field(default_factory=dict)
+    model: str = "Unknown"
+    provider: str = ""
+    context: Dict[str, Any] = field(default_factory=dict)
+    duration: float = 0.0
+    observation: TurnObservation = field(default_factory=TurnObservation, repr=False)
+    subscription_usage: str = ""
+    subscription_usage_checked: bool = False
+    attachments: list[dict[str, str]] = field(default_factory=list)
+    active_interaction: InteractionState | None = None
+    # At most 32 bounded static predecessor cards; never persisted or restored.
+    approval_retirements: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    delivery_kind: str = "chat"
+    reply_to_message_id: str = ""
+    reply_in_thread: bool = False
+    execution_scope: str = ""
+    chat_type: str = ""
+    sender_open_id: str = ""
+    sender_name: str = ""
+    completion_notify_state: str = "idle"
+    terminal_delivery_state: str = "idle"
+    notice_kind: str = ""
+    notice_title: str = ""
+    notice_level: str = "info"
+    terminal_disposition: str = ""
+    terminal_limit_reason: str = ""
+    terminal_handoff_record: NativeHandoffRecord | None = field(
+        default=None,
+        repr=False,
+    )
+    display_segment: dict[str, Any] = field(default_factory=dict)
+    # Non-empty only when the writable owner is the initial legacy receipt.
+    # Persist rendered static text, never InteractionState or callback tokens.
+    legacy_owner_receipt: dict[str, Any] = field(default_factory=dict)
+    _tool_call_count: int = field(default=0)
+    _process_activity: dict[str, dict] = field(default_factory=dict, repr=False)
+    _answer_archive_index: int | None = None
+    timeline: CardTimeline = field(default_factory=CardTimeline)
+    thinking_normalizer: StreamingTextNormalizer = field(default_factory=StreamingTextNormalizer)
+    answer_normalizer: StreamingTextNormalizer = field(default_factory=StreamingTextNormalizer)
+    # Immutable route provenance, populated by the server from the accepted
+    # event or checkpoint envelope. Logical turn IDs may contain colons.
+    route_profile_id: str | None = None
+
+    @property
+    def tool_count(self) -> int:
+        return self._tool_call_count
+
+    @property
+    def runtime_header_text(self) -> str:
+        interaction = self.active_interaction
+        if interaction is not None and interaction.status == "pending":
+            return normalize_stream_text(interaction.prompt).strip()
+        if self.status == "completed":
+            return ""
+        if self.runtime_phase_text:
+            return self.runtime_phase_text
+        return self.latest_tool_preview
+
+    @property
+    def visible_main_text(self) -> str:
+        if self.status in {"completed", "failed"}:
+            return self.answer_text
+        if self.answer_text:
+            return self.answer_text
+        return self.thinking_text
+
+    def refresh_display_status_source(
+        self, config: Optional[StatusConfig] = None
+    ) -> None:
+        resolved = resolve_display_status(self, config or StatusConfig.defaults())
+        self.display_status_source = resolved.source
+
+    def apply(
+        self,
+        event: SidecarEvent,
+        *,
+        advance_sequence: bool = True,
+    ) -> bool:
+        observed_at = time.monotonic()
+        previous_answer = self.answer_text
+        applied = self._apply_state(event, advance_sequence=advance_sequence)
+        if applied:
+            self.observation.observe(
+                event.event, now=observed_at,
+                answer_changed=(self.answer_text != previous_answer and bool(self.answer_text.strip())),
+            )
+        return applied
+
+    def _apply_state(
+        self, event: SidecarEvent, *, advance_sequence: bool = True,
+    ) -> bool:
+        if (
+            event.conversation_id != self.conversation_id
+            or event.message_id != self.message_id
+            or event.chat_id != self.chat_id
+        ):
+            return False
+        is_terminal_event = _is_terminal_session_event(event)
+        if event.sequence <= self.last_sequence and not is_terminal_event:
+            return False
+        if self.status in {"completed", "failed"}:
+            return False
+        execution_scope = event.data.get("execution_scope")
+        if type(execution_scope) is str and re.fullmatch(r"[0-9a-f]{64}", execution_scope):
+            self.execution_scope = execution_scope
+        chat_type = event.data.get("chat_type")
+        if isinstance(chat_type, str) and chat_type.strip().lower() in {"group", "dm", "p2p", "private"}:
+            self.chat_type = chat_type.strip().lower()
+        sender_open_id = _exact_feishu_open_id(event.data.get("sender_open_id"))
+        if sender_open_id:
+            if self.sender_open_id != sender_open_id:
+                self.sender_name = ""
+            self.sender_open_id = sender_open_id
+            sender_name = event.data.get("sender_name")
+            if (isinstance(sender_name, str) and 0 < len(sender_name) <= 80
+                    and not any(ord(c) < 32 or c in "<>" for c in sender_name)):
+                self.sender_name = sender_name
+        # Card-action callbacks are authenticated out-of-band transitions. They
+        # may complete an interaction while Hermes is already preparing the next
+        # batch clarify request, so they must not consume the transport sequence
+        # that the next gateway event will use.
+        if advance_sequence:
+            self.last_sequence = max(self.last_sequence, event.sequence)
+        if _truthy_flag(event.data.get("reply_in_thread")):
+            self.reply_in_thread = True
+
+        self.display_status = event.display_status
+        self.display_status_source = "explicit" if event.display_status else "session"
+        if event.event in {
+            "thinking.delta",
+            "answer.delta",
+            "tool.updated",
+            "message.completed",
+            "message.failed",
+        }:
+            self.runtime_phase_text = ""
+
+        if event.event == "thinking.delta":
+            mode = str(event.data.get("mode") or "delta").strip().lower()
+            raw_text = str(event.data.get("text", ""))
+            if mode == "replace":
+                normalized = normalize_stream_text(raw_text)
+                self.thinking_text = normalized
+                update_thinking(self, normalized, mode)
+            elif mode == "append_block":
+                text = normalize_stream_text(raw_text).strip()
+                if text:
+                    if self.thinking_text:
+                        self.thinking_text = self.thinking_text.rstrip() + "\n\n" + text
+                    else:
+                        self.thinking_text = text
+                    update_thinking(self, text, mode)
+            else:
+                delta = self.thinking_normalizer.feed(raw_text)
+                if delta:
+                    self.thinking_text += delta
+                    update_thinking(self, delta, mode)
+        elif event.event == "answer.delta":
+            delta = self.answer_normalizer.feed(str(event.data.get("text", "")))
+            if delta:
+                if self._answer_archive_index is not None:
+                    self._archive_current_answer_to_reasoning()
+                self.answer_text += delta
+                append_answer(self, delta)
+        elif event.event == "tool.updated":
+            tool_id = event.data.get("tool_id")
+            if not isinstance(tool_id, str) or not tool_id:
+                self.updated_at = time.time()
+                self.refresh_display_status_source()
+                return True
+            call_id = event.data.get("call_id")
+            call_id = call_id if isinstance(call_id, str) and 0 < len(call_id) <= 256 else ""
+            if call_id:
+                tool_id = call_id
+            if self.answer_text and self._answer_archive_index is None:
+                self._answer_archive_index = self.timeline.entry_count
+            name = event.data.get("name")
+            status = event.data.get("status")
+            resolved_name = name if isinstance(name, str) else tool_id
+            resolved_status = status if isinstance(status, str) else "running"
+            normalized_status = resolved_status.strip().lower()
+            is_terminal = normalized_status in TERMINAL_TOOL_STATUSES
+            previous_tool = self.tools.get(tool_id)
+            previous_is_terminal = (
+                previous_tool is not None
+                and previous_tool.status.strip().lower() in TERMINAL_TOOL_STATUSES
+            )
+            same_call = bool(call_id and previous_tool is not None and previous_tool.call_id == call_id)
+            if same_call and previous_is_terminal and not is_terminal:
+                # A higher transport sequence can still contain a late start.
+                # Explicit call identity prevents terminal state/count regression.
+                self.updated_at = time.time()
+                self.refresh_display_status_source()
+                return True
+            from .process_activity import enrich_process_detail
+            tool_data = enrich_process_detail(
+                event.data, self._process_activity,
+                observe=not (same_call and previous_is_terminal and is_terminal),
+            )
+            raw_preview = tool_data.get("detail")
+            if isinstance(raw_preview, str):
+                normalized_preview = normalize_stream_text(raw_preview).strip()
+                if normalized_preview:
+                    self.latest_tool_preview = _runtime_tool_summary(
+                        tool_data.get("name"), normalized_preview
+                    )
+            if previous_tool is None or (previous_is_terminal and not is_terminal):
+                started_at = None if is_terminal else event.created_at
+            else:
+                started_at = previous_tool.started_at
+            detail_data = tool_data
+            resolved_duration_ms = _tool_duration_milliseconds(tool_data)
+            if same_call and previous_is_terminal and resolved_duration_ms is None:
+                resolved_duration_ms = previous_tool.duration_ms
+                if resolved_duration_ms is not None:
+                    detail_data = dict(tool_data, duration_ms=resolved_duration_ms)
+            if (
+                is_terminal
+                and resolved_duration_ms is None
+                and started_at is not None
+                and event.created_at >= started_at
+            ):
+                detail_data = dict(tool_data)
+                resolved_duration_ms = (event.created_at - started_at) * 1000
+                detail_data["duration_ms"] = resolved_duration_ms
+            resolved_detail = _tool_detail_from_event_data(detail_data)
+            if (
+                is_terminal
+                and previous_tool is not None
+                and not _tool_event_has_primary_detail(tool_data)
+            ):
+                resolved_detail = _merge_tool_details(
+                    previous_tool.detail,
+                    resolved_detail,
+                )
+            if previous_tool is None or (previous_is_terminal and not same_call):
+                self._tool_call_count += 1
+                call_ordinal = self._tool_call_count
+            elif previous_tool.ordinal:
+                call_ordinal = previous_tool.ordinal
+            else:
+                # Pre-existing state (or a resumed session) with no ordinal recorded.
+                call_ordinal = self._tool_call_count
+            self.tools[tool_id] = ToolState(
+                tool_id=tool_id,
+                name=resolved_name,
+                status=resolved_status,
+                detail=resolved_detail,
+                started_at=started_at,
+                ordinal=call_ordinal,
+                duration_ms=resolved_duration_ms,
+                call_id=call_id,
+            )
+            self.timeline.record_tool(tool_id, resolved_name, resolved_status, resolved_detail,
+                                      replace_terminal=same_call)
+        elif event.event == "subagent.updated":
+            child_id = event.data.get("child_id")
+            if type(child_id) is str and child_id.strip():
+                role = event.data.get("role")
+                status = event.data.get("status")
+                resolved_role = (
+                    normalize_stream_text(role).strip()[:240]
+                    if type(role) is str
+                    else ""
+                )
+                resolved_status = (
+                    status.strip().lower()[:64]
+                    if type(status) is str and status.strip()
+                    else "running"
+                )
+                detail_lines: list[str] = []
+                preview_key = (
+                    "summary_preview"
+                    if type(event.data.get("summary_preview")) is str
+                    else "goal_preview"
+                )
+                preview = event.data.get(preview_key)
+                if type(preview) is str:
+                    safe_preview = normalize_stream_text(preview).strip()[:240]
+                    if safe_preview:
+                        detail_lines.append(safe_preview)
+                duration_ms = _subagent_duration_milliseconds(
+                    event.data.get("duration_ms")
+                )
+                if duration_ms is not None:
+                    detail_lines.append(f"耗时: {_duration_milliseconds_text(duration_ms)}")
+                self.timeline.record_subagent(
+                    child_id.strip(),
+                    resolved_role,
+                    resolved_status,
+                    "\n".join(detail_lines),
+                )
+        elif event.event == "message.started":
+            delivery_kind = event.data.get("delivery_kind")
+            if isinstance(delivery_kind, str) and delivery_kind.strip():
+                self.delivery_kind = delivery_kind.strip()
+            reply_to_message_id = event.data.get("reply_to_message_id")
+            if isinstance(reply_to_message_id, str):
+                self.reply_to_message_id = reply_to_message_id
+            elif event.message_id.startswith("om_"):
+                self.reply_to_message_id = event.message_id
+        elif event.event == "interaction.requested":
+            self.active_interaction = _interaction_from_event_data(
+                event.data, runtime_turn_id=event.turn_id
+            )
+            self.active_interaction.thread_id = event.thread_id or str(event.data.get("thread_id") or "")
+        elif event.event == "interaction.completed":
+            self._complete_interaction(event.data)
+        elif event.event == "interaction.failed":
+            # Hermes re-asks a failed or expired interaction natively below this
+            # card, so the rest of the turn continues below that question too.
+            if self._fail_interaction(event.data):
+                begin_continuation(self)
+        elif event.event == "system.notice":
+            title = str(event.data.get("title") or "运行提示").strip() or "运行提示"
+            is_runtime_phase = (
+                str(event.data.get("notice_kind") or "") == "context-compaction"
+                and str(event.data.get("phase") or "") == "started"
+            )
+            if is_runtime_phase:
+                self.runtime_phase_text = title
+            content = normalize_stream_text(
+                str(event.data.get("content") or event.data.get("text") or "")
+            ).strip()
+            level = _notice_level(event.data.get("level"))
+            notice_id = str(event.data.get("notice_id") or "").strip()
+            scope = str(event.data.get("notice_scope") or "session").strip().lower()
+            delivery_kind = event.data.get("delivery_kind")
+            if isinstance(delivery_kind, str) and delivery_kind.strip():
+                self.delivery_kind = delivery_kind.strip()
+            reply_to_message_id = event.data.get("reply_to_message_id")
+            if isinstance(reply_to_message_id, str):
+                self.reply_to_message_id = reply_to_message_id
+            if scope == "independent" or self.delivery_kind == "notice":
+                self.delivery_kind = "notice"
+                self.notice_kind = str(event.data.get("notice_kind") or "")
+                self.notice_title = title
+                self.notice_level = level
+                self.answer_text = content or title
+                self.status = (
+                    "completed"
+                    if _notice_is_terminal(event.data.get("notice_terminal"))
+                    else "running"
+                )
+                self.updated_at = time.time()
+                self.refresh_display_status_source()
+                return True
+            if not is_runtime_phase:
+                self.timeline.record_notice(notice_id, title, level, content)
+        elif event.event == "message.completed":
+            if self.active_interaction is not None:
+                self.active_interaction.runtime_admission = None
+            outcome = event.data.get("turn_outcome")
+            failed_outcome = (
+                isinstance(outcome, str) and outcome in _UNSUCCESSFUL_TURN_OUTCOMES
+            )
+            completed_answer = normalize_stream_text(str(event.data.get("answer") or ""))
+            if completed_answer.strip():
+                completed_answer = self._prepare_completed_answer(
+                    completed_answer, failed_outcome=failed_outcome
+                )
+            self.timeline.complete()
+            self.status = "completed"
+            self.latest_tool_preview = ""
+            if completed_answer.strip():
+                self.answer_text = completed_answer
+            delivery_kind = event.data.get("delivery_kind")
+            if isinstance(delivery_kind, str) and delivery_kind.strip():
+                self.delivery_kind = delivery_kind.strip()
+            reply_to_message_id = event.data.get("reply_to_message_id")
+            if isinstance(reply_to_message_id, str):
+                self.reply_to_message_id = reply_to_message_id
+            tokens = event.data.get("tokens", {})
+            self.tokens = dict(tokens) if isinstance(tokens, dict) else {}
+            self.tokens.pop("output_tps", None)
+            self.tokens.pop("rate_basis", None)
+            rate = completion_output_rate(event.data.get("rate"))
+            count = metric_count(self.tokens.get("output_tokens"))
+            if rate is not None and count is not None and count >= RATE_MIN_OUTPUT_TOKENS:
+                # Kept inside the persisted tokens mapping so checkpoints keep their schema.
+                self.tokens["output_tps"], self.tokens["rate_basis"] = rate
+            model = event.data.get("model")
+            self.model = model if isinstance(model, str) and model.strip() else "Unknown"
+            provider = event.data.get("provider")
+            self.provider = provider.strip() if isinstance(provider, str) else ""
+            context = event.data.get("context", {})
+            self.context = dict(context) if isinstance(context, dict) else {}
+            try:
+                self.duration = float(event.data.get("duration", 0.0))
+            except (TypeError, ValueError):
+                self.duration = 0.0
+            attachments = event.data.get("attachments", [])
+            if isinstance(attachments, list):
+                self.attachments = [
+                    attachment
+                    for attachment in attachments
+                    if isinstance(attachment, dict) and isinstance(attachment.get("name"), str)
+                ]
+            if isinstance(outcome, str) and outcome in _UNSUCCESSFUL_TURN_OUTCOMES:
+                self.status = "failed"
+                self.answer_text = (
+                    self._adopt_in_progress_content(_UNSUCCESSFUL_TURN_OUTCOME_NOTICES[outcome])
+                    + "\n\n> "
+                    + _UNSUCCESSFUL_TURN_OUTCOME_NOTICES[outcome]
+                ).lstrip()
+        elif event.event == "message.failed":
+            if self.active_interaction is not None:
+                self.active_interaction.runtime_admission = None
+            self.timeline.complete()
+            self.status = "failed"
+            error = event.data.get("error")
+            error = error if isinstance(error, str) and error.strip() else "消息处理失败"
+            self._adopt_failure_metrics(event.data)
+            partial = self._adopt_in_progress_content(error)
+            self.answer_text = partial + "\n\n> " + error if partial else error
+        if event.event in {"message.completed", "message.failed"}:
+            # A terminal execution event cannot leave an unresolved decision
+            # looking live. Preserve its scope as a failed receipt; never infer
+            # an approval or restore a paused waiter from a display checkpoint.
+            self._fail_interaction({"error": "本轮任务已结束，未提交的选择已失效。"})
+            record_terminal(self, event)
+        if self.display_segment and event.event in {"tool.updated", "subagent.updated"}:
+            self.display_segment["has_output"] = bool(
+                self.display_segment["has_output"] or event.data.get("tool_id") or event.data.get("child_id")
+            )
+        self.updated_at = time.time()
+        self.refresh_display_status_source()
+        return True
+
+    def _adopt_failure_metrics(self, data: dict[str, Any]) -> None:
+        """Adopt measured failure fields without erasing known values with placeholders."""
+        model = data.get("model")
+        if isinstance(model, str) and model.strip() and model.strip().lower() != "unknown":
+            self.model = model.strip()
+        for field_name, keys in (
+            ("tokens", ("input_tokens", "output_tokens")),
+            ("context", ("used_tokens", "max_tokens")),
+        ):
+            incoming = data.get(field_name)
+            if not isinstance(incoming, dict):
+                continue
+            current = dict(getattr(self, field_name))
+            for key in keys:
+                value = incoming.get(key)
+                if type(value) is int and value > 0:
+                    current[key] = value
+            setattr(self, field_name, current)
+        value = data.get("duration")
+        if not isinstance(value, bool):
+            try:
+                duration = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if math.isfinite(duration) and duration > 0:
+                self.duration = duration
+
+    def _adopt_in_progress_content(self, terminal_notice: str = "") -> str:
+        """Promote the content the user was reading, so a failure cannot erase it.
+
+        Maintainer note (contract change): while a turn runs, the card streams whatever has arrived —
+        the answer once there is one, otherwise the in-progress reasoning (`visible_main_text` and
+        `render._primary_text_for_session` both fall back to `thinking_text`). BOTH readers return
+        only `answer_text` once the status is `failed`, so a failure landing before any answer was
+        produced left the card showing nothing but the error. The user reported exactly that for an
+        HTTP 403 arriving mid-turn: 「这种以后能否不要覆盖掉正在做的事项内容」.
+
+        Promoting the streamed text first makes a no-answer failure behave like the partial-answer
+        case that already worked: the work in progress stays where it was, and the failure text is
+        appended below it as a quote.
+        """
+        self.terminal_reasoning_notice = ""
+        if not self.answer_text.strip():
+            self.terminal_reasoning_notice = terminal_notice
+            if self.thinking_text.strip():
+                self.answer_text = self.thinking_text.strip()
+        return self.answer_text.rstrip()
+
+    def _archive_current_answer_to_reasoning(self, final_answer: str = "") -> None:
+        preface = normalize_stream_text(self.answer_text).strip()
+        if not preface:
+            return
+        final = normalize_stream_text(final_answer).strip()
+        if final and (final == preface or final.startswith(preface)):
+            return
+        self.answer_text = ""
+        self.answer_normalizer = StreamingTextNormalizer()
+        self.timeline.insert_completed_reasoning(preface, self._answer_archive_index)
+        self._answer_archive_index = None
+
+    def _prepare_completed_answer(
+        self, completed_answer: str, *, failed_outcome: bool = False
+    ) -> str:
+        preface = normalize_stream_text(self.answer_text).strip()
+        final = normalize_stream_text(completed_answer).strip()
+        if not preface or final == preface:
+            return final
+
+        if failed_outcome:
+            # The closing text of an unsuccessful turn is a postscript, not a rewrite:
+            # keep everything that already streamed and append the provider/error notice
+            # below it.  The archive/length gates further down exist for successful
+            # completions and would otherwise drop the streamed answer outright.  (#307)
+            if final in preface:
+                return preface
+            return f"{preface}\n\n---\n\n{final}"
+
+        if self._answer_archive_index is not None:
+            stripped = _strip_preface_prefix(final, preface)
+            # Guard: if final merely extends preface by a tiny suffix (e.g.
+            # trailing punctuation), the preface IS the answer — don't
+            # archive it into reasoning.  (#96)
+            if final.startswith(preface) and (
+                stripped == final
+                or not _has_substantial_completed_suffix(final, stripped)
+            ):
+                self._answer_archive_index = None
+                return final
+            if _short_completion_would_replace_substantive_answer(preface, final):
+                self._answer_archive_index = None
+                return f"{preface}\n\n---\n\n{final}"
+            self._archive_current_answer_to_reasoning()
+            return stripped
+
+        return final
+
+    def _complete_interaction(self, data: dict[str, Any]) -> None:
+        interaction_id = str(data.get("interaction_id") or "").strip()
+        if self.active_interaction is None or (
+            interaction_id and interaction_id != self.active_interaction.interaction_id
+        ):
+            return
+        if self.active_interaction.status != "pending":
+            return
+        self.active_interaction.status = "completed"
+        self.active_interaction.choice = str(data.get("choice") or "").strip()
+        self.active_interaction.choice_label = str(
+            data.get("choice_label") or self.active_interaction.choice
+        ).strip()
+        self.active_interaction.user_name = str(data.get("user_name") or "").strip()
+        self.active_interaction.runtime_admission = None
+
+        begin_continuation(self)
+
+    def _fail_interaction(self, data: dict[str, Any]) -> bool:
+        """Mark the active interaction failed; False when it was not the open one."""
+        interaction_id = str(data.get("interaction_id") or "").strip()
+        if self.active_interaction is None or (
+            interaction_id and interaction_id != self.active_interaction.interaction_id
+        ):
+            return False
+        if self.active_interaction.status not in {"pending", "paused"}:
+            return False
+        self.active_interaction.status = "failed"
+        self.active_interaction.error = str(data.get("error") or "交互请求失败").strip()
+        self.active_interaction.runtime_admission = None
+        return True
+
+
+def _interaction_from_event_data(
+    data: dict[str, Any], *, runtime_turn_id: str = ""
+) -> InteractionState:
+    interaction_id = str(data.get("interaction_id") or "").strip()
+    if not interaction_id:
+        interaction_id = secrets.token_hex(8)
+    kind = str(data.get("kind") or "choice").strip() or "choice"
+    allow_custom_input = data.get("allow_custom_input")
+    if not isinstance(allow_custom_input, bool):
+        # Backward compatibility for interaction events emitted before the
+        # capability became explicit. Hermes clarify has always exposed an
+        # Other/free-text path; fixed-choice interactions have not.
+        allow_custom_input = kind == "clarify"
+    runtime_admission = data.get("_hfc_runtime_admission")
+    frozen_runtime_admission = (
+        MappingProxyType(deepcopy(runtime_admission))
+        if type(runtime_admission) is dict
+        else None
+    )
+    return InteractionState(
+        interaction_id=interaction_id,
+        kind=kind,
+        prompt=str(data.get("prompt") or "").strip(),
+        description=str(data.get("description") or "").strip(),
+        options=_interaction_options(data.get("options")),
+        callback_token=str(data.get("callback_token") or secrets.token_urlsafe(16)),
+        multi_select=bool(data.get("multi_select", False)),
+        allow_custom_input=allow_custom_input,
+        timeout_seconds=_safe_timeout_seconds(data.get("timeout_seconds")),
+        pause_on_timeout=(data.get("pause_on_timeout") is True and kind == "approval"
+                          and frozen_runtime_admission is None),
+        runtime_admission=frozen_runtime_admission,
+        runtime_turn_id=(
+            runtime_turn_id
+            if frozen_runtime_admission is not None and type(runtime_turn_id) is str
+            else ""
+        ),
+    )
+
+
+def _safe_timeout_seconds(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 300.0
+    if not math.isfinite(parsed) or parsed < 0:
+        return 300.0
+    return parsed
+
+
+def _interaction_options(value: Any) -> list[InteractionOption]:
+    if not isinstance(value, list):
+        return []
+    options: list[InteractionOption] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("text") or item.get("value") or "").strip()
+        option_value = str(item.get("value") or label or index).strip()
+        if not label or not option_value:
+            continue
+        style = str(item.get("style") or item.get("type") or "default").strip() or "default"
+        options.append(InteractionOption(label=label, value=option_value, style=style))
+    return options
+
+
+# Tool name → the phrase the card shows for it.  Exact names win over the substring families
+# below, which is how `todo_list` avoids being read as "listing files" and `tool_search` avoids
+# being read as a web search.
+_TOOL_ACTION_PHRASES = {
+    "read_file": "读取文件",
+    "read_terminal": "读取终端输出",
+    "read_window": "读取窗口",
+    "write_file": "写入文件",
+    "patch": "编辑文件",
+    "search_files": "搜索文件",
+    "web_search": "搜索网页",
+    "x_search": "搜索推文",
+    "session_search": "搜索历史会话",
+    "tool_search": "搜索工具",
+    "web_extract": "浏览网页",
+    "terminal": "执行命令",
+    "todo_list": "整理待办",
+    "delegate_task": "分派子任务",
+    "skill_view": "查看技能",
+    "skill_manage": "修改技能",
+    "skills_list": "查看技能列表",
+}
+
+# Substring → phrase, checked in order; first hit wins.  Covers the tools that are not named
+# above (plugins, MCP servers, new core tools) without enumerating every one of them.
+_TOOL_ACTION_FAMILIES = (
+    ("search", "搜索网页"),
+    ("query", "搜索网页"),
+    ("browser", "浏览网页"),
+    ("fetch", "浏览网页"),
+    ("web", "浏览网页"),
+    ("http", "浏览网页"),
+    ("terminal", "执行命令"),
+    ("shell", "执行命令"),
+    ("exec", "执行命令"),
+    ("command", "执行命令"),
+    ("code", "执行命令"),
+    ("write", "写入文件"),
+    ("edit", "编辑文件"),
+    ("patch", "编辑文件"),
+    ("read", "读取文件"),
+    ("open", "读取文件"),
+    ("glob", "搜索文件"),
+)
+
+
+def _search_tool_phrase(tool_name: str) -> str:
+    """The phrase for a tool, or "" when nothing matches (the caller falls back to 使用 X)."""
+    exact = _TOOL_ACTION_PHRASES.get(tool_name)
+    if exact:
+        return exact
+    for marker, phrase in _TOOL_ACTION_FAMILIES:
+        if marker in tool_name:
+            return phrase
+    return ""
+
+
+def _runtime_tool_summary(name: Any, preview: str) -> str:
+    """The action phrase + target for a tool ("读取文件：session.py").
+
+    Maintainer note (contract change): the phrases used to carry a 正在 prefix, and the verbs
+    were bare ("读取"). The user asked for two things: name the object (读取文件, not 读取), and
+    drop 正在 from the content-area row — there the status pill already reads 运行中/已完成, so the
+    prefix only repeated it. The header KEEPS 正在 (it is the status line); `_tool_action_phrase`
+    adds it back for the title. So this function returns the phrase WITHOUT the prefix.
+    """
+    text = normalize_stream_text(preview).strip()
+    if not text:
+        return ""
+    if text.startswith("正在"):
+        # A preview that is already phrased ("正在读取：session.py"): drop the prefix and strip it
+        # down through the normal path so the object is named consistently.
+        text = _RUNTIME_ACTION_PREFIX_RE.sub("", text).strip()
+        if not text:
+            return ""
+
+    tool_name = str(name or "").strip().lower()
+    is_url = text.startswith(("http://", "https://"))
+
+    if tool_name in _TOOL_ACTION_PHRASES:
+        action = _TOOL_ACTION_PHRASES[tool_name]
+    elif _SEARCH_SITE_OPERATOR_RE.search(text) or is_url:
+        action = "搜索网页" if _SEARCH_SITE_OPERATOR_RE.search(text) else "浏览网页"
+    else:
+        action = _search_tool_phrase(tool_name)
+
+    target = _runtime_preview_target(text, action=action, is_url=is_url)
+    if not action:
+        readable_name = tool_name.replace("_", " ").strip() or "工具"
+        # An unrecognised tool (plugin, MCP server, new core tool) still has to name what it was
+        # asked to do: the bare "使用 delegate task" is the same content-free row the targeted form
+        # exists to avoid. The header is unaffected — it reads only the phrase before "：".
+        return f"使用 {readable_name}：{target}" if target else f"使用 {readable_name}"
+    return f"{action}：{target}" if target else action
+
+
+def _runtime_preview_target(text: str, *, action: str, is_url: bool) -> str:
+    if is_url:
+        parsed = urlsplit(text)
+        host = parsed.netloc.removeprefix("www.")
+        path = parsed.path.rstrip("/")
+        return f"{host}{path}" if host else ""
+
+    target = text
+    # A preview that already carries the action phrase ("执行命令：pytest -q") must not be phrased a
+    # second time — that produced rows like "执行命令：命令：pytest -q".
+    if action and target.startswith(action):
+        target = target[len(action) :].lstrip("：: ").strip()
+    target = _RUNTIME_ACTION_PREFIX_RE.sub("", target).strip()
+    if action == "搜索网页":
+        target = _SEARCH_SITE_OPERATOR_RE.sub("", target).strip()
+        target = " ".join(target.split())
+    if action in {"读取文件", "编辑文件", "写入文件"} and target.startswith(("/", "~/")):
+        path = target.split(maxsplit=1)[0]
+        target = path.rstrip("/").rsplit("/", 1)[-1]
+    if target.lower().startswith(("参数:", "参数：", "args:", "arguments:")):
+        return ""
+    return target
+
+
+def _tool_detail_from_event_data(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+    detail = data.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        lines.append(normalize_stream_text(detail).strip())
+
+    arguments = _first_tool_value(data, ("arguments", "parameters", "args", "input"))
+    if arguments is not None:
+        rendered = _compact_tool_value(arguments)
+        if rendered:
+            lines.append(f"参数: {rendered}")
+
+    duration = _tool_duration_text(data)
+    if duration:
+        lines.append(f"耗时: {duration}")
+
+    error = _first_tool_value(data, ("error", "error_message", "failure_reason"))
+    if error is not None:
+        rendered_error = normalize_stream_text(str(error)).strip()
+        if rendered_error:
+            lines.append(f"失败: {rendered_error}")
+
+    return "\n".join(lines)
+
+
+def _tool_event_has_primary_detail(data: dict[str, Any]) -> bool:
+    detail = data.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return True
+    return _first_tool_value(data, ("arguments", "parameters", "args", "input")) is not None
+
+
+def _merge_tool_details(previous: str, current: str) -> str:
+    lines: list[str] = []
+    for detail in (previous, current):
+        for line in str(detail or "").splitlines():
+            if line and line not in lines:
+                lines.append(line)
+    return "\n".join(lines)
+
+
+def _first_tool_value(data: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name not in data:
+            continue
+        value = data.get(name)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _compact_tool_value(value: Any) -> str:
+    if isinstance(value, str):
+        return normalize_stream_text(value).strip()
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
+    except (TypeError, ValueError):
+        return normalize_stream_text(str(value)).strip()
+
+
+def _tool_duration_text(data: dict[str, Any]) -> str:
+    milliseconds = _tool_duration_milliseconds(data)
+    if milliseconds is None:
+        return ""
+    if milliseconds < 1000:
+        return f"{int(round(milliseconds))}ms"
+    seconds = milliseconds / 1000.0
+    return f"{seconds:.2f}".rstrip("0").rstrip(".") + "s"
+
+
+def _tool_duration_milliseconds(data: dict[str, Any]) -> float | None:
+    for name in ("duration_ms", "elapsed_ms", "tool_duration_ms"):
+        if isinstance(data.get(name), bool):
+            continue
+        try:
+            value = float(data.get(name))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value >= 0:
+            return value
+    for name in ("duration", "elapsed", "tool_duration"):
+        if isinstance(data.get(name), bool):
+            continue
+        try:
+            value = float(data.get(name))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value >= 0:
+            milliseconds = value * 1000
+            if math.isfinite(milliseconds):
+                return milliseconds
+    return None
+
+
+def _subagent_duration_milliseconds(value: Any) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+def _duration_milliseconds_text(milliseconds: float) -> str:
+    if milliseconds < 1000:
+        return f"{int(round(milliseconds))} ms"
+    seconds = milliseconds / 1000.0
+    return f"{seconds:.2f}".rstrip("0").rstrip(".") + " s"
+
+
+def _notice_level(value: Any) -> str:
+    level = str(value or "info").strip().lower()
+    if level in {"success", "warning", "error", "info"}:
+        return level
+    if level in {"warn", "orange"}:
+        return "warning"
+    if level in {"failed", "danger", "red"}:
+        return "error"
+    if level in {"ok", "done", "green"}:
+        return "success"
+    return "info"
+
+
+def _notice_is_terminal(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def _is_terminal_session_event(event: SidecarEvent) -> bool:
+    if event.event in {"message.completed", "message.failed"}:
+        return True
+    if event.event != "system.notice":
+        return False
+    scope = str(event.data.get("notice_scope") or "session").strip().lower()
+    delivery_kind = str(event.data.get("delivery_kind") or "").strip().lower()
+    return (
+        scope == "independent" or delivery_kind == "notice"
+    ) and _notice_is_terminal(event.data.get("notice_terminal"))
+
+
+def _has_substantial_completed_suffix(final: str, stripped: str) -> bool:
+    threshold = max(
+        MIN_COMPLETED_SUFFIX_CHARS,
+        len(final) // MIN_COMPLETED_SUFFIX_RATIO_DENOMINATOR,
+    )
+    return len(stripped) > threshold
+
+
+def _short_completion_would_replace_substantive_answer(
+    streamed_answer: str,
+    completed_answer: str,
+) -> bool:
+    """Keep a long streamed answer visible when completion is a short postscript.
+
+    This is intentionally content-agnostic: validators and custom skills can
+    append many different status messages, so recognizing private marker text
+    would be brittle.  The size and ratio bounds preserve an actual answer while
+    still letting a normal authoritative completion replace a brief preface.
+    """
+    streamed_length = len(streamed_answer.strip())
+    completed_length = len(completed_answer.strip())
+    return (
+        streamed_length >= MIN_PRESERVED_STREAMED_ANSWER_CHARS
+        and 0 < completed_length <= MAX_SHORT_COMPLETION_POSTSCRIPT_CHARS
+        and streamed_length
+        >= completed_length * MIN_STREAMED_ANSWER_TO_POSTSCRIPT_RATIO
+    )
+
+
+def _strip_preface_prefix(final: str, preface: str) -> str:
+    if not final.startswith(preface):
+        return final
+    tail = final[len(preface):].strip()
+    if not tail:
+        return final
+    if tail.startswith("---"):
+        tail = tail[3:].strip()
+    return tail or final

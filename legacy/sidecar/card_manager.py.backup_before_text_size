@@ -1,0 +1,559 @@
+"""
+CardManager - 卡片生命周期管理器
+================================================================
+
+职责:
+  1. 接收来自 gateway 的事件
+  2. 管理 card_id ↔ chat_id 映射
+  3. 调用 CardKitClient 执行 API 操作
+  4. 处理并发更新(per-chat lock)
+  5. 卡片超时清理
+  6. 统计和监控指标
+
+设计:
+  - 单例模式(一个 sidecar 进程一个实例)
+  - 内存状态 + 可选的 Redis 持久化(后续扩展)
+  - 支持 graceful shutdown
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Optional, List, Any
+
+from .cardkit_client import CardKitClient
+
+logger = logging.getLogger("sidecar.manager")
+
+
+@dataclass
+class ToolCall:
+    """工具调用记录"""
+    name: str
+    status: str  # 'start' | 'end' | 'error'
+    result: Optional[Any] = None
+    error: Optional[str] = None
+
+
+class CardInfo:
+    """卡片元数据"""
+    __slots__ = ('card_id', 'chat_id', 'message_id', 'greeting', 'created_at', 'thinking_start',
+                 'last_update', 'finalized', 'pending_updates', 'sequence', 'sent_sentence_count',
+                 'thinking_buffer', 'last_flush_time', '_tool_count', '_tool_lines', '_seen_tool_lines', 'sent_thinking_content')
+
+    def __init__(self, card_id: str, chat_id: str, message_id: str = None, greeting: str = None):
+        self.card_id = card_id
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.greeting = greeting
+        self.created_at = time.time()
+        self.thinking_start = time.time()
+        self.last_update = self.created_at
+        self.finalized = False
+        self.pending_updates: List[Dict] = []
+        self.sequence = 0
+        self.sent_sentence_count = 0  # 已发送的完整句子数
+        self.thinking_buffer = ''  # 思考内容缓冲区
+        self.last_flush_time = time.monotonic()  # 上次刷新时间
+        self._tool_count = 0  # 工具调用次数
+        self._tool_lines: List[str] = []  # 工具调用行
+        self._seen_tool_lines: set = set()  # 已见过的工具行(去重)
+        self.sent_thinking_content = ''  # 已发送的思考内容(累加式)
+
+
+class CardManager:
+    """
+    卡片管理器。
+
+    状态映射:
+      chat_id -> CardInfo
+      card_id -> chat_id(反向索引)
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.cardkit = CardKitClient(config, config.get('hermes_dir', ''))
+
+        # 状态存储
+        self._by_chat: Dict[str, CardInfo] = {}
+        self._by_card: Dict[str, str] = {}  # card_id -> chat_id
+
+        # 锁:per-chat 锁保证同一会话的更新顺序
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
+
+        # 清理任务
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._shutdown = False
+
+        # 统计
+        self._stats = {
+            'cards_created': 0,
+            'cards_finalized': 0,
+            'updates_sent': 0,
+            'errors': 0,
+            'start_time': time.time(),
+        }
+
+    async def start(self) -> None:
+        """启动管理器(初始化 + 启动清理任务)"""
+        try:
+            await self.cardkit.initialize()
+        except Exception as e:
+            logger.warning(f"[CardManager] CardKit initialization failed: {e}")
+            logger.warning("[CardManager] Sidecar will run in degraded mode - card operations will fail")
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        logger.info("[CardManager] Started")
+
+    async def stop(self) -> None:
+        """停止管理器"""
+        self._shutdown = True
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        await self.cardkit.shutdown()
+        logger.info("[CardManager] Stopped")
+
+    def get_lock(self, chat_id: str) -> asyncio.Lock:
+        """获取 chat_id 的锁"""
+        if chat_id not in self._locks:
+            self._locks[chat_id] = asyncio.Lock()
+        return self._locks[chat_id]
+
+    # ─── 事件处理 ───────────────────────────────────────────────
+
+    async def on_message_received(self, chat_id: str, message_id: str,
+                                  user_id: str, greeting: str,
+                                  model: str, user_input: str) -> str:
+        """
+        处理消息接收事件。
+        创建卡片并返回 card_id。
+        """
+        lock = self.get_lock(chat_id)
+        async with lock:
+            # 检查是否已存在卡片
+            if chat_id in self._by_chat:
+                existing = self._by_chat[chat_id]
+                if not existing.finalized:
+                    logger.debug(f"[CardManager] Chat {chat_id} already has active card")
+                    return existing.card_id
+
+            try:
+                # 调用 CardKit 创建卡片
+                card_id, im_message_id = await self.cardkit.create_card(
+                    chat_id=chat_id,
+                    greeting=greeting,
+                    model=model,
+                    user_input=user_input,
+                )
+
+                # 记录状态
+                info = CardInfo(card_id=card_id, chat_id=chat_id, message_id=im_message_id, greeting=greeting)
+                self._by_chat[chat_id] = info
+                self._by_card[card_id] = chat_id
+                self._stats['cards_created'] += 1
+
+                logger.info(f"[CardManager] Card created: {card_id} (message_id: {im_message_id}) for chat {chat_id}")
+                return card_id
+
+            except Exception as e:
+                logger.error(f"[CardManager] Create card failed: {e}")
+                self._stats['errors'] += 1
+                # 返回一个占位符 card_id,保证 sidecar 不崩溃
+                card_id = f"error_{chat_id}_{int(time.time())}"
+                info = CardInfo(card_id=card_id, chat_id=chat_id)
+                self._by_chat[chat_id] = info
+                self._by_card[card_id] = chat_id
+                return card_id
+
+    async def on_thinking(self, chat_id: str, delta: str,
+                         tools: Optional[List[Dict]] = None) -> None:
+        """
+        处理思考过程更新。
+
+        更新策略(防抖 + 智能合并):
+        - 累积新内容到 pending buffer
+        - 满足以下条件之一时触发刷新:
+          * 距离上次刷新 > UPDATE_WINDOW (500ms)
+          * 新增内容长度 >= MIN_CHUNK (200 字符)
+          * 收到明确的句子结束符(。!?.!? 且累积 >= 50 字符)
+
+        工具调用追踪:
+        - 检测 delta 中以 emoji + 工具关键词开头的行
+        - 识别工具: 搜索(web_search/tavily), 提取(web_extract), 记忆(memory), 文件等
+        """
+        info = self._by_chat.get(chat_id)
+        if not info or info.finalized:
+            return
+
+        lock = self.get_lock(chat_id)
+        async with lock:
+            # 初始化 buffer(首次)
+            if not hasattr(info, 'thinking_buffer'):
+                info.thinking_buffer = ''
+                info.last_flush_time = time.monotonic()
+
+            # 追加新内容
+            info.thinking_buffer += delta
+
+            # 判断是否需要刷新
+            now = time.monotonic()
+            time_elapsed = now - info.last_flush_time
+            buffer_len = len(info.thinking_buffer)
+
+            # 触发条件：尽快刷新形成打字机效果，优先在完整句子后刷新
+            has_complete_thought = buffer_len >= 30 and self._has_sentence_end(info.thinking_buffer)
+            needs_flush = (
+                time_elapsed >= 1.0 or                      # 超过 1 秒就刷新
+                buffer_len >= 200 or                         # 积累 200+ 字符时刷新
+                has_complete_thought                          # 有完整句子时刷新
+            )
+
+            if needs_flush:
+                # 检测 delta 中的工具调用
+                new_tools = self._detect_tools_in_delta(delta)
+                for t in new_tools:
+                    if t not in info._seen_tool_lines:
+                        info._seen_tool_lines.add(t)
+                        info._tool_lines.append(t)
+                        info._tool_count = len(info._tool_lines)
+
+                # 创建更新(发送全部 buffer,而非增量)
+                update = {
+                    'content': info.thinking_buffer,
+                    'tools': tools or [],
+                    'tool_count': info._tool_count,
+                    'tool_lines': info._tool_lines.copy(),
+                    'timestamp': now,
+                }
+                info.pending_updates.append(update)
+                info.last_flush_time = now
+                # 清空 buffer - 保留已发送内容在 sent_thinking_content 中
+                info.thinking_buffer = ''
+                # 调度发送
+                asyncio.create_task(self._flush_updates(chat_id))
+            else:
+                # 不刷新,只记录最后工具调用(用于下次合并)
+                # 同时检测工具
+                new_tools = self._detect_tools_in_delta(delta)
+                for t in new_tools:
+                    if t not in info._seen_tool_lines:
+                        info._seen_tool_lines.add(t)
+                        info._tool_lines.append(t)
+                        info._tool_count = len(info._tool_lines)
+                if tools or new_tools:
+                    if not info.pending_updates:
+                        info.pending_updates.append({'content': '', 'tools': [], 'tool_count': info._tool_count, 'tool_lines': info._tool_lines.copy(), 'timestamp': now})
+                    info.pending_updates[-1].setdefault('tools', []).extend(tools)
+
+    def _has_sentence_end(self, text: str) -> bool:
+        """检查文本是否包含句子结束符"""
+        import re
+        return bool(re.search(r'[。!?.!?]', text))
+
+    def _detect_tools_in_delta(self, delta: str) -> List[str]:
+        """
+        从 delta 内容中检测工具调用行。
+        匹配模式: emoji + 工具关键词 (搜索/提取/记忆/网页/文件等)
+        返回检测到的工具名称列表。
+        """
+        import re
+        detected = []
+        # 工具关键词模式
+        tool_patterns = [
+            (r'🔍\s*搜索[：:]?\s*["\']?([^"\'\n]+)', 'web_search'),
+            (r'🌐\s*提取[：:]?\s*["\']?([^"\'\n]+)', 'web_extract'),
+            (r'📄\s*读取[：:]?\s*["\']?([^"\'\n]+)', 'file_read'),
+            (r'📝\s*写入[：:]?\s*["\']?([^"\'\n]+)', 'file_write'),
+            (r'🧠\s*记忆[：:]?\s*["\']?([^"\'\n]+)', 'memory'),
+            (r'🔧\s*工具[：:]?\s*["\']?([^"\'\n]+)', 'tool'),
+            (r'⚡\s*执行[：:]?\s*["\']?([^"\'\n]+)', 'execute'),
+            (r'🌍\s*网页[：:]?\s*["\']?([^"\'\n]+)', 'web'),
+            (r'🔍\s*正在搜索', 'web_search'),
+            (r'🌐\s*正在提取', 'web_extract'),
+            (r'🧠\s*正在搜索记忆', 'memory_search'),
+            (r'📚\s*正在读取', 'file_read'),
+        ]
+        for pattern, tool_name in tool_patterns:
+            if re.search(pattern, delta):
+                detected.append(tool_name)
+        return detected
+
+    async def on_tool_call(self, chat_id: str, tool: ToolCall) -> None:
+        """
+        处理工具调用事件。
+
+        将工具调用信息追加到该 chat 的 pending_updates 中,
+        会在下次 _flush_updates 时一并发送到卡片。
+        """
+        info = self._by_chat.get(chat_id)
+        if not info or info.finalized:
+            return
+
+        lock = self.get_lock(chat_id)
+        async with lock:
+            # 构建工具调用记录
+            tool_entry = {
+                'type': 'tool_call',
+                'name': tool.name,
+                'status': tool.status,
+                'result': tool.result,
+                'error': tool.error,
+                'timestamp': time.time(),
+            }
+            # 将 tool 信息注入到最近一次 pending update
+            if not info.pending_updates:
+                # 没有 pending update,用当前 buffer 内容创建一个
+                buffer = getattr(info, 'thinking_buffer', '')
+                info.pending_updates.append({
+                    'content': buffer,
+                    'tools': [tool_entry],
+                    'tool_count': info._tool_count,
+                    'tool_lines': info._tool_lines.copy() if hasattr(info, '_tool_lines') else [],
+                    'timestamp': time.monotonic(),
+                })
+            else:
+                info.pending_updates[-1].setdefault('tools', []).append(tool_entry)
+            info.last_update = time.monotonic()
+            # 调度合并发送
+            asyncio.create_task(self._schedule_merge(chat_id))
+
+    async def _schedule_merge(self, chat_id: str) -> None:
+        """调度合并发送(防抖)"""
+        # 使用更长的合并窗口(0.5秒),让内容充分积累
+        await asyncio.sleep(0.5)
+        await self._flush_updates(chat_id)
+
+    def _split_sentences(self, text: str) -> list:
+        """按句子分割文本,返回句子列表"""
+        import re
+        # 按句子结束符分割:中英文句号、问号、感叹号
+        sentences = re.split(r'(?<=[。!?.!?])\s*', text)
+        # 过滤空句子
+        return [s for s in sentences if s.strip()]
+
+    async def _flush_updates(self, chat_id: str) -> None:
+        """
+        刷新待处理的更新到 IM API。
+
+        新策略：
+        - pending_updates 中的每个元素包含完整的 thinking_buffer 内容
+        - 直接发送最新内容，无需句子分割
+        - 发送后清空 buffer（保留尾部上下文）
+        """
+        info = self._by_chat.get(chat_id)
+        if not info or not info.pending_updates:
+            return
+
+        lock = self.get_lock(chat_id)
+        async with lock:
+            if not info.pending_updates:
+                return
+
+            # 取最新更新
+            latest = info.pending_updates[-1]
+            raw_content = latest['content']
+            tools = latest.get('tools', [])
+            tool_count = latest.get('tool_count', 0)
+            tool_lines = latest.get('tool_lines', None)
+
+            # 移除 thinking 标签
+            content = raw_content.replace('<think>', '').replace('</think>', '').strip()
+
+            # 移除 thinking 标签
+            content = raw_content.replace('<think>', '').replace('</think>', '').strip()
+
+            # 累加式更新：新内容直接追加到已发送内容后面（连贯打字机效果）
+            if info.sent_thinking_content:
+                content = info.sent_thinking_content + content
+            # 更新 sent_thinking_content 为完整累积内容
+            info.sent_thinking_content = content
+
+            if not content and not tools:
+                info.pending_updates.clear()
+                return
+
+            try:
+                await self.cardkit.update_card_message(
+                    message_id=info.message_id,
+                    greeting=info.greeting,
+                    content=content,
+                    tools=tools,
+                    tool_count=tool_count,
+                    tool_lines=tool_lines,
+                )
+                self._stats['updates_sent'] += 1
+                logger.debug(f"[CardManager] Flushed update for {chat_id}: {len(content)} chars")
+            except Exception as e:
+                logger.error(f"[CardManager] Update failed: {e}")
+                self._stats['errors'] += 1
+            finally:
+                # 清空已处理的 pending updates（thinking_buffer 由 on_thinking 管理）
+                info.pending_updates.clear()
+                # sent_sentence_count 已不再需要（新策略不用句子计数）
+                info.sent_sentence_count = 0
+
+    async def on_finish(self, chat_id: str, final_content: str,
+                       tokens: Dict[str, int], duration: float,
+                       tool_calls: List[str] = None) -> None:
+        """
+        处理完成事件。
+        """
+        api_calls = tokens.get('api_calls', 0) if tokens else 0
+        tool_calls = tool_calls or []
+        logger.warning(f"[CardManager] on_finish called: chat_id={chat_id}, content_len={len(final_content)}, tokens={tokens}, api_calls={api_calls}, tool_calls={tool_calls}")
+        info = self._by_chat.get(chat_id)
+        if not info:
+            logger.warning(f"[CardManager] on_finish: no card for {chat_id}")
+            return
+
+        lock = self.get_lock(chat_id)
+        async with lock:
+            try:
+                # 先刷新任何待处理的更新
+                logger.warning(f"[CardManager] on_finish: flushing updates, pending={len(info.pending_updates)}")
+                await self._flush_updates(chat_id)
+                logger.warning(f"[CardManager] on_finish: flush done")
+
+                # 计算 thinking_start(从创建到现在的时长)
+                thinking_start = info.thinking_start
+
+                # 使用 IM PATCH 最终化卡片
+                logger.warning(f"[CardManager] on_finish: calling finalize, message_id={info.message_id}")
+                await self.cardkit.finalize_card_message(
+                    message_id=info.message_id,
+                    final_content=final_content,
+                    tokens=tokens,
+                    duration=duration,
+                    thinking_start=thinking_start,
+                    api_calls=api_calls,
+                    tool_calls=tool_calls,
+                )
+                logger.warning(f"[CardManager] on_finish: finalize done")
+
+                info.finalized = True
+                self._stats['cards_finalized'] += 1
+                logger.warning(f"[CardManager] Card finalized: {info.card_id}, message_id={info.message_id}")
+
+            except Exception as e:
+                logger.error(f"[CardManager] Finalize failed: {e}")
+                self._stats['errors'] += 1
+                # 仍标记为 finalized 以避免重复处理
+                info.finalized = True
+            finally:
+                # 标记为可清理(但不会立即删除,等待清理任务)
+                pass
+
+    async def on_error(self, chat_id: str, error: str) -> None:
+        """
+        处理错误事件。
+        在卡片中显示错误信息。
+        """
+        info = self._by_chat.get(chat_id)
+        if not info or info.finalized:
+            return
+
+        lock = self.get_lock(chat_id)
+        async with lock:
+            try:
+                error_msg = f"❌ **错误**: {error}"
+                await self.cardkit.update_card_message(
+                    message_id=info.message_id,
+                    greeting=info.greeting,
+                    content=error_msg,
+                    tools=None,
+                )
+            except Exception as e:
+                logger.error(f"[CardManager] Error update failed: {e}")
+
+    async def cleanup_chat(self, chat_id: str) -> None:
+        """
+        清理会话状态。
+        在卡片完成后调用,释放内存。
+        """
+        lock = self.get_lock(chat_id)
+        async with lock:
+            info = self._by_chat.pop(chat_id, None)
+            if info:
+                self._by_card.pop(info.card_id, None)
+                self._locks.pop(chat_id, None)
+                logger.debug(f"[CardManager] Cleaned up chat {chat_id}")
+
+    # ─── 后台清理任务 ───────────────────────────────────────────
+
+    async def _cleanup_loop(self) -> None:
+        """
+        定期清理过期卡片。
+        每 60 秒检查一次,清理超过 max_age_seconds 的卡片。
+        """
+        max_age = self.config.get('card', {}).get(
+            'max_age_seconds', 3600
+        )
+
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(60)
+
+                now = time.time()
+                to_cleanup = []
+
+                async with self._global_lock:
+                    for chat_id, info in list(self._by_chat.items()):
+                        age = now - info.created_at
+                        if age > max_age:
+                            to_cleanup.append(chat_id)
+
+                # 清理
+                for chat_id in to_cleanup:
+                    try:
+                        await self.cleanup_chat(chat_id)
+                        logger.info(f"[CardManager] Auto-cleaned aged card: {chat_id}")
+                    except Exception as e:
+                        logger.error(f"[CardManager] Cleanup error: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[CardManager] Cleanup loop error: {e}")
+
+    # ─── 统计与监控 ─────────────────────────────────────────────
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        uptime = time.time() - self._stats['start_time']
+        return {
+            'uptime': uptime,
+            'cards_created': self._stats['cards_created'],
+            'cards_finalized': self._stats['cards_finalized'],
+            'updates_sent': self._stats['updates_sent'],
+            'errors': self._stats['errors'],
+            'active_cards': len(self._by_chat),
+            'pending_cleanup': max(0, len(self._by_chat) - self._stats['cards_finalized']),
+        }
+
+    def active_card_count(self) -> int:
+        """活跃卡片数"""
+        return len(self._by_chat)
+
+    def get_card_info(self, card_id: str) -> Optional[Dict[str, Any]]:
+        """获取卡片信息"""
+        chat_id = self._by_card.get(card_id)
+        if chat_id and chat_id in self._by_chat:
+            info = self._by_chat[chat_id]
+            return {
+                'card_id': info.card_id,
+                'chat_id': info.chat_id,
+                'created_at': info.created_at,
+                'finalized': info.finalized,
+                'age_seconds': time.time() - info.created_at,
+            }
+        return None

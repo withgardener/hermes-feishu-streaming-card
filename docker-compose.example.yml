@@ -1,0 +1,87 @@
+# Example only: this project does not publish an official Hermes Docker image.
+x-hfc-environment: &hfc-environment
+  HERMES_DIR: /opt/hermes
+  HERMES_HOME: /opt
+  HFC_CONFIG: /opt/data/config.yaml
+  HFC_ENV_FILE: /opt/data/.env
+  HFC_VERSION: "${HFC_VERSION:-v5.0.12}"
+  HFC_NO_PROMPT: "1"
+  HERMES_FEISHU_CARD_PROFILE_ID: "${HERMES_FEISHU_CARD_PROFILE_ID:-default}"
+  HERMES_FEISHU_CARD_EVENT_URL: http://sidecar:8765/events
+  HERMES_FEISHU_CARD_STATE_DIR: /opt/hfc-state
+  HERMES_FEISHU_CARD_SERVICE_MANAGER: detached
+  HERMES_FEISHU_CARD_HOST: 0.0.0.0
+  HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK: "true"
+  FEISHU_APP_ID: "${FEISHU_APP_ID}"
+  FEISHU_APP_SECRET: "${FEISHU_APP_SECRET}"
+  FEISHU_CONNECTION_MODE: "${FEISHU_CONNECTION_MODE:-websocket}"
+  FEISHU_HOME_CHANNEL: "${FEISHU_HOME_CHANNEL:-}"
+
+x-hfc-volumes: &hfc-volumes
+  - hermes-runtime:/opt/hermes
+  - hermes-data:/opt/data
+  - hfc-state:/opt/hfc-state
+
+services:
+  setup:
+    image: your-hermes-image:latest
+    working_dir: /opt/hermes
+    environment:
+      <<: *hfc-environment
+      HFC_SKIP_START: "1"
+    volumes:
+      - hermes-runtime:/opt/hermes
+      - hermes-data:/opt/data
+      - hfc-state:/opt/hfc-state
+      - ./install-docker.sh:/tmp/install-docker.sh:ro
+    command: ["bash", "/tmp/install-docker.sh"]
+
+  sidecar:
+    image: your-hermes-image:latest
+    working_dir: /opt/hermes
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment: *hfc-environment
+    volumes: *hfc-volumes
+    command:
+      - /opt/hermes/venv/bin/python
+      - -m
+      - hermes_feishu_card.runner
+      - --config
+      - /opt/data/config.yaml
+      - --env-file
+      - /opt/data/.env
+    healthcheck:
+      test:
+        - CMD
+        - /opt/hermes/venv/bin/python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8765/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  gateway:
+    image: your-hermes-image:latest
+    working_dir: /opt/hermes
+    restart: unless-stopped
+    depends_on:
+      sidecar:
+        condition: service_healthy
+    environment: *hfc-environment
+    volumes: *hfc-volumes
+    command:
+      - /opt/hermes/venv/bin/python
+      - -m
+      - hermes_cli.main
+      - gateway
+      - run
+      - --accept-hooks
+
+volumes:
+  hermes-runtime:
+  hermes-data:
+  hfc-state:

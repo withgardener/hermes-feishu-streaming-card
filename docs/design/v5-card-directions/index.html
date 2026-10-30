@@ -1,0 +1,1081 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:">
+<title>HFC 下一版卡片方向比较</title>
+<style>
+:root{color-scheme:light;--page:#f5f6f8;--surface:#fff;--text:#20242e;--muted:#677183;--line:#e3e7ed;--soft:#f4f6f9;--blue:#225fcc;--shadow:0 8px 28px #17233709}
+*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--text);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+body.dark{color-scheme:dark;--page:#171b22;--surface:#242a34;--text:#e6eaf0;--muted:#a5adba;--line:#39414e;--soft:#2d3440;--blue:#8bb5ff;--shadow:none}
+main{max-width:1300px;margin:auto;padding:40px 32px 70px}header.page{display:flex;gap:24px;justify-content:space-between;align-items:start;margin-bottom:28px}
+h1{font-size:27px;font-weight:650;letter-spacing:-.7px;margin:0 0 7px}p{margin:0 0 10px}.caption{color:var(--muted);font-size:13px;max-width:720px}
+.eyebrow{font-size:12px;letter-spacing:1.3px;color:var(--blue);margin-bottom:12px;font-weight:650}a{color:var(--blue);text-decoration:none}
+.toolbar{display:flex;flex-wrap:wrap;gap:18px;align-items:center;background:var(--surface);border:1px solid var(--line);padding:14px 18px;border-radius:12px;margin-bottom:24px}
+label{display:flex;align-items:center;gap:9px;color:var(--muted)}select,.toggle,.export{border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:7px;padding:7px 11px;font:inherit}
+.toggle{cursor:pointer}select{max-width:220px}.export{white-space:nowrap;font-size:13px}.toolbar .end{margin-left:auto}
+.stage{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;align-items:start}.column{min-width:0}
+.rail-label{display:flex;justify-content:space-between;margin:0 0 12px;font-size:13px;font-weight:650}.rail-label span{font-weight:400;color:var(--muted);font-size:12px}
+.chat{background:var(--soft);padding:22px;border-radius:14px;border:1px solid var(--line);min-height:340px}
+.sender{display:flex;align-items:center;gap:9px;margin-bottom:12px;color:var(--muted);font-size:12px}.avatar{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;background:#e5edff;color:#2e60be;font-weight:700}
+.card{border:1px solid var(--line);border-radius:10px;background:var(--surface);overflow:hidden;box-shadow:var(--shadow);overflow-wrap:anywhere}
+.card-head{padding:14px 18px;background:#eaf1ff;color:#244d89}.card-head.green{background:#e9f4ed;color:#286843}.card-head.orange{background:#fff1df;color:#87530a}.card-head.red{background:#fdecee;color:#983849}.card-head.grey{background:#eceff3;color:#515f70}
+.dark .card-head{background:#2a3b57;color:#c0d5fa}.dark .card-head.green{background:#293f35;color:#b4dfc6}.dark .card-head.orange{background:#4b3924;color:#f4d097}.dark .card-head.red{background:#4b3037;color:#f3bac4}.dark .card-head.grey{background:#343d49;color:#ccd6e4}
+.card-title{font-weight:650;font-size:16px;line-height:1.6}.card-subtitle{font-size:12px;opacity:.85;margin-top:3px}.card-body{padding:18px}
+.md{white-space:normal;line-height:1.7;margin-bottom:12px;word-break:break-word}.md:last-child{margin-bottom:0}.md h2,.md h3{font-size:17px;line-height:1.6;margin:7px 0 12px}.md h4{font-size:15px;margin:6px 0}
+.md p{margin:0 0 9px}.md pre{overflow:auto;white-space:pre;background:var(--soft);padding:13px;border-radius:7px;border:1px solid var(--line);font-size:12px;line-height:1.65}.md code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.md blockquote{border-left:3px solid var(--line);padding:1px 0 1px 12px;margin:10px 0;color:var(--muted)}
+.md ul,.md ol{padding-left:20px;margin:8px 0}.pill{display:inline;padding:2px 5px;border-radius:4px;font-size:.9em;background:var(--soft);color:var(--blue)}.pill.neutral,.pill.grey{color:var(--muted)}.pill.green{color:#247149}.pill.red{color:#b74455}.pill.orange{color:#976012}.dark .pill.green{color:#9bd7ad}.dark .pill.red{color:#f8a6b6}.dark .pill.orange{color:#f2c37d}
+hr{border:0;border-top:1px solid var(--line);margin:16px 0}.footer{color:var(--muted)}details.panel{margin:12px 0;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+summary{cursor:pointer;padding:10px 12px;line-height:1.6;font-size:13px;color:var(--muted)}details.panel>.inside{padding:2px 12px 12px}
+.cols{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.col{flex:1;min-width:120px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.card button{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:6px;min-height:38px;padding:8px 13px;text-align:left;opacity:1;cursor:default;white-space:normal}
+.card button.primary{background:#3370ff;border-color:#3370ff;color:white}.card button.danger{color:#b74455;border-color:#d38e99}
+.field{border:1px solid var(--line);padding:10px 12px;color:var(--muted);border-radius:6px;margin:10px 0}.table-wrap{overflow:auto;margin:12px 0}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:9px 11px;text-align:left;border:1px solid var(--line)}th{background:var(--soft);font-weight:600}
+.settings{margin-top:26px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.settings .inside{padding:0 18px 18px}.settings pre{white-space:pre-wrap;font-size:12px;overflow-wrap:anywhere;color:var(--muted)}
+.mobile .chat{max-width:390px;margin:auto;padding:15px}.mobile .card-body{padding:15px}.mobile .card-title{font-size:15px}.mobile .rail-label{max-width:390px;margin-left:auto;margin-right:auto}
+@media(max-width:850px){main{padding:24px 16px}.stage{grid-template-columns:minmax(0,1fr)}header.page{flex-direction:column;gap:10px}.toolbar .end{margin-left:0}.chat{padding:14px}.rail-label{margin-top:5px}}
+.card-head.default{background:var(--surface);color:var(--text);border-bottom:1px solid var(--line)}
+</style>
+<main>
+  <header class="page"><div><div class="eyebrow">HERMES / CARD PREVIEW</div><h1>卡片更清楚，过程不打扰</h1><p class="caption">同一份示例内容，对比 A「阅读优先」与 B「任务分区」。可切换执行、审批、结果等九种状态。这里是设计样稿，尚未修改正式卡片；飞书真实外观另行验收。</p></div><a class="export" href="cards.json" download>下载 Card JSON</a></header>
+  <section class="toolbar" aria-label="预览选项">
+    <label>场景 <select id="scenario" aria-label="卡片场景"></select></label>
+    <label>宽度 <select id="viewport" aria-label="模拟设备宽度"><option value="desktop">桌面</option><option value="mobile">手机</option></select></label>
+    <button class="toggle" id="theme" type="button">切换深色</button>
+    <span class="caption end">仅预览 · 卡片按钮不会提交</span>
+  </section>
+  <section class="stage" id="stage" aria-label="布局对比"></section>
+  <details class="settings"><summary>查看设计差异与边界</summary><div class="inside"><p class="caption">A 更适合日常问答与长结果；B 更适合经常追踪执行步骤的用户。完整内容相同，差异在首屏强调与过程的展开方式。</p><pre id="settings"></pre></div></details>
+</main>
+<script type="application/json" id="preview-data">{
+  "schema_version": 1,
+  "notice": "设计方向样稿，全部为固定示例。组件来自当前 renderer；A 的中性标题为候选变更。这里不是飞书客户端，按钮不会提交。",
+  "configuration": {
+    "A": "阅读优先：中性标题保留状态文字，正文先读，成功过程默认收起，统计在底部。",
+    "B": "任务分区：状态色标题，执行过程默认展开，运行和结束后的过程都便于连续查看。",
+    "unchanged": "两种方向均保留完整正文、审批范围和选择值；不改变账号、权限或默认配置。",
+    "limits": "手机宽度、颜色和字体仅为离线近似。真机布局、输入、滚动、焦点和读屏另行验收。"
+  },
+  "scenarios": [
+    {
+      "id": "running",
+      "label": "执行过程",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_0",
+                "content": "\u003ctext_tag color='green'\u003e已完成\u003c/text_tag\u003e · \u003ctext_tag color='neutral'\u003eterminal\u003c/text_tag\u003e · #1\n执行命令：项目说明",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_1",
+                "content": "\u003ctext_tag color='neutral'\u003eterminal\u003c/text_tag\u003e · #2 · 3s\n执行命令：检查项目测试",
+                "text_size": "small"
+              },
+              {
+                "tag": "collapsible_panel",
+                "element_id": "auxiliary_timeline",
+                "expanded": false,
+                "header": {
+                  "title": {
+                    "tag": "plain_text",
+                    "content": "▸ 执行过程（点开查看）"
+                  },
+                  "vertical_align": "center"
+                },
+                "border": {
+                  "color": "grey",
+                  "corner_radius": "8px"
+                },
+                "padding": "8px 8px 8px 8px",
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_reasoningentry_2",
+                    "content": "**实时思考** · running\n先核对资料，再整理本次修改。",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_1",
+                    "content": "\u003cfont color=\"blue\"\u003e⠋ **terminal** · #2 · 执行中\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　检查项目测试\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　参数: {\"command\": \"python -m pytest tests/unit -q\"}\u003c/font\u003e",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_0",
+                    "content": "\u003cfont color=\"green\"\u003e✓ **terminal** · #1\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　读取项目说明\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　参数: {\"command\": \"python -m pytest tests/unit -q\"}\u003c/font\u003e",
+                    "text_size": "small"
+                  }
+                ]
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 执行中"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_0",
+                "content": "\u003ctext_tag color='green'\u003e已完成\u003c/text_tag\u003e · \u003ctext_tag color='neutral'\u003eterminal\u003c/text_tag\u003e · #1\n执行命令：项目说明",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "tool_activity_1",
+                "content": "\u003ctext_tag color='neutral'\u003eterminal\u003c/text_tag\u003e · #2 · 3s\n执行命令：检查项目测试",
+                "text_size": "small"
+              },
+              {
+                "tag": "collapsible_panel",
+                "element_id": "auxiliary_timeline",
+                "expanded": true,
+                "header": {
+                  "title": {
+                    "tag": "plain_text",
+                    "content": "▸ 执行过程（点开查看）"
+                  },
+                  "vertical_align": "center"
+                },
+                "border": {
+                  "color": "grey",
+                  "corner_radius": "8px"
+                },
+                "padding": "8px 8px 8px 8px",
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_reasoningentry_2",
+                    "content": "**实时思考** · running\n先核对资料，再整理本次修改。",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_1",
+                    "content": "\u003cfont color=\"blue\"\u003e⠋ **terminal** · #2 · 执行中\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　检查项目测试\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　参数: {\"command\": \"python -m pytest tests/unit -q\"}\u003c/font\u003e",
+                    "text_size": "small"
+                  },
+                  {
+                    "tag": "markdown",
+                    "element_id": "auxiliary_timeline_toolentry_0",
+                    "content": "\u003cfont color=\"green\"\u003e✓ **terminal** · #1\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　读取项目说明\u003c/font\u003e\n\u003cfont color=\"grey\"\u003e　参数: {\"command\": \"python -m pytest tests/unit -q\"}\u003c/font\u003e",
+                    "text_size": "small"
+                  }
+                ]
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "blue",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 执行中"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "waiting",
+      "label": "长时间无更新",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "最近 2 分钟未收到新事件；任务是否仍在执行尚待确认。",
+                "text_size": "small"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待新进展"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "思考中"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "最近 2 分钟未收到新事件；任务是否仍在执行尚待确认。",
+                "text_size": "small"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "1m24s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待新进展"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "approval",
+      "label": "等待审批",
+      "cards": {
+        "reading": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待审批"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "允许更新示例项目配置吗？"
+            },
+            {
+              "tag": "markdown",
+              "content": "请核对下方完整操作后，单击授权按钮一次。若手机显示“展开”，展开仅查看内容，不会提交授权。"
+            },
+            {
+              "tag": "markdown",
+              "content": "将在示例项目中更新一项阅读设置。原配置先备份，不修改模型、账号或权限。\n\n请核对完整操作范围后选择。"
+            },
+            {
+              "tag": "markdown",
+              "content": "请选择一个选项"
+            },
+            {
+              "tag": "column_set",
+              "flex_mode": "flow",
+              "horizontal_spacing": "8px",
+              "horizontal_align": "left",
+              "columns": [
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "允许本次操作"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "once",
+                        "choice_label": "允许本次操作",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                },
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "拒绝"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "deny",
+                        "choice_label": "拒绝",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "progress": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "orange",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待审批"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "允许更新示例项目配置吗？"
+            },
+            {
+              "tag": "markdown",
+              "content": "请核对下方完整操作后，单击授权按钮一次。若手机显示“展开”，展开仅查看内容，不会提交授权。"
+            },
+            {
+              "tag": "markdown",
+              "content": "将在示例项目中更新一项阅读设置。原配置先备份，不修改模型、账号或权限。\n\n请核对完整操作范围后选择。"
+            },
+            {
+              "tag": "markdown",
+              "content": "请选择一个选项"
+            },
+            {
+              "tag": "column_set",
+              "flex_mode": "flow",
+              "horizontal_spacing": "8px",
+              "horizontal_align": "left",
+              "columns": [
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "允许本次操作"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "once",
+                        "choice_label": "允许本次操作",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                },
+                {
+                  "tag": "column",
+                  "width": "auto",
+                  "vertical_align": "top",
+                  "elements": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "拒绝"
+                      },
+                      "type": "default",
+                      "value": {
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "preview-approval",
+                        "token": "preview-only-not-a-live-token",
+                        "choice": "deny",
+                        "choice_label": "拒绝",
+                        "profile_id": "default"
+                      },
+                      "width": "default"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "clarify",
+      "label": "多选与输入",
+      "cards": {
+        "reading": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待你的选择"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "这份报告重点展示哪些内容？"
+            },
+            {
+              "tag": "markdown",
+              "content": "1. 结果与结论\n\n2. 执行过程\n\n3. 数据与限制"
+            },
+            {
+              "tag": "form",
+              "name": "hfc_clarify_form",
+              "elements": [
+                {
+                  "tag": "multi_select_static",
+                  "name": "hfc_multi",
+                  "type": "default",
+                  "required": false,
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "请选择（可多选）"
+                  },
+                  "options": [
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "1. 结果与结论"
+                      },
+                      "value": "result"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "2. 执行过程"
+                      },
+                      "value": "process"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "3. 数据与限制"
+                      },
+                      "value": "evidence"
+                    }
+                  ]
+                },
+                {
+                  "tag": "input",
+                  "name": "hfc_other",
+                  "input_type": "text",
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "或输入自定义答案…"
+                  }
+                },
+                {
+                  "tag": "button",
+                  "text": {
+                    "tag": "plain_text",
+                    "content": "✅ 确认选择"
+                  },
+                  "type": "primary",
+                  "name": "hfc_confirm_preview-only-not-a-live-token",
+                  "value": {
+                    "profile_id": "default"
+                  },
+                  "action_type": "form_submit"
+                }
+              ]
+            }
+          ]
+        },
+        "progress": {
+          "config": {
+            "wide_screen_mode": true,
+            "update_multi": true
+          },
+          "header": {
+            "template": "orange",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待你的选择"
+            }
+          },
+          "elements": [
+            {
+              "tag": "markdown",
+              "content": "这份报告重点展示哪些内容？"
+            },
+            {
+              "tag": "markdown",
+              "content": "1. 结果与结论\n\n2. 执行过程\n\n3. 数据与限制"
+            },
+            {
+              "tag": "form",
+              "name": "hfc_clarify_form",
+              "elements": [
+                {
+                  "tag": "multi_select_static",
+                  "name": "hfc_multi",
+                  "type": "default",
+                  "required": false,
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "请选择（可多选）"
+                  },
+                  "options": [
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "1. 结果与结论"
+                      },
+                      "value": "result"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "2. 执行过程"
+                      },
+                      "value": "process"
+                    },
+                    {
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "3. 数据与限制"
+                      },
+                      "value": "evidence"
+                    }
+                  ]
+                },
+                {
+                  "tag": "input",
+                  "name": "hfc_other",
+                  "input_type": "text",
+                  "placeholder": {
+                    "tag": "plain_text",
+                    "content": "或输入自定义答案…"
+                  }
+                },
+                {
+                  "tag": "button",
+                  "text": {
+                    "tag": "plain_text",
+                    "content": "✅ 确认选择"
+                  },
+                  "type": "primary",
+                  "name": "hfc_confirm_preview-only-not-a-live-token",
+                  "value": {
+                    "profile_id": "default"
+                  },
+                  "action_type": "form_submit"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "completed",
+      "label": "结果与长内容",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "## 项目检查完成 配置与文档保持一致，可以继续下一步验证。 - 已核对阅读设置和覆盖顺序 - 已保留原始配置 - 真实客户端效果仍需单独验收 | 检查项 | 结果 | | --- | --- | | 配置解析 | 通过 | | 文档链接…"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "## 项目检查完成\n\n配置与文档保持一致，可以继续下一步验证。\n\n- 已核对阅读设置和覆盖顺序\n- 已保留原始配置\n- 真实客户端效果仍需单独验收\n\n| 检查项 | 结果 |\n| --- | --- |\n| 配置解析 | 通过 |\n| 文档链接 | 通过 |\n\n使用示例命令检查配置：\n\n语言：bash\n\n```plain_text\nhermes-feishu-card card-config --config example.yaml\n```",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "deepseek/deepseek-v4-pro · 1m24s · ↑4.2k · ↓680",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "## 项目检查完成 配置与文档保持一致，可以继续下一步验证。 - 已核对阅读设置和覆盖顺序 - 已保留原始配置 - 真实客户端效果仍需单独验收 | 检查项 | 结果 | | --- | --- | | 配置解析 | 通过 | | 文档链接…"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "## 项目检查完成\n\n配置与文档保持一致，可以继续下一步验证。\n\n- 已核对阅读设置和覆盖顺序\n- 已保留原始配置\n- 真实客户端效果仍需单独验收\n\n| 检查项 | 结果 |\n| --- | --- |\n| 配置解析 | 通过 |\n| 文档链接 | 通过 |\n\n使用示例命令检查配置：\n\n语言：bash\n\n```plain_text\nhermes-feishu-card card-config --config example.yaml\n```",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "deepseek/deepseek-v4-pro · 1m24s · ↑4.2k · ↓680",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "green",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "short",
+      "label": "简短回复",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "已收到，稍后见。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已收到，稍后见。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "已收到，稍后见。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已收到，稍后见。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "green",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已完成"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "stopped",
+      "label": "失败与中断",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已保留前半部分结果。\n\n\u003e 请求未完成，请检查连接后重新发起任务。",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "32s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已停止"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "已保留前半部分结果。\n\n\u003e 请求未完成，请检查连接后重新发起任务。",
+                "text_size": "normal"
+              },
+              {
+                "tag": "hr",
+                "element_id": "main_divider"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "footer",
+                "content": "32s",
+                "text_size": "notation"
+              }
+            ]
+          },
+          "header": {
+            "template": "red",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 已停止"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "restored",
+      "label": "连接恢复",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "连接已重建；执行状态尚未同步，原授权不会恢复。",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "此前已经收到的内容会继续保留。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待状态同步"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "处理失败"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "task_observation",
+                "content": "连接已重建；执行状态尚未同步，原授权不会恢复。",
+                "text_size": "small"
+              },
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "此前已经收到的内容会继续保留。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "项目检查 · 等待状态同步"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "notice",
+      "label": "独立通知",
+      "cards": {
+        "reading": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "配置文件可以正常读取。下次启动时加载新设置。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "配置文件可以正常读取。下次启动时加载新设置。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "default",
+            "title": {
+              "tag": "plain_text",
+              "content": "配置检查 · 已完成"
+            }
+          }
+        },
+        "progress": {
+          "schema": "2.0",
+          "config": {
+            "update_multi": true,
+            "summary": {
+              "content": "配置文件可以正常读取。下次启动时加载新设置。"
+            }
+          },
+          "body": {
+            "elements": [
+              {
+                "tag": "markdown",
+                "element_id": "main_content",
+                "content": "配置文件可以正常读取。下次启动时加载新设置。",
+                "text_size": "normal"
+              }
+            ]
+          },
+          "header": {
+            "template": "green",
+            "title": {
+              "tag": "plain_text",
+              "content": "配置检查 · 已完成"
+            }
+          }
+        }
+      }
+    }
+  ]
+}</script>
+<script>
+const data=JSON.parse(document.querySelector('#preview-data').textContent);
+const el=(tag,cls='',text='')=>{const n=document.createElement(tag);n.className=cls;n.textContent=text;return n};
+const escapeText=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function inline(s){
+  let t=escapeText(s);
+  t=t.replace(/&lt;text_tag color=(?:&#39;|&quot;)(blue|green|red|orange|purple|indigo|grey|neutral)(?:&#39;|&quot;)&gt;([\s\S]*?)&lt;\/text_tag&gt;/g,'<span class="pill $1">$2</span>');
+  t=t.replace(/&lt;font color=(?:&#39;|&quot;)?[\w-]+(?:&#39;|&quot;)?&gt;([\s\S]*?)&lt;\/font&gt;/g,'$1');
+  t=t.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\x60([^\x60]+)\x60/g,'<code>$1</code>');
+  return t;
+}
+function markdown(s){
+  const n=el('div','md'),lines=String(s??'').split('\n');let code=null,list=null;
+  const cells=line=>line.trim().replace(/^\||\|$/g,'').split(/(?<!\\)\|/).map(c=>c.trim().replace(/\\\|/g,'|'));
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(line.startsWith(String.fromCharCode(96,96,96))){if(code===null){code=[]}else{const pre=el('pre');pre.append(el('code','',code.join('\n')));n.append(pre);code=null}continue}
+    if(code!==null){code.push(line);continue}
+    if(!line.trim()){list=null;continue}
+    if(line.includes('|')&&i+1<lines.length&&cells(lines[i+1]).every(c=>/^:?-{3,}:?$/.test(c))){
+      const wrap=el('div','table-wrap'),table=el('table'),tr=el('tr');
+      for(const text of cells(line)){const th=el('th');th.innerHTML=inline(text);tr.append(th)}table.append(tr);i++;
+      while(i+1<lines.length&&lines[i+1].includes('|')){const row=el('tr');for(const text of cells(lines[++i])){const td=el('td');td.innerHTML=inline(text);row.append(td)}table.append(row)}
+      wrap.append(table);n.append(wrap);list=null;continue;
+    }
+    const bullet=line.match(/^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/);
+    if(bullet){const type=bullet[1]?'ul':'ol';if(!list||list.tagName.toLowerCase()!==type){list=el(type);if(type==='ol')list.start=Number(bullet[2]);n.append(list)}const li=el('li');li.innerHTML=inline(bullet[3]);list.append(li);continue}
+    list=null;
+    const m=line.match(/^(#{1,4})\s+(.+)$/),quote=line.match(/^>\s?(.*)$/);
+    const p=el(m?'h'+Math.min(4,m[1].length+1):quote?'blockquote':'p');
+    p.innerHTML=inline(m?m[2]:quote?quote[1]:line);n.append(p);
+  }
+  if(code!==null){const pre=el('pre');pre.append(el('code','',code.join('\n')));n.append(pre)}
+  return n;
+}
+let styles={},device='pc';
+function sizeFor(v){
+  if(v?.startsWith('hfc_')){const m=styles[v];v=m?.[device]||m?.default||'normal'}
+  return ({'normal':'14px','small':'13px','x-small':'12px','notation':'12px','large':'16px','medium':'14px','heading':'18px','heading-2':'19px','heading-3':'17px','heading-4':'16px'})[v]||'';
+}
+function node(item){
+  if(!item||typeof item!=='object')return el('span');
+  let n;
+  if(item.tag==='markdown'||item.tag==='plain_text'||item.tag==='lark_md'){
+    n=markdown(item.content||'');if(item.element_id==='footer')n.classList.add('footer');const size=sizeFor(item.text_size);if(size)n.style.fontSize=size;return n;
+  }
+  if(item.tag==='hr')return el('hr');
+  if(item.tag==='collapsible_panel'){
+    n=el('details','panel');n.open=!!item.expanded;const h=item.header||{};n.append(el('summary','',String(h.title?.content||h.title||'执行过程').replace(/^[▸▾]\s*/,'')));
+    const inside=el('div','inside');(item.elements||[]).forEach(x=>inside.append(node(x)));n.append(inside);return n;
+  }
+  if(item.tag==='column_set'){n=el('div','cols');(item.columns||[]).forEach(x=>n.append(node(x)));return n}
+  if(item.tag==='button'){n=el('button',['primary','danger'].includes(item.type)?item.type:'',item.text?.content||'选择');n.disabled=true;n.title='离线预览，不会提交';return n}
+  if(item.tag==='input'||String(item.tag).startsWith('select_'))return el('div','field',item.placeholder?.content||'输入或选择内容');
+  if(item.tag==='table'){
+    n=el('div','table-wrap');const table=el('table'),head=el('tr'),columns=item.columns||[];
+    columns.forEach(c=>head.append(el('th','',c.display_name||c.name||'')));table.append(head);
+    (item.rows||[]).forEach(row=>{const tr=el('tr');columns.forEach(c=>tr.append(el('td','',String(row[c.name]??''))));table.append(tr)});n.append(table);return n;
+  }
+  n=el('div',item.tag==='column'?'col':item.tag==='action'?'actions':'');
+  if(item.text?.content)n.append(markdown(item.text.content));
+  (item.elements||item.actions||[]).forEach(x=>n.append(node(x)));return n;
+}
+function render(){
+  const sample=data.scenarios.find(x=>x.id===document.querySelector('#scenario').value)||data.scenarios[0];
+  device=document.querySelector('#viewport').value==='mobile'?'mobile':'pc';
+  const stage=document.querySelector('#stage');stage.classList.toggle('mobile',device==='mobile');stage.replaceChildren();
+  for(const [layout,label] of [['reading','A · 阅读优先（建议）'],['progress','B · 任务分区']]){
+    const column=el('div','column'),caption=el('div','rail-label',label);caption.append(el('span','',sample.label));column.append(caption);
+    const chat=el('div','chat'),sender=el('div','sender');sender.append(el('div','avatar','H'),el('span','','Hermes · 示例机器人'));chat.append(sender);
+    const payload=sample.cards[layout],card=el('article','card');styles=payload.config?.style?.text_size||{};
+    if(payload.header){const head=el('div','card-head '+(payload.header.template||''));head.append(el('div','card-title',payload.header.title?.content||''));if(payload.header.subtitle)head.append(el('div','card-subtitle',payload.header.subtitle.content));card.append(head)}
+    const body=el('div','card-body');(payload.body?.elements||payload.elements||[]).forEach(x=>body.append(node(x)));card.append(body);chat.append(card);column.append(chat);stage.append(column);
+  }
+}
+const select=document.querySelector('#scenario');data.scenarios.forEach(s=>{const option=el('option','',s.label);option.value=s.id;select.append(option)});
+select.addEventListener('change',render);document.querySelector('#viewport').addEventListener('change',render);
+document.querySelector('#theme').addEventListener('click',()=>{const dark=document.body.classList.toggle('dark');document.querySelector('#theme').textContent=dark?'切换浅色':'切换深色'});
+document.querySelector('#settings').textContent=JSON.stringify(data.configuration,null,2);render();
+</script>
+</html>

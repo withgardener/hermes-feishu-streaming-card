@@ -1,0 +1,18 @@
+server:
+  host: 0.0.0.0
+  port: 8765
+  allow_non_loopback: true
+
+feishu:
+  app_id: ""
+  app_secret: ""
+
+bindings:
+  native_chats:
+    - smoke-native-chat
+
+integrity:
+  mode: safe
+
+service:
+  manager: detached

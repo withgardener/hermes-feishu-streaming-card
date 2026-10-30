@@ -1,0 +1,88 @@
+{
+  "timestamp": "20260417_171943",
+  "project": "hermes-feishu-streaming-card",
+  "version": "v2.1-sidecar (in progress)",
+  "architecture": {
+    "mode": "sidecar (独立进程)",
+    "communication": "HTTP (aiohttp)",
+    "sidecar_port": 8765,
+    "adapter_pattern": "factory + dual-mode"
+  },
+  "current_state": {
+    "sidecar_server": {
+      "status": "running",
+      "pid": 28851,
+      "health": "healthy",
+      "events_endpoint": "200 OK (fixed)",
+      "active_cards": 0
+    },
+    "gateway": {
+      "status": "running",
+      "pid": 87647,
+      "feishu_connection": "connected"
+    },
+    "default_model": "MiniMax-M2.7",
+    "current_model": "step-3.5-flash-2603"
+  },
+  "recent_fixes": [
+    {
+      "time": "2026-04-17 16:48",
+      "issue": "Sidecar /events 404 (old process conflict)",
+      "fix": "Killed stale process, restarted clean",
+      "status": "fixed"
+    },
+    {
+      "time": "2026-04-17 16:45",
+      "issue": "cardkit_client.py finalize_card corrupted (duplicate code, syntax error)",
+      "fix": "Rewrote lines 350-469, removed duplicate blocks",
+      "status": "fixed"
+    }
+  ],
+  "known_issues": [
+    {
+      "id": "ISSUE-002",
+      "title": "Gateway event forwarding not implemented",
+      "priority": "P0",
+      "description": "feishu.py needs minimal patch to forward events to sidecar"
+    }
+  ],
+  "next_steps": [
+    {
+      "step": 1,
+      "action": "Implement gateway event forwarding patch",
+      "files": [
+        "~/.hermes/hermes-agent/gateway/platforms/feishu.py"
+      ]
+    },
+    {
+      "step": 2,
+      "action": "End-to-end test",
+      "command": "hermes chat"
+    },
+    {
+      "step": 3,
+      "action": "Add graceful degradation"
+    }
+  ],
+  "key_files": {
+    "sidecar_modules": [
+      "sidecar/server.py",
+      "sidecar/cardkit_client.py",
+      "sidecar/card_manager.py",
+      "sidecar/config.py",
+      "adapter/*.py"
+    ],
+    "gateway_target": "~/.hermes/hermes-agent/gateway/platforms/feishu.py",
+    "backup": "~/.hermes/hermes-agent/gateway/platforms/feishu.py.bak.20260415090316"
+  },
+  "config_paths": {
+    "hermes_config": "~/.hermes/config.yaml",
+    "sidecar_config": "~/.hermes/feishu-sidecar.yaml",
+    "sidecar_log": "~/.hermes/logs/feishu-sidecar.log"
+  },
+  "commands": {
+    "start_sidecar": "python -m sidecar.server --config ~/.hermes/feishu-sidecar.yaml",
+    "check_health": "curl http://localhost:8765/health",
+    "restart_gateway": "hermes gateway run --replace"
+  }
+}

@@ -1,0 +1,1700 @@
+from hermes_feishu_card.events import SidecarEvent
+from hermes_feishu_card.session import CardSession, InteractionState
+from copy import deepcopy
+import pytest
+import time
+
+
+class _StringSubclass(str):
+    pass
+
+
+def event(name, sequence, data, **overrides):
+    payload = {
+        "schema_version": "1",
+        "event": name,
+        "conversation_id": "chat-1",
+        "message_id": "msg-1",
+        "chat_id": "oc_abc",
+        "platform": "feishu",
+        "sequence": sequence,
+        "created_at": 1777017600.0 + sequence,
+        "data": data,
+    }
+    payload.update(overrides)
+    return SidecarEvent.from_dict(payload)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "interrupted", "incomplete"])
+def test_unsuccessful_completion_keeps_answer_and_metadata_without_success(outcome):
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.completed", 1, {
+        "answer": "已有部分结果", "turn_outcome": outcome,
+        "tokens": {"input_tokens": 42}, "duration": 12,
+    }))
+    assert session.status == "failed"
+    assert "已有部分结果" in session.answer_text
+    assert "本轮" in session.answer_text
+    assert session.tokens == {"input_tokens": 42}
+    assert session.duration == 12
+    assert not session.apply(event("answer.delta", 2, {"text": "late"}))
+
+
+@pytest.mark.parametrize("outcome", [None, "unknown", {}, []])
+def test_unknown_completion_outcome_retains_legacy_behavior(outcome):
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.completed", 1, {
+        "answer": "普通答案", "turn_outcome": outcome,
+    }))
+    assert session.status == "completed"
+    assert session.answer_text == "普通答案"
+
+
+_STREAMED_ANSWER = "这是一轮正在进行的流式回答。" * 4
+_PROVIDER_FAILURE = (
+    "\u26a0\ufe0f The model provider failed after retries. I kept raw provider "
+    "details out of chat; check gateway logs for diagnostics."
+)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "interrupted", "incomplete"])
+@pytest.mark.parametrize("tool_event_between", [False, True])
+def test_unsuccessful_completion_keeps_streamed_answer(outcome, tool_event_between):
+    """An unsuccessful turn appends its notice; it never blanks the streamed answer. (#307)
+
+    Both shapes matter: a tool event between the streamed text and the completion is
+    what arms the answer archive, so it used to take a different branch to the same
+    data loss.
+    """
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.started", 1, {"display_status": "running"}))
+    assert session.apply(event("answer.delta", 2, {"text": _STREAMED_ANSWER}))
+    sequence = 3
+    if tool_event_between:
+        assert session.apply(event("tool.updated", sequence, {
+            "tool_id": "t1", "name": "terminal", "status": "running",
+        }))
+        sequence += 1
+
+    assert session.apply(event("message.completed", sequence, {
+        "answer": _PROVIDER_FAILURE, "turn_outcome": outcome,
+    }))
+
+    assert session.status == "failed"
+    assert _STREAMED_ANSWER in session.answer_text
+    assert _PROVIDER_FAILURE in session.answer_text
+    assert "本轮" in session.answer_text
+    # The answer the user was reading still reads first; the failure notice follows it.
+    assert session.answer_text.index(
+        _STREAMED_ANSWER
+    ) < session.answer_text.index(_PROVIDER_FAILURE)
+
+
+def test_unsuccessful_completion_keeps_short_streamed_answer():
+    """Length gates meant for success must not delete an unsuccessful turn's text. (#307)
+
+    A completion shorter than the 3:1 ratio gate used to send the streamed text to the
+    reasoning archive and leave the body holding only the error notice.
+    """
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("answer.delta", 1, {"text": "短答案，仍在流式输出中。"}))
+    assert session.apply(event("message.completed", 2, {
+        "answer": _PROVIDER_FAILURE, "turn_outcome": "failed",
+    }))
+
+    assert "短答案，仍在流式输出中。" in session.answer_text
+    assert _PROVIDER_FAILURE in session.answer_text
+
+
+def test_thinking_accumulates_and_strips_tags():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("thinking.delta", 1, {"text": "<think>先分析"}))
+    assert session.apply(event("thinking.delta", 2, {"text": "</think>结束。"}))
+    assert session.thinking_text == "先分析结束。"
+
+
+def test_terminal_native_disposition_defaults_empty_and_can_be_persisted():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.terminal_disposition == ""
+    assert session.terminal_limit_reason == ""
+    assert session.terminal_handoff_record is None
+
+    session.terminal_disposition = "native"
+    session.terminal_limit_reason = "json_bytes"
+
+    assert session.terminal_disposition == "native"
+    assert session.terminal_limit_reason == "json_bytes"
+
+
+def test_thinking_append_block_preserves_complete_interim_messages():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("thinking.delta", 1, {"text": "我先来讲今天的 AI。", "mode": "append_block"}))
+    assert session.apply(event("thinking.delta", 2, {"text": "接着看第二个现象。", "mode": "append_block"}))
+
+    assert session.thinking_text == "我先来讲今天的 AI。\n\n接着看第二个现象。"
+
+
+def test_started_message_uses_feishu_message_id_as_native_reply_anchor():
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {},
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.reply_to_message_id == "om_user_message"
+
+
+def test_reply_in_thread_placement_is_sticky_within_session():
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"reply_in_thread": "true"},
+            message_id="om_user_message",
+        )
+    )
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "placement-choice",
+                "prompt": "是否继续？",
+                "options": [{"label": "继续", "value": "yes"}],
+            },
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.reply_in_thread is True
+
+
+def test_out_of_band_interaction_completion_does_not_consume_transport_sequence():
+    session = CardSession(
+        conversation_id="chat-1",
+        message_id="msg-1",
+        chat_id="oc_abc",
+    )
+
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "clarify-first",
+                "kind": "clarify",
+                "prompt": "第一个问题",
+                "options": [{"label": "A", "value": "a"}],
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "interaction.completed",
+            2,
+            {
+                "interaction_id": "clarify-first",
+                "choice": "a",
+                "choice_label": "A",
+            },
+        ),
+        advance_sequence=False,
+    )
+
+    assert session.last_sequence == 1
+    assert session.apply(
+        event(
+            "interaction.requested",
+            2,
+            {
+                "interaction_id": "clarify-second",
+                "kind": "clarify",
+                "prompt": "第二个问题",
+                "options": [{"label": "B", "value": "b"}],
+            },
+        )
+    )
+    assert session.active_interaction is not None
+    assert session.active_interaction.interaction_id == "clarify-second"
+
+
+@pytest.mark.parametrize(
+    ("sender_open_id", "expected"),
+    (
+        ("ou_sender-01", "ou_sender-01"),
+        ('ou_bad"><at user_id="ou_other"', ""),
+        ("on_wrong_kind", ""),
+        (_StringSubclass("ou_subclass"), ""),
+    ),
+)
+def test_session_records_only_exact_feishu_sender_open_id(sender_open_id, expected):
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"sender_open_id": sender_open_id},
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.sender_open_id == expected
+
+
+def test_rejects_duplicate_and_stale_sequence():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("thinking.delta", 2, {"text": "新"}))
+    assert not session.apply(event("thinking.delta", 2, {"text": "重复"}))
+    assert not session.apply(event("thinking.delta", 1, {"text": "旧"}))
+    assert session.thinking_text == "新"
+
+
+def test_terminal_completion_applies_even_when_streaming_delta_sequence_arrived_ahead():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("answer.delta", 100, {"text": "部分答案"}))
+
+    assert session.apply(event("message.completed", 90, {"answer": "最终答案"}))
+
+    assert session.status == "completed"
+    assert session.visible_main_text == "最终答案"
+    assert session.last_sequence == 100
+
+
+def test_blank_completion_preserves_streamed_answer_delta():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("answer.delta", 10, {"text": "DeepSeek 已生成答案"}))
+
+    assert session.apply(event("message.completed", 11, {"answer": "   "}))
+
+    assert session.status == "completed"
+    assert session.visible_main_text == "DeepSeek 已生成答案"
+
+
+def test_completion_carries_explicit_display_status_into_session():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "message.completed",
+            1,
+            {
+                "answer": "数据收集中，数据到位后我会继续生成报告。",
+                "display_status": "in_progress",
+            },
+        )
+    )
+
+    assert session.status == "completed"
+    assert session.display_status == "in_progress"
+    assert session.display_status_source == "explicit"
+
+
+def test_completion_persists_inferred_display_status_source():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "message.completed",
+            1,
+            {"answer": "数据收集中，数据到位后我会继续生成报告。"},
+        )
+    )
+
+    assert session.display_status == ""
+    assert session.display_status_source == "inferred"
+
+
+def test_invalid_explicit_display_status_falls_back_to_session_semantics():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "message.completed",
+            1,
+            {"answer": "最终答案", "display_status": "done"},
+        )
+    )
+
+    assert session.display_status == ""
+    assert session.display_status_source == "session"
+
+
+def test_later_event_without_explicit_status_clears_stale_override():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(
+        event("message.started", 0, {"display_status": "thinking"})
+    )
+    assert session.display_status == "thinking"
+
+    assert session.apply(event("message.completed", 1, {"answer": "最终答案"}))
+
+    assert session.status == "completed"
+    assert session.display_status == ""
+    assert session.display_status_source == "session"
+
+
+def test_pending_interaction_clears_explicit_status_to_session_source():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.started", 0, {"display_status": "thinking"}))
+
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {"interaction_id": "approval-1", "prompt": "请选择"},
+        )
+    )
+
+    assert session.display_status == ""
+    assert session.display_status_source == "session"
+
+
+def test_runtime_admission_is_hidden_frozen_and_erased_on_completion():
+    descriptor = {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": "http://127.0.0.1:43210/runtime/interactions/resolve",
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-1",
+                "kind": "approval",
+                "prompt": "请选择",
+                "options": [{"label": "允许", "value": "once"}],
+                "_hfc_runtime_admission": descriptor,
+            },
+            turn_id="turn-1",
+            event_id="patch:turn-1:interaction:approval-1:1",
+            producer="patch",
+            phase="started",
+        )
+    )
+    descriptor["token"] = "d" * 64
+    interaction = session.active_interaction
+    assert interaction is not None
+    assert interaction.runtime_admission["token"] == "c" * 64
+    assert "c" * 64 not in repr(interaction)
+    with pytest.raises(TypeError):
+        interaction.runtime_admission["token"] = "d" * 64
+    snapshot = deepcopy(session)
+    assert snapshot.active_interaction.runtime_admission["token"] == "c" * 64
+    assert snapshot.active_interaction.runtime_admission is not interaction.runtime_admission
+
+    assert session.apply(
+        event(
+            "interaction.completed",
+            2,
+            {"interaction_id": "approval-1", "choice": "once"},
+        )
+    )
+    assert interaction.runtime_admission is None
+
+
+def test_failed_event_clears_explicit_status_to_session_source():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.started", 0, {"display_status": "thinking"}))
+
+    assert session.apply(event("message.failed", 1, {"error": "处理失败"}))
+
+    assert session.display_status == ""
+    assert session.display_status_source == "session"
+
+
+def test_tool_count_tracks_invocations_instead_of_lifecycle_events():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    session.apply(event("tool.updated", 1, {"tool_id": "t1", "name": "search", "status": "running"}))
+    session.apply(event("tool.updated", 2, {"tool_id": "t1", "name": "search", "status": "completed"}))
+    session.apply(event("tool.updated", 3, {"tool_id": "t2", "name": "fetch", "status": "completed"}))
+    assert session.tool_count == 2
+    assert len(session.tools) == 2
+    assert session.tools["t1"].status == "completed"
+
+
+def test_subagent_start_stop_updates_one_distinct_timeline_item_without_tool_count():
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {
+                "child_id": "child-1",
+                "role": "research",
+                "status": "running",
+                "goal_preview": "分析 <风险>",
+                "goal": "raw alias must not appear",
+                "tool_history": [{"secret": "must not appear"}],
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {
+                "child_id": "child-1",
+                "role": "research",
+                "status": "completed",
+                "duration_ms": 12,
+                "summary_preview": "完成核验",
+                "summary": "raw summary must not appear",
+                "args": {"secret": "must not appear"},
+                "result": "must not appear",
+            },
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert [(item.kind, item.status) for item in entries] == [
+        ("subagent", "completed")
+    ]
+    assert entries[0].subagent_id == "child-1"
+    assert "完成核验" in entries[0].detail
+    assert "12 ms" in entries[0].detail
+    assert "raw" not in entries[0].detail
+    assert "secret" not in entries[0].detail
+    assert session.tool_count == 0
+
+
+@pytest.mark.parametrize("child_id", [None, "", "   ", 123, _StringSubclass("child")])
+def test_subagent_requires_exact_nonblank_child_id(child_id):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": child_id, "status": "running"},
+        )
+    )
+    assert session.timeline.snapshot() == []
+    assert session.last_sequence == 1
+
+
+def test_terminal_subagent_cannot_be_reopened_by_late_running_update():
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": "child-1", "status": "failed"},
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {"child_id": "child-1", "status": "running"},
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert len(entries) == 1
+    assert entries[0].status == "failed"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "completed",
+        "success",
+        "succeeded",
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+        "timeout",
+        "blocked",
+        "interrupted",
+    ],
+)
+def test_all_terminal_subagent_statuses_reject_late_running_update(terminal_status):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": "child-1", "status": terminal_status},
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {"child_id": "child-1", "status": "running"},
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert len(entries) == 1
+    assert entries[0].status == terminal_status
+
+
+@pytest.mark.parametrize(
+    "duration_ms",
+    [True, "12", -1, float("nan"), float("inf"), float("-inf")],
+)
+def test_subagent_ignores_non_numeric_or_non_finite_duration(duration_ms):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {
+                "child_id": "child-1",
+                "status": "completed",
+                "duration_ms": duration_ms,
+                "summary_preview": "完成",
+            },
+        )
+    )
+
+    assert session.timeline.snapshot()[0].detail == "完成"
+
+
+def test_compaction_notice_sets_runtime_phase_without_changing_answer():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "system.notice",
+            1,
+            {
+                "notice_kind": "context-compaction",
+                "phase": "started",
+                "title": "正在压缩上下文",
+                "content": "正在总结较早的对话，完成后会继续当前任务。",
+            },
+        )
+    )
+
+    assert session.runtime_phase_text == "正在压缩上下文"
+    assert session.answer_text == ""
+    assert session.runtime_header_text == "正在压缩上下文"
+
+
+def test_generic_notice_does_not_set_runtime_phase():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "system.notice",
+            1,
+            {
+                "notice_kind": "system",
+                "phase": "started",
+                "title": "运行提示",
+                "content": "普通提示",
+            },
+        )
+    )
+
+    assert session.runtime_phase_text == ""
+
+
+@pytest.mark.parametrize(
+    ("event_name", "data"),
+    [
+        ("thinking.delta", {"text": "继续思考"}),
+        ("answer.delta", {"text": "继续回答"}),
+        (
+            "tool.updated",
+            {
+                "tool_id": "tool-1",
+                "name": "terminal",
+                "status": "running",
+                "detail": "pytest",
+            },
+        ),
+        ("message.completed", {"answer": "完成"}),
+        ("message.failed", {"error": "失败"}),
+    ],
+)
+def test_runtime_activity_clears_compaction_phase(event_name, data):
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(
+        event(
+            "system.notice",
+            1,
+            {
+                "notice_kind": "context-compaction",
+                "phase": "started",
+                "title": "正在压缩上下文",
+            },
+        )
+    )
+
+    assert session.apply(event(event_name, 2, data))
+
+    assert session.runtime_phase_text == ""
+
+
+def test_tool_update_builds_compact_detail_from_arguments_duration_and_error():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "search-1",
+                "name": "web_search",
+                "status": "failed",
+                "arguments": {"query": "广州天气", "limit": 3},
+                "duration_ms": 1234,
+                "error": "timeout",
+            },
+        )
+    )
+
+    detail = session.tools["search-1"].detail
+    assert "参数: {\"query\": \"广州天气\", \"limit\": 3}" in detail
+    assert "耗时: 1.23s" in detail
+    assert "失败: timeout" in detail
+
+
+def test_tool_update_computes_duration_from_lifecycle_when_event_omits_it():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "search-1",
+                "name": "web_search",
+                "status": "running",
+                "detail": "DeepSeek V4 official release",
+                "arguments": {"query": "DeepSeek V4 official release", "limit": 5},
+            },
+            created_at=100.0,
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "search-1",
+                "name": "web_search",
+                "status": "completed",
+            },
+            created_at=101.75,
+        )
+    )
+
+    detail = session.tools["search-1"].detail
+    assert "DeepSeek V4 official release" in detail
+    assert '参数: {"query": "DeepSeek V4 official release", "limit": 5}' in detail
+    assert "耗时: 1.75s" in detail
+
+
+def test_tool_update_prefers_explicit_duration_over_lifecycle_duration():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {"tool_id": "search-1", "name": "web_search", "status": "running"},
+            created_at=100.0,
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "search-1",
+                "name": "web_search",
+                "status": "completed",
+                "duration_ms": 250,
+            },
+            created_at=105.0,
+        )
+    )
+
+    assert "耗时: 250ms" in session.tools["search-1"].detail
+    assert "5s" not in session.tools["search-1"].detail
+
+
+def test_terminal_only_tool_update_does_not_invent_duration():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "search-1",
+                "name": "web_search",
+                "status": "completed",
+            },
+            created_at=101.75,
+        )
+    )
+
+    assert "耗时:" not in session.tools["search-1"].detail
+
+
+def test_completion_replaces_thinking_with_answer():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    session.apply(event("thinking.delta", 1, {"text": "思考内容。"}))
+    session.apply(
+        event(
+            "message.completed",
+            2,
+            {"answer": "最终答案", "tokens": {"input_tokens": 10}, "duration": 3.5},
+        )
+    )
+    assert session.status == "completed"
+    assert session.visible_main_text == "最终答案"
+
+
+def test_completion_stores_model_and_context_footer_metadata():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "message.completed",
+            1,
+            {
+                "answer": "最终答案",
+                "model": "MiniMax M2.7",
+                "context": {"used_tokens": 182_000, "max_tokens": 204_000},
+            },
+        )
+    )
+
+    assert session.model == "MiniMax M2.7"
+    assert session.context == {"used_tokens": 182_000, "max_tokens": 204_000}
+
+
+def test_session_stores_attachment_and_delivery_metadata():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"delivery_kind": "chat", "reply_to_message_id": "om_parent"},
+        )
+    )
+    assert session.apply(
+        event(
+            "message.completed",
+            1,
+            {
+                "answer": "最终答案",
+                "attachments": [
+                    {"kind": "file", "name": "report.pdf", "summary": "report.pdf"},
+                    {"kind": "image", "summary": "missing-name.png"},
+                    "bad",
+                ],
+            },
+        )
+    )
+
+    assert session.delivery_kind == "chat"
+    assert session.reply_to_message_id == "om_parent"
+    assert session.attachments == [
+        {"kind": "file", "name": "report.pdf", "summary": "report.pdf"}
+    ]
+    assert session.visible_main_text == "最终答案"
+
+
+def test_session_tracks_pending_and_completed_interaction():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-1",
+                "kind": "approval",
+                "prompt": "允许执行命令吗？",
+                "description": "rm -rf /tmp/demo",
+                "allow_custom_input": False,
+                "options": [
+                    {"label": "允许一次", "value": "once"},
+                    {"label": "拒绝", "value": "deny", "style": "danger"},
+                ],
+            },
+        )
+    )
+
+    assert session.active_interaction is not None
+    assert session.active_interaction.interaction_id == "approval-1"
+    assert session.active_interaction.status == "pending"
+    assert session.active_interaction.options[0].value == "once"
+    assert session.active_interaction.allow_custom_input is False
+
+    assert session.apply(
+        event(
+            "interaction.completed",
+            2,
+            {
+                "interaction_id": "approval-1",
+                "choice": "once",
+                "choice_label": "允许一次",
+                "user_name": "Bailey",
+            },
+        )
+    )
+
+    assert session.active_interaction is not None
+    assert session.active_interaction.status == "completed"
+    assert session.active_interaction.choice == "once"
+    assert session.active_interaction.choice_label == "允许一次"
+    assert session.active_interaction.user_name == "Bailey"
+
+
+def test_interaction_expiry_uses_absolute_sidecar_deadline_and_is_idempotent():
+    interaction = InteractionState(
+        interaction_id="approval-expiry",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=5.0,
+        requested_at=100.0,
+    )
+
+    assert interaction.expires_at == 105.0
+    assert interaction.is_expired(104.999) is False
+    assert interaction.is_expired(105.0) is True
+    assert interaction.expire(105.0) is True
+    assert interaction.status == "failed"
+    assert interaction.error == "交互已过期"
+    assert interaction.expire(106.0) is False
+
+
+def test_zero_timeout_interaction_expires_immediately():
+    interaction = InteractionState(
+        interaction_id="approval-zero",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=0.0,
+        requested_at=100.0,
+    )
+
+    assert interaction.expires_at == 100.0
+    assert interaction.is_expired(100.0) is True
+
+
+def test_system_notice_records_and_updates_timeline_entry():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "system.notice",
+            1,
+            {
+                "title": "运行提示",
+                "content": "Working - 2 min - iteration 1/90, terminal",
+                "notice_id": "heartbeat",
+                "level": "info",
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "system.notice",
+            2,
+            {
+                "title": "运行提示",
+                "content": "Working - 3 min - iteration 2/90, terminal",
+                "notice_id": "heartbeat",
+                "level": "info",
+            },
+        )
+    )
+
+    entries = [item for item in session.timeline.snapshot() if item.kind == "notice"]
+    assert len(entries) == 1
+    assert entries[0].title == "运行提示"
+    assert entries[0].content == "Working - 3 min - iteration 2/90, terminal"
+    assert session.status == "thinking"
+
+
+def test_independent_system_notice_becomes_completed_notice_card():
+    session = CardSession(conversation_id="chat-1", message_id="notice-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "system.notice",
+            1,
+            {
+                "title": "会话已自动重置",
+                "content": "Session automatically reset.",
+                "notice_scope": "independent",
+                "level": "success",
+            },
+            message_id="notice-1",
+        )
+    )
+
+    assert session.delivery_kind == "notice"
+    assert session.notice_title == "会话已自动重置"
+    assert session.notice_level == "success"
+    assert session.status == "completed"
+    assert session.visible_main_text == "Session automatically reset."
+    assert session.timeline.snapshot() == []
+
+
+def test_independent_terminal_notice_applies_after_sequence_resets():
+    session = CardSession(
+        conversation_id="chat-1", message_id="notice-process", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "system.notice",
+            100,
+            {
+                "title": "后台进程运行中",
+                "content": "Updating files: 76%",
+                "notice_scope": "independent",
+                "notice_terminal": False,
+            },
+            message_id="notice-process",
+        )
+    )
+    assert session.status == "running"
+
+    assert session.apply(
+        event(
+            "system.notice",
+            1,
+            {
+                "title": "后台进程已完成",
+                "content": "Updating files: 100%, done.",
+                "notice_scope": "independent",
+                "notice_terminal": True,
+            },
+            message_id="notice-process",
+        )
+    )
+    assert session.status == "completed"
+    assert session.last_sequence == 100
+    assert session.visible_main_text == "Updating files: 100%, done."
+
+
+def test_answer_delta_takes_over_visible_text_before_completion():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("thinking.delta", 1, {"text": "思考内容。"}))
+    assert session.visible_main_text == "思考内容。"
+
+    assert session.apply(event("answer.delta", 2, {"text": "答案开始"}))
+
+    assert session.status == "thinking"
+    assert session.visible_main_text == "答案开始"
+
+
+def test_split_think_tags_do_not_leak_across_chunks():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("thinking.delta", 1, {"text": "<thi"}))
+    assert session.apply(event("tool.updated", 2, {"tool_id": "t1", "name": "search", "status": "running"}))
+    assert session.apply(event("thinking.delta", 3, {"text": "nk>先分析</thi"}))
+    assert session.apply(event("thinking.delta", 4, {"text": "nk>结束"}))
+    assert session.thinking_text == "先分析结束"
+    reasoning_entries = [item for item in session.timeline.snapshot() if item.kind == "reasoning"]
+    assert reasoning_entries == []
+    assert session.timeline.snapshot()[0].kind == "tool"
+
+    assert session.apply(event("answer.delta", 5, {"text": "<thi"}))
+    assert session.apply(event("answer.delta", 6, {"text": "nk>答案</thi"}))
+    assert session.apply(event("answer.delta", 7, {"text": "nk>完成"}))
+    assert session.answer_text == "答案完成"
+
+
+def test_completed_state_rejects_later_mutations():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("thinking.delta", 1, {"text": "思考"}))
+    assert session.apply(event("tool.updated", 2, {"tool_id": "t1", "name": "search", "status": "running"}))
+    assert session.apply(event("message.completed", 3, {"answer": "最终答案"}))
+
+    assert not session.apply(event("thinking.delta", 4, {"text": "更多"}))
+    assert not session.apply(event("tool.updated", 5, {"tool_id": "t2", "name": "fetch", "status": "completed"}))
+    assert not session.apply(event("message.completed", 6, {"answer": "覆盖答案"}))
+
+    assert session.status == "completed"
+    assert session.visible_main_text == "最终答案"
+    assert session.thinking_text == "思考"
+    assert session.tool_count == 1
+
+
+def test_rejects_mismatched_conversation_id_and_chat_id():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert not session.apply(event("thinking.delta", 1, {"text": "错会话"}, conversation_id="chat-2"))
+    assert not session.apply(event("thinking.delta", 2, {"text": "错群"}, chat_id="oc_other"))
+    assert session.thinking_text == ""
+    assert session.last_sequence == -1
+
+
+def test_missing_or_empty_tool_id_does_not_create_tool():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("tool.updated", 1, {"name": "search", "status": "running"}))
+    assert session.apply(event("tool.updated", 2, {"tool_id": "", "name": "fetch", "status": "completed"}))
+    assert session.tool_count == 0
+    assert session.last_sequence == 2
+
+
+def test_tool_metadata_uses_defaults_for_non_strings():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("tool.updated", 1, {"tool_id": "t1", "name": None, "status": None, "detail": None}))
+    assert session.tools["t1"].name == "t1"
+    assert session.tools["t1"].status == "running"
+    assert session.tools["t1"].detail == ""
+
+
+def test_completion_bad_metadata_uses_safe_defaults():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.completed", 1, {"answer": "最终答案", "tokens": None, "duration": "abc"}))
+    assert session.tokens == {}
+    assert session.duration == 0.0
+
+
+def test_failed_visible_main_text_shows_error():
+    """The failure text is shown — and it must not REPLACE what the user was reading.
+
+    Maintainer note (contract change): this used to assert `visible_main_text == "失败原因"` while a
+    thinking delta had already been streamed. That pinned the erasure: both readers of the card's
+    main text return `answer_text` alone once the status is `failed`, so the in-progress content
+    disappeared and the card was left showing nothing but the error. The user reported exactly that
+    for an HTTP 403 arriving mid-turn (「这种以后能否不要覆盖掉正在做的事项内容」).
+
+    What this test guards now: the error is still visible AND the streamed content survives beside it.
+    """
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("thinking.delta", 1, {"text": "旧思考"}))
+    assert session.apply(event("message.failed", 2, {"error": "失败原因"}))
+    assert session.status == "failed"
+    assert "失败原因" in session.visible_main_text
+    assert "旧思考" in session.visible_main_text
+
+
+def test_a_failure_with_nothing_streamed_still_reports_the_error_alone():
+    """Fallback path: with no streamed content at all, the error IS the content.
+
+    This is the shape the rewritten test above used to cover, kept explicit so the no-content
+    fallback stays tested rather than being dropped along with the old assertion.
+    """
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("message.failed", 1, {"error": "失败原因"}))
+    assert session.status == "failed"
+    assert session.visible_main_text == "失败原因"
+
+
+def test_failure_keeps_partial_answer_visible_and_rejects_late_success():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(event("answer.delta", 1, {"text": "已经查到的结果"}))
+    assert session.apply(event("message.failed", 2, {"error": "provider unavailable"}))
+    assert "已经查到的结果" in session.visible_main_text
+    assert "provider unavailable" in session.visible_main_text
+    assert not session.apply(event("message.completed", 3, {"answer": "late success"}))
+    assert session.status == "failed"
+
+
+def test_repeated_running_updates_do_not_inflate_tool_count():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    for i in range(3):
+        e = event("tool.updated", i, {"tool_id": "web_search", "name": "web_search", "status": "running"})
+        session.apply(e)
+    assert session.tool_count == 1
+    assert len(session.tools) == 1
+
+
+def test_explicit_tool_call_identity_deduplicates_terminal_and_late_start():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    data = {"tool_id": "terminal", "call_id": "call_a", "name": "terminal"}
+    assert session.apply(event("tool.updated", 1, dict(data, status="running"), created_at=100))
+    assert session.apply(event("tool.updated", 2, dict(data, status="completed", detail="done"), created_at=102))
+    assert session.apply(event("tool.updated", 3, dict(data, status="completed", detail="done"), created_at=150))
+    assert session.apply(event("tool.updated", 4, dict(data, status="running", detail="late"), created_at=100))
+    assert session.tool_count == 1
+    assert session.tools["call_a"].status == "completed"
+    assert session.tools["call_a"].ordinal == 1
+    assert session.tools["call_a"].duration_ms == 2000
+    assert "late" not in session.latest_tool_preview
+    rows = [row for row in session.timeline.snapshot() if row.kind == "tool"]
+    assert len(rows) == 1 and rows[0].status == "completed"
+    assert "2s" in rows[0].detail
+
+
+def test_distinct_calls_reusing_tool_name_do_not_merge_or_steal_late_results():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    for seq, call, status in ((1,"a","running"),(2,"a","completed"),(3,"b","running"),
+                              (4,"a","completed"),(5,"b","completed")):
+        assert session.apply(event("tool.updated", seq, {
+            "tool_id":"terminal", "call_id":call, "name":"terminal", "status":status,
+        }))
+    assert session.tool_count == 2
+    assert session.tools["a"].ordinal == 1 and session.tools["b"].ordinal == 2
+    assert len([row for row in session.timeline.snapshot() if row.kind == "tool"]) == 2
+
+
+def test_parallel_same_name_tools_keep_details_and_durations_separate():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "call-1",
+                "name": "web_search",
+                "status": "running",
+                "detail": "DeepSeek V4 official release July 2026 live status",
+            },
+            created_at=100.0,
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "call-2",
+                "name": "web_search",
+                "status": "running",
+                "detail": "site:api-docs.deepseek.com V4 models latest",
+            },
+            created_at=100.01,
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            3,
+            {"tool_id": "call-1", "name": "web_search", "status": "completed"},
+            created_at=102.12,
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            4,
+            {"tool_id": "call-2", "name": "web_search", "status": "completed"},
+            created_at=102.48,
+        )
+    )
+
+    entries = [item for item in session.timeline.snapshot() if item.kind == "tool"]
+
+    assert session.tool_count == 2
+    assert len(entries) == 2
+    assert entries[0].tool_id == "call-1"
+    assert entries[0].detail == "DeepSeek V4 official release July 2026 live status\n耗时: 2.12s"
+    assert entries[1].tool_id == "call-2"
+    assert entries[1].detail == "site:api-docs.deepseek.com V4 models latest\n耗时: 2.47s"
+
+
+def test_timeline_preserves_repeated_completed_tool_calls_with_same_id():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    for index in range(3):
+        assert session.apply(
+            event(
+                "tool.updated",
+                index,
+                {
+                    "tool_id": "execute_code",
+                    "name": "execute_code",
+                    "status": "completed",
+                    "detail": f"第 {index + 1} 次执行",
+                },
+            )
+        )
+
+    entries = [item for item in session.timeline.snapshot() if item.kind == "tool"]
+
+    assert session.tool_count == 3
+    assert len(entries) == 3
+    assert [item.detail for item in entries] == ["第 1 次执行", "第 2 次执行", "第 3 次执行"]
+
+
+def test_timeline_updates_running_tool_until_terminal_status():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "running",
+                "detail": "开始读取",
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "completed",
+                "detail": "读取完成",
+            },
+        )
+    )
+
+    entries = [item for item in session.timeline.snapshot() if item.kind == "tool"]
+
+    assert len(entries) == 1
+    assert entries[0].status == "completed"
+    assert entries[0].detail == "读取完成\n耗时: 1s"
+
+
+def test_session_keeps_current_answer_visible_until_next_answer_block():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("answer.delta", 1, {"text": "好的，我先做分析再动手。"}))
+    assert session.answer_text == "好的，我先做分析再动手。"
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "terminal",
+                "name": "terminal",
+                "status": "running",
+                "detail": "gh release view",
+            },
+        )
+    )
+
+    entries = session.timeline.snapshot()
+
+    assert session.answer_text == "好的，我先做分析再动手。"
+    assert [(item.kind, item.title, item.status) for item in entries] == [
+        ("tool", "terminal", "running"),
+    ]
+
+    assert session.apply(event("answer.delta", 3, {"text": "我再补一轮验证。"}))
+    assert session.answer_text == "我再补一轮验证。"
+    entries = session.timeline.snapshot()
+    assert [(item.kind, item.title, item.status) for item in entries] == [
+        ("reasoning", "思考 1", "completed"),
+        ("tool", "terminal", "running"),
+    ]
+    assert entries[0].content == "好的，我先做分析再动手。"
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            4,
+            {
+                "tool_id": "readme",
+                "name": "read_file",
+                "status": "completed",
+                "detail": "README.md",
+            },
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert session.answer_text == "我再补一轮验证。"
+    assert [(item.kind, item.title, item.status) for item in entries] == [
+        ("reasoning", "思考 1", "completed"),
+        ("tool", "terminal", "running"),
+        ("tool", "read_file", "completed"),
+    ]
+
+    assert session.apply(event("message.completed", 5, {"answer": "最终答案。"}))
+    entries = session.timeline.snapshot()
+    assert session.answer_text == "最终答案。"
+    assert [(item.kind, item.title, item.status) for item in entries] == [
+        ("reasoning", "思考 1", "completed"),
+        ("tool", "terminal", "running"),
+        ("reasoning", "思考 2", "completed"),
+        ("tool", "read_file", "completed"),
+    ]
+    assert entries[2].content == "我再补一轮验证。"
+
+
+def test_tool_count_increments_for_different_tool_ids():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    for i, tid in enumerate(["a", "b", "c"]):
+        e = event("tool.updated", i, {"tool_id": tid, "name": tid, "status": "running"})
+        session.apply(e)
+    assert session.tool_count == 3
+    assert len(session.tools) == 3
+
+
+def test_session_timeline_records_pre_tool_preface_tool_answer_order():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("answer.delta", 1, {"text": "先看约束。"}))
+    assert session.apply(event("tool.updated", 2, {"tool_id": "read", "name": "read_file", "status": "running", "detail": "README.md"}))
+    assert session.apply(event("tool.updated", 3, {"tool_id": "read", "name": "read_file", "status": "completed", "detail": "README.md"}))
+    assert session.apply(event("answer.delta", 4, {"text": "最终回答开始"}))
+
+    entries = session.timeline.snapshot()
+    assert [(item.kind, item.title, item.status) for item in entries] == [
+        ("reasoning", "思考 1", "completed"),
+        ("tool", "read_file", "completed"),
+    ]
+    assert entries[0].content == "先看约束。"
+    assert entries[1].detail == "README.md\n耗时: 1s"
+    assert session.answer_text == "最终回答开始"
+
+
+def test_session_keeps_post_tool_answer_out_of_reasoning_on_completion():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("answer.delta", 1, {"text": "先验证版本。"}))
+    assert session.apply(event("tool.updated", 2, {"tool_id": "gh", "name": "terminal", "status": "completed"}))
+    assert session.apply(event("answer.delta", 3, {"text": "还差 README，我继续查。"}))
+
+    assert session.apply(event("message.completed", 4, {"answer": "最终答案：V3.8.1 变化如下。"}))
+
+    entries = session.timeline.snapshot()
+    assert session.status == "completed"
+    assert session.answer_text == "最终答案：V3.8.1 变化如下。"
+    assert [(item.kind, item.title, item.status) for item in entries] == [
+        ("reasoning", "思考 1", "completed"),
+        ("tool", "terminal", "completed"),
+    ]
+    assert entries[0].content == "先验证版本。"
+    assert "还差 README，我继续查。" not in "\n".join(
+        item.content for item in entries
+    )
+
+
+def test_session_preserves_post_tool_answer_prefix_in_completed_answer():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("tool.updated", 1, {"tool_id": "gh", "name": "terminal", "status": "completed"}))
+    assert session.apply(event("answer.delta", 2, {"text": "3. 补查结果\nREADME 和 diff 都查完了。"}))
+
+    assert session.apply(
+        event(
+            "message.completed",
+            3,
+            {
+                "answer": (
+                    "3. 补查结果\nREADME 和 diff 都查完了。\n\n"
+                    "---\n\n"
+                    "最终总结：v3.7.0 到 v3.8.1 主要变化如下。"
+                )
+            },
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert session.answer_text == (
+        "3. 补查结果\nREADME 和 diff 都查完了。\n\n"
+        "---\n\n"
+        "最终总结：v3.7.0 到 v3.8.1 主要变化如下。"
+    )
+    assert all(entry.kind != "reasoning" for entry in entries)
+
+
+def test_completed_answer_keeps_nearly_complete_streamed_body_after_tools():
+    session = CardSession(
+        conversation_id="chat-1",
+        message_id="msg-1",
+        chat_id="oc_abc",
+    )
+    answer = "Today test_node status: 95% success rate. Overall healthy."
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {"tool_id": "terminal-1", "name": "terminal", "status": "completed"},
+        )
+    )
+    assert session.apply(event("answer.delta", 2, {"text": answer}))
+    assert session.apply(event("message.completed", 3, {"answer": answer + "."}))
+
+    assert session.answer_text == answer + "."
+
+
+def test_session_raw_thinking_blocks_do_not_enter_timeline():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("thinking.delta", 1, {"text": "第一句", "mode": "append_block"}))
+    assert session.apply(event("thinking.delta", 2, {"text": "第二句", "mode": "append_block"}))
+
+    entries = session.timeline.snapshot()
+    assert entries == []
+    assert session.thinking_text == "第一句\n\n第二句"
+
+
+def test_session_raw_thinking_replace_mode_stays_internal():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(event("thinking.delta", 1, {"text": "我先看"}))
+    assert session.apply(event("thinking.delta", 2, {"text": "我先看看今天的变更", "mode": "replace"}))
+
+    entries = session.timeline.snapshot()
+    assert entries == []
+    assert session.thinking_text == "我先看看今天的变更"
+
+
+def test_session_timeline_folded_count_reports_hidden_old_entries():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    for index in range(5):
+        assert session.apply(event("tool.updated", index, {"tool_id": f"tool-{index}", "name": f"tool_{index}", "status": "completed"}))
+
+    assert session.timeline.folded_count(max_items=3) == 2
+    assert [item.title for item in session.timeline.snapshot(max_items=3)] == ["tool_2", "tool_3", "tool_4"]
+
+
+def test_tool_preview_replaces_header_without_touching_thinking_text():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "thinking.delta",
+            1,
+            {"text": "先分析接口。", "mode": "append_block"},
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "read-1",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 weather_client.py",
+            },
+        )
+    )
+
+    assert session.latest_tool_preview == "读取文件：weather_client.py"
+    assert session.runtime_header_text == "读取文件：weather_client.py"
+    assert session.thinking_text == "先分析接口。"
+
+
+def test_empty_tool_preview_preserves_previous_header():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "read-1",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 weather_client.py",
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "read-1",
+                "name": "read_file",
+                "status": "completed",
+                "detail": " \n ",
+            },
+        )
+    )
+
+    assert session.latest_tool_preview == "读取文件：weather_client.py"
+
+
+def test_interaction_temporarily_overrides_then_restores_preview():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "terminal",
+                "name": "terminal",
+                "status": "running",
+                "detail": "执行 pytest",
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "interaction.requested",
+            2,
+            {
+                "interaction_id": "approval-1",
+                "kind": "approval",
+                "prompt": "允许继续执行测试吗？",
+                "options": [{"label": "允许", "value": "yes"}],
+            },
+        )
+    )
+    assert session.runtime_header_text == "允许继续执行测试吗？"
+
+    assert session.apply(
+        event(
+            "interaction.completed",
+            3,
+            {
+                "interaction_id": "approval-1",
+                "choice": "yes",
+                "choice_label": "允许",
+            },
+        )
+    )
+    assert session.runtime_header_text == "执行命令：pytest"
+
+
+def test_completed_clears_header_but_failed_retains_preview():
+    completed = CardSession(
+        conversation_id="chat-1",
+        message_id="msg-1",
+        chat_id="oc_abc",
+    )
+    assert completed.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 config.py",
+            },
+        )
+    )
+    assert completed.apply(event("message.completed", 2, {"answer": "完成"}))
+    assert completed.latest_tool_preview == ""
+    assert completed.runtime_header_text == ""
+
+    failed = CardSession(
+        conversation_id="chat-1",
+        message_id="msg-1",
+        chat_id="oc_abc",
+    )
+    assert failed.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "terminal",
+                "name": "terminal",
+                "status": "running",
+                "detail": "执行 pytest",
+            },
+        )
+    )
+    assert failed.apply(event("message.failed", 2, {"error": "测试失败"}))
+    assert failed.runtime_header_text == "执行命令：pytest"
+    assert not failed.apply(
+        event(
+            "tool.updated",
+            3,
+            {
+                "tool_id": "late",
+                "name": "read_file",
+                "status": "running",
+                "detail": "迟到更新",
+            },
+        )
+    )
+    assert failed.runtime_header_text == "执行命令：pytest"
+
+
+def test_runtime_header_summarizes_search_url_and_private_file_path():
+    search = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert search.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "search-1",
+                "name": "browser_console",
+                "status": "running",
+                "detail": "广州 小时天气 降雨概率 site:gbaweather.net",
+            },
+        )
+    )
+    assert search.runtime_header_text == "搜索网页：广州 小时天气 降雨概率"
+
+    assert search.apply(
+        event(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "browser-1",
+                "name": "browser_console",
+                "status": "running",
+                "detail": "https://www.ventusky.com/zh/guangzhou?token=private",
+            },
+        )
+    )
+    assert search.runtime_header_text == "浏览网页：ventusky.com/zh/guangzhou"
+
+    reader = CardSession(conversation_id="chat-1", message_id="msg-2", chat_id="oc_abc")
+    assert reader.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "read-1",
+                "name": "read_file",
+                "status": "running",
+                "detail": "/Users/private/project/weather_client.py",
+            },
+            message_id="msg-2",
+        )
+    )
+    assert reader.runtime_header_text == "读取文件：weather_client.py"
+
+
+def test_runtime_header_keeps_unknown_tools_specific_without_exposing_arguments():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    assert session.apply(
+        event(
+            "tool.updated",
+            1,
+            {
+                "tool_id": "memos-1",
+                "name": "memos_skill_get",
+                "status": "running",
+                "detail": '参数: {"id": "private"}',
+            },
+        )
+    )
+
+    assert session.runtime_header_text == "使用 memos skill get"
+
+
+def test_pause_capability_never_extends_native_admission():
+    from hermes_feishu_card.session import InteractionState
+    interaction = InteractionState('native', 'approval', 'scope', pause_on_timeout=True,
+                                   requested_at=0, timeout_seconds=1,
+                                   runtime_admission={'expires_at': 1})
+    assert interaction.expire(2)
+    assert interaction.status == 'failed'
+    assert interaction.runtime_admission is None
