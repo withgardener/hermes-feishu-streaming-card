@@ -144,8 +144,31 @@ POLICY_CACHE_TTL_SECONDS = 1.0
 POLICY_CACHE_LIMIT = 1024
 _FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
 _CONTEXT_COMPACTION_STATUS_RE = re.compile(
-    r"\bCompacting\s+context\b",
+    r"\A(?:🗜️ )?Compacting\s+context"
+    r"(?: — (?:summarizing|still summarizing) earlier conversation so I can continue\.\.\.)?\Z",
     re.IGNORECASE,
+)
+_MEMORY_RECALL_STATUS_RE = re.compile(
+    r"\A🧠 [^—\r\n]{1,80} — recalled "
+    r"(?:1 memory|(?:[2-9]|[1-9][0-9]{1,5}) memories|relevant memory)"
+    r"(?:  🧠 [^—\r\n]{1,80} — recalled "
+    r"(?:1 memory|(?:[2-9]|[1-9][0-9]{1,5}) memories|relevant memory))*\Z"
+)
+_ROUTINE_COMPRESSION_STATUS_PATTERNS = (
+    re.compile(r"\A📦 Pre-API compression: ~[0-9,]+ tokens near the context/output limit\. Compacting before the next model call\.\Z"),
+    re.compile(r"\A📦 Preflight compression: ~[0-9,]+ tokens >= [0-9,]+ threshold\. This may take a moment\.\Z"),
+    re.compile(r"\A💤 Resumed after [0-9]+s idle — compacting ~[0-9,]+ tokens before continuing\.\Z"),
+    re.compile(r"\A🗜️ Context too large \(~[0-9,]+ tokens\) — compressing \([0-9]+/[0-9]+\)\.\.\.\Z"),
+    re.compile(r"\A🗜️ Compressed [0-9,]+ → [0-9,]+ messages, retrying\.\.\.\Z"),
+    re.compile(r"\A🗜️ Compressed ~[0-9,]+ → ~[0-9,]+ tokens, retrying\.\.\.\Z"),
+    re.compile(r"\A🗜️ Context reduced to [0-9,]+ tokens \(was [0-9,]+\), retrying\.\.\.\Z"),
+    re.compile(r"\A🗜️ Compressed [0-9,]+ → [0-9,]+ payload bytes, retrying\.\.\.\Z"),
+)
+_COMPACTION_DONE_STATUS_RE = re.compile(
+    r"\A✓ Context compaction complete — continuing turn\.\.\.\Z"
+)
+_ITERATION_BUDGET_STATUS_RE = re.compile(
+    r"\A⚠️ Iteration budget exhausted \((?P<used>[0-9]+)/(?P<limit>[0-9]+)\) — asking model to summarise\Z"
 )
 MEDIA_RE = re.compile(r"MEDIA:([^\s\]]+)")
 LOCAL_FILE_RE = re.compile(
@@ -176,6 +199,20 @@ BACKGROUND_TASK_FAILED_RE = re.compile(
     r"\A❌ Background task "
     r"(?P<task_id>bg_\d{6}_[0-9a-f]{6}) "
     r"failed:(?:[ \t\r\n][\s\S]*)?\Z"
+)
+# LOCAL PATCH (PATCH-024): the gateway's concise background-process completion line
+# (gateway.run._format_concise_process_notification, zh/en locales), e.g.
+#   ✅ 后台任务已完成 — `cmd …` (10s)
+#   ❌ Background task failed — `cmd` (exit 1). Last output:\n```…```\nAsk me to rerun it…
+# Anchored to the exact template so a quoted or extended answer never matches.
+_BG_CONCISE_DETAIL = r"(?: — `[^`\r\n]+`)?(?: \([^()\r\n]{1,40}\))?"
+BACKGROUND_CONCISE_FINISHED_RE = re.compile(
+    r"\A✅ (?:后台任务已完成|Background task finished)" + _BG_CONCISE_DETAIL + r"\Z"
+)
+BACKGROUND_CONCISE_FAILED_RE = re.compile(
+    r"\A❌ (?:后台任务失败|Background task failed)" + _BG_CONCISE_DETAIL
+    + r"(?:(?:。最后输出：|\. Last output:)\n```\n[\s\S]*?\n```)?"
+    + r"(?:\n(?:可以让我重新运行它，或显示完整日志。|Ask me to rerun it or show the full log\.))?\Z"
 )
 ATTACHMENT_TRAILING_PUNCTUATION = ",.;:)]}，。；：）】}"
 NATIVE_DELIVERY_MARKERS = ("[[as_document]]", "[[audio_as_voice]]")
@@ -1940,6 +1977,57 @@ def emit_from_hermes_locals_threadsafe(
         return False
 
 
+def _hfc_classify_status_callback_notice(event_type: Any, message: Any) -> dict[str, Any] | None:
+    """Classify exact Hermes status-callback templates that belong on the current turn card."""
+    if type(event_type) is not str or type(message) is not str:
+        return None
+    if event_type == "lifecycle" and _MEMORY_RECALL_STATUS_RE.fullmatch(message):
+        return {
+            "title": "记忆召回", "level": "info", "notice_kind": "memory-recall",
+            "notice_id": "memory-recall", "notice_terminal": False, "content": message,
+        }
+    compaction_done = event_type == "compacted" and _COMPACTION_DONE_STATUS_RE.fullmatch(message)
+    iteration_budget = bool(event_type == "lifecycle" and _ITERATION_BUDGET_STATUS_RE.fullmatch(message))
+    compaction_started = event_type in {"lifecycle", "context"} and (
+        _CONTEXT_COMPACTION_STATUS_RE.fullmatch(message)
+        or bool(_ITERATION_BUDGET_STATUS_RE.fullmatch(message))
+        or any(pattern.fullmatch(message) for pattern in _ROUTINE_COMPRESSION_STATUS_PATTERNS)
+    )
+    if compaction_done or compaction_started:
+        title = "上下文压缩完成" if compaction_done else "正在压缩上下文"
+        content = (
+            "上下文压缩已完成，正在继续当前任务。"
+            if compaction_done else "正在总结较早的对话，完成后会继续当前任务。"
+        )
+        if iteration_budget:
+            title = "即将生成摘要"
+            content = "已达到本轮迭代上限，正在请求摘要后结束当前任务。"
+        return {
+            "title": title,
+            "level": "info", "notice_kind": "context-compaction",
+            "notice_id": "context-compaction:active", "notice_terminal": bool(compaction_done),
+            "phase": "started", "content": content,
+        }
+    return None
+
+
+def _status_callback_notice_locals(local_vars: dict[str, Any], notice: dict[str, Any]) -> dict[str, Any]:
+    notice_terminal = bool(notice.get("notice_terminal", False))
+    return {
+        **local_vars,
+        "_hfc_notice_title": notice["title"],
+        "_hfc_notice_level": notice["level"],
+        "_hfc_notice_kind": notice["notice_kind"],
+        "_hfc_notice_id": notice["notice_id"],
+        "_hfc_notice_scope": "session",
+        "_hfc_notice_terminal": notice_terminal,
+        "_hfc_notice_phase": notice.get("phase", "started"),
+        "_hfc_notice_create_session": False,
+        "display_status": "in_progress",
+        "content": notice["content"],
+    }
+
+
 def handle_status_from_hermes_locals(
     local_vars: dict[str, Any],
     *,
@@ -1954,31 +2042,35 @@ def handle_status_from_hermes_locals(
             event_type == "lifecycle" and isinstance(message, str) and len(message) <= 1000
             and re.fullmatch(r"❌ (?:API failed|Rate limited) after [1-9][0-9]{0,2} retries — [^\r\n]+", message)
         )
-        if not provider_failure and not _CONTEXT_COMPACTION_STATUS_RE.search(str(message or "")):
+        raw_message = message if isinstance(message, str) else ""
+        status_notice = _hfc_classify_status_callback_notice(event_type, raw_message)
+        recall_status = bool(status_notice and status_notice.get("notice_kind") == "memory-recall")
+        is_compaction = bool(status_notice and status_notice.get("notice_kind") == "context-compaction")
+        if not provider_failure and not recall_status and not is_compaction:
             return False
         run_guard = local_vars.get("_run_still_current")
         if callable(run_guard) and not run_guard():
             return False
+        if recall_status:
+            return emit_from_hermes_locals_threadsafe(
+                _status_callback_notice_locals(local_vars, status_notice),
+                event_name="system.notice",
+            )
         event_locals = {
             **local_vars,
-            "_hfc_notice_title": "正在压缩上下文",
-            "_hfc_notice_level": "info",
-            "_hfc_notice_kind": "context-compaction",
-            "_hfc_notice_id": "context-compaction:active",
+            "_hfc_notice_title": status_notice["title"] if status_notice else "模型服务异常",
+            "_hfc_notice_level": status_notice["level"] if status_notice else "warning",
+            "_hfc_notice_kind": status_notice["notice_kind"] if status_notice else "provider-failure",
+            "_hfc_notice_id": status_notice["notice_id"] if status_notice else "provider-failure:terminal",
             "_hfc_notice_scope": "session",
-            "_hfc_notice_phase": "started",
+            "_hfc_notice_phase": status_notice.get("phase", "started") if status_notice else "",
             "_hfc_notice_create_session": True,
-            "display_status": "in_progress",
-            "content": "正在总结较早的对话，完成后会继续当前任务。",
+            "display_status": "in_progress" if status_notice else "completed",
+            "content": status_notice["content"] if status_notice else (
+                "模型服务请求失败，本轮正在结束。错误说明会保留在结果卡中。"
+            ),
         }
         if provider_failure:
-            event_locals.update({
-                "_hfc_notice_title": "模型服务异常",
-                "_hfc_notice_level": "warning",
-                "_hfc_notice_kind": "provider-failure",
-                "_hfc_notice_id": "provider-failure:terminal",
-                "content": "模型服务请求失败，本轮正在结束。错误说明会保留在结果卡中。",
-            })
             return _emit_status_notice_confirmed(event_locals)
         return emit_from_hermes_locals_threadsafe(
             event_locals,
@@ -4788,22 +4880,18 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
                        "重启耗时取决于正在收尾的任务和启动过程；收到重启完成通知后，请重新发送请求。",
         }
     if text in {"♻ Gateway restarted successfully. Your session continues.",
-                "♻️ Gateway restarted successfully. Your session continues."}:
-        # Maintainer note (contract change): this notice is delivered as PLAIN TEXT, not a card.
-        #
-        # It used to render as a card titled "Gateway 重启完成" — a duplicate of the home-channel
-        # line in different words, arriving with a status pill and a metrics row it never had
-        # ("已完成 · 0s · Unknown · ↑0 · ↓0 · ctx 0/0 0%"). The user asked for the two surfaces to
-        # read the same and for the card to go: "可以改成不发卡片。发♻️ Gateway online — Hermes is
-        # back and ready." `_hfc_send_system_notice_card` honours `plain_text` by sending exactly
-        # this line through the adapter's own text send; `title`/`level`/`content` stay for the
-        # classification contract and any caller that still renders one.
+                "♻️ Gateway restarted successfully. Your session continues.",
+                _HFC_GATEWAY_ONLINE_TEXT}:
+        # LOCAL PATCH (PATCH-024, 2026-10-14): restart completion is a green card again.
+        # The earlier plain-text contract (「可以改成不发卡片」) was reversed by the user
+        # (「都改成卡片比较美观」). The home-channel online line uses the same card so both
+        # surfaces still read the same. Independent terminal notices render without the
+        # metrics footer, so the old "0s · Unknown · ↑0" row does not come back.
         return {
             "title": "Gateway 重启完成", "level": "success",
             "notice_kind": "gateway-restart", "notice_id": "gateway-restart-ready",
             "notice_terminal": True,
-            "content": "Gateway 已重启完成，会话已保留。现在可以发送新任务。",
-            "plain_text": _HFC_GATEWAY_ONLINE_TEXT,
+            "content": "Hermes 已重新上线，会话已保留，可以继续发送任务。",
         }
     if text.startswith("📬 No home channel is set for Feishu."):
         return {
@@ -4817,21 +4905,18 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
             "notice_id": _hfc_content_notice_id("compression", text),
         }
     if text.startswith("⏳") or lowered.startswith("working ") or "working —" in lowered:
-        # Maintainer note (contract change): the ⏳ status line is NEVER a card.
-        #
-        # These lines used to become notice cards titled「运行中」. They are transient process state
-        # ("compressing", "waiting for approval", "loading the model", the long-running heartbeat,
-        # "tool timed out, retrying", …): the turn's OWN card already carries the live progress, so
-        # the extra card restated it and then appeared/vanished every ~180s. The user asked for the
-        # whole class to be plain text (「⏳ Working — … 之类的，我觉得不应该发卡片」/「都改为纯文本。
-        # 体验效果感觉会好一点」).
-        #
-        # Returning None preserves the adapter's plain-text path. The egress helper
-        # recalls only known transient templates, never arbitrary hourglass text.
-        # Queue/error acknowledgements and answer content remain visible. The edit
-        # path also still works: `_hfc_edit_message_with_system_notice_card` falls back to the
-        # original edit once classification returns None, so a refreshing status updates ONE line.
-        return None
+        # LOCAL PATCH (PATCH-024, 2026-10-14): the user reversed the earlier plain-text
+        # contract (「都改成卡片比较美观」). The whole ⏳ family is one 「运行中」 notice card
+        # per turn again (upstream v3.8.8 shape): heartbeat id is stable per anchor, so
+        # core's in-place edits update that one card, and the sidecar's heartbeat recall
+        # withdraws it once it stops being refreshed.
+        return {
+            "title": "运行中",
+            "level": "info",
+            "notice_kind": "heartbeat",
+            "notice_id": "heartbeat",
+            "notice_terminal": False,
+        }
     if "caps context" in lowered and "auto-compaction" in lowered:
         return {
             "title": "上下文窗口提示",
@@ -4933,6 +5018,24 @@ def _hfc_classify_background_notice(text: str) -> dict[str, Any] | None:
             "notice_id": f"background-task:{task_id}",
             "notice_terminal": True,
         }
+    # LOCAL PATCH (PATCH-024): concise background-process completion → card.
+    for pattern, title, level in (
+        (BACKGROUND_CONCISE_FINISHED_RE, "后台任务已完成", "success"),
+        (BACKGROUND_CONCISE_FAILED_RE, "后台任务失败", "error"),
+    ):
+        if pattern.fullmatch(text) is not None:
+            # body = what follows the fixed phrase: "`cmd` (10s)" plus, on failure, the output tail
+            detail = re.sub(r"\A[✅❌] (?:后台任务已完成|Background task finished|后台任务失败|Background task failed)", "", text)
+            detail = detail.removeprefix(" — ").strip() or title
+            return {
+                "title": title,
+                "level": level,
+                "notice_kind": "background-process",
+                # each completion is its own card (two runs of the same command must not merge)
+                "notice_id": "background-process:" + secrets.token_hex(6),
+                "notice_terminal": True,
+                "content": detail,
+            }
     return None
 
 
@@ -11635,6 +11738,19 @@ def _completion_model(local_vars: dict[str, Any]) -> str:
     return "Unknown"
 
 
+def _hfc_channel_label(base_provider: Any, candidate: Any) -> Any:
+    """LOCAL PATCH (PATCH-002): return the uppercased named channel from a "base:channel"
+    identity string, or *base_provider* unchanged when *candidate* isn't a more specific
+    match for it."""
+    if not isinstance(base_provider, str) or not isinstance(candidate, str):
+        return base_provider
+    base_norm = base_provider.strip().lower()
+    if not candidate.strip().lower().startswith(f"{base_norm}:"):
+        return base_provider
+    channel_name = candidate.strip().split(":", 1)[1].strip()
+    return channel_name.upper() if channel_name else base_provider
+
+
 def effective_response_model(agent: Any) -> str:
     """Capture the actual fallback route before Gateway discards result fields."""
     route = getattr(agent, "_provider_fallback_route", None)
@@ -11642,6 +11758,15 @@ def effective_response_model(agent: Any) -> str:
         model, provider = route
     else:
         model, provider = getattr(agent, "model", None), getattr(agent, "provider", None)
+        # LOCAL PATCH (PATCH-002): prefer the pre-normalization requested provider so the
+        # footer shows the named channel (OKHEMA/...) instead of the runtime bucket (custom/...).
+        requested = getattr(agent, "requested_provider", None)
+        if isinstance(requested, str) and isinstance(provider, str):
+            provider = _hfc_channel_label(provider, requested)
+    if isinstance(provider, str) and ":" in provider:
+        # LOCAL PATCH (PATCH-002): named custom-provider channel from fallback config
+        # (e.g. "custom:okhema") — show the concrete channel, not the generic bucket.
+        provider = _hfc_channel_label(provider.split(":", 1)[0], provider)
     if not isinstance(model, str) or not model.strip():
         return ""
     model = model.strip()
@@ -11691,6 +11816,24 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
 
     input_tokens = _token_value(explicit_tokens, "input_tokens")
     output_tokens = _token_value(explicit_tokens, "output_tokens")
+    # LOCAL PATCH (PATCH-007 carry): session cache/prompt token fields for the card footer.
+    cache_read_tokens = _token_value(explicit_tokens, "cache_read_tokens")
+    if cache_read_tokens <= 0:
+        cache_read_tokens = _positive_int(agent_result.get("cache_read_tokens"))
+    if cache_read_tokens <= 0:
+        cache_read_tokens = _positive_int(agent_result.get("session_cache_read_tokens"))
+    cache_write_tokens = _token_value(explicit_tokens, "cache_write_tokens")
+    if cache_write_tokens <= 0:
+        cache_write_tokens = _positive_int(agent_result.get("cache_write_tokens"))
+    if cache_write_tokens <= 0:
+        cache_write_tokens = _positive_int(agent_result.get("session_cache_write_tokens"))
+    prompt_tokens = _token_value(explicit_tokens, "prompt_tokens")
+    if prompt_tokens <= 0:
+        prompt_tokens = _positive_int(agent_result.get("prompt_tokens"))
+    if prompt_tokens <= 0:
+        prompt_tokens = _positive_int(agent_result.get("session_prompt_tokens"))
+    if prompt_tokens <= 0:
+        prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
     last_prompt_tokens = _positive_int(agent_result.get("last_prompt_tokens"))
     estimated_output_tokens = _estimate_output_tokens(answer) if answer else 0
 
@@ -11719,10 +11862,28 @@ def _completion_tokens(local_vars: dict[str, Any], answer: str) -> dict[str, int
     if output_tokens <= 0 and answer:
         output_tokens = estimated_output_tokens
 
-    return {
+    result = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+    for key, value in (
+        ("prompt_tokens", prompt_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+        ("cache_write_tokens", cache_write_tokens),
+    ):
+        if value > 0:
+            result[key] = value
+    # LOCAL PATCH (PATCH-007): rolling per-call cache history from the agent's
+    # _api_cache_history deque — [[prompt, cache_read], ...] most-recent-last.
+    # Pass through verbatim so the renderer can show a rolling hit rate; absent when
+    # the agent copy predates the counter (fall back to cumulative rates downstream).
+    cache_history = agent_result.get("cache_history")
+    if isinstance(cache_history, list) and cache_history:
+        result["cache_history"] = [
+            [int(p), int(c)] for p, c in cache_history
+            if isinstance(p, (int, float)) and isinstance(c, (int, float)) and p > 0
+        ] or None
+    return result
 
 
 def _completion_context(local_vars: dict[str, Any]) -> dict[str, int]:
