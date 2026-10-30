@@ -4285,6 +4285,8 @@ HYBRID_PATCH_REGISTRY = PatchDescriptorRegistry(
 
 # September 2026 facade layout. Keep this separate from the fixed-tag Hybrid
 # descriptor registry: source layout is not evidence of native hook support.
+from .provider_route import PROVIDER_USAGE_BEGIN as _PROVIDER_USAGE_BEGIN
+
 DECOMPOSED_LAYOUT_MARKERS = {
     "message_handler": PATCH_BEGIN,
     "completion_return": COMPLETE_PATCH_BEGIN,
@@ -4292,6 +4294,11 @@ DECOMPOSED_LAYOUT_MARKERS = {
     "answer_delta_callback": ANSWER_DELTA_PATCH_BEGIN,
     "thinking_delta_callback": THINKING_DELTA_PATCH_BEGIN,
     "status_callback": STATUS_PATCH_BEGIN,
+    # LOCAL PATCH (PATCH-038): the footer channel label rides on the provider
+    # capture inside the gateway result dict. Declaring it here makes a moved
+    # result construction an install/doctor anchor failure ("missing decomposed
+    # anchors"/"ambiguous anchors") instead of a silent custom/ fallback footer.
+    "provider_usage": _PROVIDER_USAGE_BEGIN,
     "clarify_callback": CLARIFY_PATCH_BEGIN,
     "approval_callback": APPROVAL_PATCH_BEGIN,
     "command_card": COMMAND_CARD_PATCH_BEGIN,

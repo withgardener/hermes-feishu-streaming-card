@@ -88,7 +88,10 @@ def render(sources: Mapping[str, bytes], strategy: str = "gateway_run_013_plus")
     all_bytes = b"\n".join(rendered.values())
     for name, marker in patcher.DECOMPOSED_LAYOUT_MARKERS.items():
         count = all_bytes.count(marker.encode())
-        if count != 1 and not (name == "status_callback" and count == 0):
+        # LOCAL PATCH (PATCH-038): provider_usage joins status_callback as an
+        # anchor that may be absent (no result dict in a minimal source set) but
+        # must never be duplicated.
+        if count != 1 and not (name in {"status_callback", "provider_usage"} and count == 0):
             raise ValueError(f"decomposed patch group missing or ambiguous: {name}")
     for marker in (patcher.CRON_PATCH_BEGIN, patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN,
                    patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN):

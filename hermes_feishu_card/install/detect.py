@@ -1018,7 +1018,14 @@ def _detect_layout_capabilities(sources, cron_contents, cron_target):
     capabilities = {key: bool(value) for key, value in locations.items()}
     # Status remains optional exactly as on the legacy layout. All other
     # decomposed delivery/interaction seams are required to preserve features.
-    missing = [key for key in _LAYOUT_MARKERS if key != "status_callback" and not capabilities[key]]
+    # LOCAL PATCH (PATCH-038): provider_usage is reported as an anchor but is not
+    # an install precondition, because a synthetic/minimal source set legitimately
+    # has no gateway result dict to capture into. On a real tree a missing capture
+    # still surfaces twice: doctor lists `provider_usage` as not found, and
+    # hermes-preflight.py::hfc_hooks() rejects any anchor that is not True, so the
+    # switch gate fails instead of shipping a footer without the channel prefix.
+    missing = [key for key in _LAYOUT_MARKERS
+               if key not in {"status_callback", "provider_usage"} and not capabilities[key]]
     if missing:
         errors.append("missing decomposed anchors: " + ", ".join(missing))
     return capabilities, {key: tuple(value) for key, value in locations.items()}, "; ".join(errors) or "supported"
