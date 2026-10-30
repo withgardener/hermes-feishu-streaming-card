@@ -269,7 +269,11 @@ def detect_hermes(root: str | Path) -> HermesDetection:
     if decomposed:
         capabilities, capability_locations, capability_error = _detect_layout_capabilities(gateway_sources, cron_contents, cron_py.relative_to(hermes_root).as_posix())
     else:
-        capabilities, capability_error = _detect_capabilities(contents, cron_contents)
+        capabilities, capability_error = _detect_capabilities(
+            contents,
+            cron_contents,
+            progress_contents=gateway_sources.get("gateway/run_turn_progress.py", ""),
+        )
         capability_locations = {key: ((cron_py.relative_to(hermes_root).as_posix(),) if key == "cron_delivery" and _find_deliver_result_in_contents(cron_contents) else ("gateway/run.py",)) for key, found in capabilities.items() if found}
     capability_locations["exact_base_delivery"] = ("gateway/platforms/base.py",) if exact_base_delivery else ()
     capabilities["exact_base_delivery"] = exact_base_delivery
@@ -558,7 +562,7 @@ def _select_hook_strategy_from_capabilities(capabilities: dict[str, bool]) -> st
 
 
 def _detect_capabilities(
-    contents: str, cron_contents: str = ""
+    contents: str, cron_contents: str = "", *, progress_contents: str = ""
 ) -> tuple[dict[str, bool], str]:
     try:
         module = ast.parse(contents)
@@ -571,8 +575,15 @@ def _detect_capabilities(
     else:
         completion_return = _find_completion_return(handler)
 
+    split_modules: tuple[ast.Module, ...] = ()
+    if progress_contents:
+        try:
+            split_modules = (ast.parse(progress_contents),)
+        except SyntaxError:
+            split_modules = ()
+
     callback_capabilities, callback_error = _detect_callback_patchability(
-        contents, module
+        contents, module, split_modules=split_modules
     )
     capabilities = {
         "message_handler": handler is not None,
@@ -597,7 +608,7 @@ def _detect_capabilities(
 
 
 def _detect_callback_patchability(
-    contents: str, module: ast.Module
+    contents: str, module: ast.Module, *, split_modules: tuple[ast.Module, ...] = ()
 ) -> tuple[dict[str, bool], str]:
     try:
         patched = patcher.apply_patch(contents, strategy="gateway_run_013_plus")
@@ -614,7 +625,9 @@ def _detect_callback_patchability(
                 module, "_interim_assistant_cb"
             )
             is not None,
-            "status_callback": _has_patchable_status_callback(module),
+            "status_callback": _has_patchable_status_callback(
+                module, split_modules=split_modules
+            ),
         }, ""
 
     capabilities = {
@@ -780,7 +793,24 @@ def _turn_runner_assigns_agent_callback(
     return False
 
 
-def _has_patchable_status_callback(module: ast.Module) -> bool:
+def _has_patchable_status_callback(
+    module: ast.Module, *, split_modules: tuple[ast.Module, ...] = ()
+) -> bool:
+    """The status anchor is patchable in the legacy closure OR its split home.
+
+    Hermes v0.22.5 moved ``_status_callback_sync`` from the ``_run_agent_inner``
+    closure into ``gateway/run_turn_progress.py::GatewayTurnProgressMixin`` and
+    left only the ``agent.status_callback = ctx._status_callback_sync`` wiring
+    behind, so the legacy scan alone reports a false negative there. The split
+    shape is judged by the patcher's own predicate, so detection can never
+    claim patchability the renderer would refuse.
+    """
+    if _has_legacy_status_callback(module):
+        return True
+    return any(patcher.has_split_status_callback(tree) for tree in split_modules)
+
+
+def _has_legacy_status_callback(module: ast.Module) -> bool:
     run_agent = _find_function(module, "_run_agent_inner") or _find_function(
         module, "_run_agent"
     )

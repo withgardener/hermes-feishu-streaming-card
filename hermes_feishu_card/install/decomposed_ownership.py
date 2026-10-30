@@ -226,7 +226,7 @@ def _inspect(root: Path, *, render_hooks: bool = True) -> tuple[dict[str, bytes 
     owned_targets = set(manifest["targets"])
     added = set(sources) - owned_targets
     extension_targets = {"gateway/run_turn_persistence.py", "gateway/run_turn_prepare.py",
-                         "gateway/run_turn_hygiene.py"}
+                         "gateway/run_turn_hygiene.py", "gateway/run_turn_progress.py"}
     if owned_targets - set(sources) or not added.issubset(extension_targets):
         raise ValueError("decomposed source target set changed")
     if any(b"HERMES_FEISHU_CARD_" in sources[name] for name in added):
