@@ -562,8 +562,18 @@ def _render_card_unchecked(
             presentation=presentation,
         )
     if presentation == "task":
+        # LOCAL PATCH (PATCH-040a): a running tool owns this slot (header_action), and the runtime
+        # phase line stays second. Only when BOTH are empty — i.e. the turn is thinking with no tool
+        # running, no answer and no phase text — does the newest reasoning step fill it, so the body
+        # shows one moving line instead of nothing. `_thinking_body_step_text` yields "" whenever
+        # the body has real content of its own, so this can never displace a tool action or answer.
+        task_action = header_action or runtime_summary
+        if not task_action:
+            task_action = _thinking_body_step_text(
+                session, stream_thinking_to_body=stream_thinking_to_body,
+            )
         card = apply_task_presentation(
-            card, session, title=configured_title, action=header_action or runtime_summary,
+            card, session, title=configured_title, action=task_action,
             has_primary_content=bool(session.answer_text or (stream_thinking_to_body and session.thinking_text)),
             legacy_fallback_card=legacy_fallback_card,
         )
@@ -1047,6 +1057,121 @@ def _last_tool_action_text(session: CardSession) -> str:
     return _tool_activity_text(
         latest, max_chars=_HEADER_ACTION_TEXT_MAX_CHARS
     ) or _tool_action_phrase(latest)
+
+
+THINKING_STEP_MAX_CHARS = 80
+# Emphasis/fence ticks carry no meaning in a one-line indicator; drop them whole.
+_THINKING_STEP_INLINE_MARKUP = re.compile(r"[`*]+")
+# A block marker only counts at the START of a line ("# 标题", "> 引用", "- 列表",
+# "1. 步骤") and only when its own punctuation follows it.
+_THINKING_STEP_LEADING_MARKER = re.compile(r"^(?:#{1,6}\s*|[>|]+\s*|[-–—•]+\s*|\d{1,2}[.)、]\s*)")
+_THINKING_STEP_TRAILING_MARKER = re.compile(r"[\s#>~|`*]+$")
+# A line shorter than this after cleaning is a fragment ("```", "-", "好的"), not a step.
+_THINKING_STEP_MIN_LINE_CHARS = 8
+
+
+def _thinking_step_text(raw: str) -> str:
+    """Flatten one reasoning line into a plain, single-line indicator fragment."""
+    text = _THINKING_STEP_INLINE_MARKUP.sub("", raw)
+    text = " ".join(text.split())
+    previous = None
+    while previous != text:
+        previous = text
+        text = _THINKING_STEP_LEADING_MARKER.sub("", text)
+        text = _THINKING_STEP_TRAILING_MARKER.sub("", text)
+    return text.strip()
+
+
+def _thinking_step_line(session: CardSession, *, limit: int = THINKING_STEP_MAX_CHARS) -> str:
+    """LOCAL PATCH (PATCH-040a): the newest reasoning step, as ONE body-sized line.
+
+    Why this exists: with the ``task`` preset ``stream_thinking_to_body`` is off, so the body's only
+    legitimate source is ``answer_text``. Models that emit reasoning + tool calls and no answer
+    preface (Gemini/GPT/DeepSeek) therefore show an EMPTY body between tool calls — the user sees
+    only the folded 「实时思考」 panel. Claude reads better because its one-line prefaces are
+    archived into the timeline by the rotation rule. This helper gives the other models the same
+    card shape: exactly ONE line that always names the newest step and is REPLACED, never appended
+    to. PATCH-037 (rejected by the user) pasted every intermediate reasoning fragment into the body
+    and piled up; the invariant here is: at most one extra body line, at any moment.
+
+    Which line, exactly, and why: the newest non-empty PARAGRAPH (blocks are separated by blank
+    lines — ``append_block`` writes ``\\n\\n``; a delta stream keeps one growing paragraph) is the
+    current thought. Inside it the LAST non-empty line is taken, walking backwards past fragments
+    (a trailing ``` or "-" left by a half-streamed block) until a real line is found. If the
+    paragraph has no substantial line, the whole paragraph's tail is used, so a lone short thought
+    still shows something. Taking the last line rather than the paragraph tail matters for
+    multi-line reasoning, where earlier lines are already superseded context.
+
+    Truncation keeps the TAIL (with a leading 「…」) instead of the head. Under ``delta`` streaming
+    the newest characters arrive at the end of the line, so a head-capped line would freeze at the
+    first ~80 characters of a long sentence while the thought kept moving — a stale indicator. The
+    tail is, by definition, the latest thing the model said. Known cost: a cut tail can begin
+    mid-word/mid-clause; that is acceptable for a status line whose only job is "this is where the
+    reasoning is now". The returned string is never longer than ``limit`` (``…`` included).
+    """
+    if limit <= 0:
+        return ""
+    raw = session.thinking_text if isinstance(session.thinking_text, str) else ""
+    if not raw.strip():
+        return ""
+    paragraphs = [part for part in re.split(r"\n\s*\n", raw) if part.strip()]
+    if not paragraphs:
+        return ""
+    # A trailing fenced code block is DATA the reasoning is about, not a step ("```py" cleans down
+    # to "py"). Skip such blocks and describe the prose that introduced them; if the whole tail is
+    # code, fall back to the last paragraph so the line is never silently empty.
+    latest = ""
+    for part in reversed(paragraphs):
+        if part.lstrip().startswith(("```", "~~~")):
+            continue
+        latest = part
+        break
+    if not latest:
+        latest = paragraphs[-1]
+    chosen = ""
+    for line in reversed(latest.splitlines()):
+        cleaned = _thinking_step_text(line)
+        if len(cleaned) >= _THINKING_STEP_MIN_LINE_CHARS:
+            chosen = cleaned
+            break
+    if not chosen:
+        chosen = _thinking_step_text(latest)
+    if not chosen:
+        return ""
+    if len(chosen) <= limit:
+        return chosen
+    return "…" + chosen[-(limit - 1):]
+
+
+def _thinking_body_step_text(
+    session: CardSession, *, stream_thinking_to_body: bool
+) -> str:
+    """LOCAL PATCH (PATCH-040a): the reasoning step may fill the body's action slot — nothing else.
+
+    Narrow on purpose, because this is the body the user reads:
+
+    * ``stream_thinking_to_body`` on → the body already streams the reasoning; a second line would
+      duplicate it, so stay out of the way.
+    * A real answer exists (``answer_text``) or the turn is over → the slot belongs to the work, and
+      the indicator must yield immediately (a completed/failed body carries its own closing notice).
+    * An interaction pending/paused → the prompt owns the body; ``apply_task_presentation`` already
+      refuses to insert an action row there, and matching that rule here keeps the two in step.
+    * A stale turn (``task_presentation`` observation) → the honest line is the observation, not a
+      step that may be minutes old.
+    * No step yet → empty string, and the caller keeps the slot empty exactly as before.
+    """
+    if stream_thinking_to_body:
+        return ""
+    if session.status in {"completed", "failed"}:
+        return ""
+    if normalize_stream_text(session.answer_text).strip():
+        return ""
+    interaction = session.active_interaction
+    if interaction is not None and interaction.status in {"pending", "paused"}:
+        return ""
+    if task_presentation(session).observation:
+        return ""
+    return _thinking_step_line(session)
 
 
 def _header_action_text(session: CardSession, *, display_status: str) -> str:
@@ -2214,11 +2339,17 @@ def _render_timeline_elements(
         ordered = panel_order
     for index, item in ordered:
         if item.kind == "reasoning":
-            content = _limit_text(
-                item.content,
-                max_reasoning_chars,
-                overflow_label="思考内容过长，已截断",
-            )
+            # LOCAL PATCH (PATCH-040a): the synthetic live entry is a stream — keep its TAIL so the
+            # newest thinking stays visible; archived 「思考 N」 entries keep the head-truncating
+            # `_limit_text` behaviour (and its overflow label) untouched.
+            if item is live_entry:
+                content = _limit_text_tail(item.content, max_reasoning_chars)
+            else:
+                content = _limit_text(
+                    item.content,
+                    max_reasoning_chars,
+                    overflow_label="思考内容过长，已截断",
+                )
             lines = [f"**{item.title}** · {item.status}"]
             if content:
                 if reasoning_format == "code" and item is not live_entry:
@@ -2910,3 +3041,23 @@ def _limit_text(text: str, limit: int, *, overflow_label: str = "内容已折叠
         return text
     suffix = f"\n> {overflow_label}"
     return text[: max(0, limit - len(suffix))].rstrip() + suffix
+
+
+def _limit_text_tail(text: str, limit: int, *, prefix: str = "…") -> str:
+    """LOCAL PATCH (PATCH-040a): keep the END of a still-growing text, not its beginning.
+
+    Only the synthetic 「实时思考」/「结束前思考」 entry uses this. That entry is the live stream: its
+    useful content is whatever arrived LAST, while ``_limit_text`` kept the first N characters and
+    replaced everything after them with 「思考内容过长，已截断」 — the user could no longer see what the
+    model was doing right now. Archived 「思考 N」 entries keep the head-truncating behaviour: they
+    are finished prose meant to be read from the start.
+
+    The result never exceeds ``limit`` characters (prefix included), so the card budget the caller
+    computed with ``max_reasoning_chars`` is unchanged.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    keep = limit - len(prefix)
+    if keep <= 0:
+        return prefix[:limit]
+    return prefix + text[-keep:]

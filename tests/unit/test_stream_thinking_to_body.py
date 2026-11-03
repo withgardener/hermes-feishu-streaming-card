@@ -77,12 +77,16 @@ def test_opt_out_does_not_change_terminal_or_failure_content(terminal):
 
 
 def test_long_live_reasoning_no_longer_forces_native_handoff_at_default_panel_budget():
-    session = thought_session('推理细节' * 9000)
+    session = thought_session('推理细节' * 9000 + 'TAIL-MARK')
     assert render_card_result(session).disposition == 'deferred_native'
     result = render_card_result(session, stream_thinking_to_body=False)
     assert result.disposition == 'card'
     assert result.inspection.safe
-    assert '已截断' in str(panel(result.card))
+    # LOCAL PATCH (PATCH-040a): the live entry keeps its TAIL now, so the panel shows where the
+    # reasoning actually is instead of the head plus a 「已截断」 label it no longer prints.
+    assert 'TAIL-MARK' in str(panel(result.card))
+    assert '…' in str(panel(result.card))
+    assert '已截断' not in str(panel(result.card))
     assert '推理细节' not in body_text(result.card)
     # User-configured huge panels and genuine huge answers remain subject to the global card gate.
     assert render_card_result(session, stream_thinking_to_body=False, max_reasoning_chars=100000).disposition == 'deferred_native'
