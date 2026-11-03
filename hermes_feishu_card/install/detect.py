@@ -9,6 +9,7 @@ import stat
 import subprocess
 
 from . import patcher
+from .source_layout import COMPLETION_REFERENCE_SOURCES
 from .native_hooks import (
     FIXED_TAG_COMMIT,
     NativeHookCapabilityProbe,
@@ -205,6 +206,21 @@ def detect_hermes(root: str | Path) -> HermesDetection:
                 return result(False, error)
             gateway_sources[name] = source
 
+    # LOCAL PATCH (PATCH-039): read the completion reference modules. They are
+    # parsed to prove an earlier mixin base cannot shadow the inherited delivery
+    # seam; they are never rendered, never a manifest or backup target, and a
+    # missing file is left out so the ownership proof fails closed instead.
+    reference_sources = {}
+    for name in COMPLETION_REFERENCE_SOURCES:
+        path = hermes_root / name
+        if path.is_symlink():
+            return result(False, f"{name} must not be a symlink")
+        if path.exists():
+            source, error = _read_text(path, name)
+            if error:
+                return result(False, error)
+            reference_sources[name] = source
+
     cron_contents = ""
     cron_error = None
     for name in ("cron/scheduler.py", "cron/scheduler_delivery.py"):
@@ -267,7 +283,7 @@ def detect_hermes(root: str | Path) -> HermesDetection:
         exact_base_error = "gateway/platforms/base.py missing for exact delivery contract"
 
     if decomposed:
-        capabilities, capability_locations, capability_error = _detect_layout_capabilities(gateway_sources, cron_contents, cron_py.relative_to(hermes_root).as_posix())
+        capabilities, capability_locations, capability_error = _detect_layout_capabilities(gateway_sources, cron_contents, cron_py.relative_to(hermes_root).as_posix(), reference_sources=reference_sources)
     else:
         capabilities, capability_error = _detect_capabilities(
             contents,
@@ -979,14 +995,19 @@ def _is_hooks_emit(func: ast.expr) -> bool:
 _LAYOUT_MARKERS = patcher.DECOMPOSED_LAYOUT_MARKERS
 
 
-def _detect_layout_capabilities(sources, cron_contents, cron_target):
+def _detect_layout_capabilities(sources, cron_contents, cron_target, reference_sources=None):
+    # LOCAL PATCH (PATCH-039): reference sources join the completion-source map
+    # only. Iterating them as render targets would raise "unknown Gateway patch
+    # target" and could double-count anchors, so the scan stays on the
+    # decomposed gateway targets that HFC actually renders.
+    completion_sources = {**sources, **(reference_sources or {})}
     locations = {name: [] for name in (*_LAYOUT_MARKERS, "run_agent", "reply_context", "attachment_delivery", "cron_delivery")}
     errors = []
     for target, content in sources.items():
         try:
             clean = patcher.remove_patch(content)
             tree = ast.parse(clean)
-            rendered = patcher.apply_gateway_fragment(clean, target, completion_sources=sources)
+            rendered = patcher.apply_gateway_fragment(clean, target, completion_sources=completion_sources)
             for name, marker in _LAYOUT_MARKERS.items():
                 if marker in rendered:
                     locations[name].append(target)
@@ -1001,7 +1022,7 @@ def _detect_layout_capabilities(sources, cron_contents, cron_target):
                    for node in ast.walk(tree)):
                 locations["attachment_delivery"].append(target)
             handler = patcher._find_handler_node(tree)
-            if handler is not None and patcher._find_decomposed_completion_node(tree) is None and patcher._split_completion_node(sources, target) is None:
+            if handler is not None and patcher._find_decomposed_completion_node(tree) is None and patcher._split_completion_node(completion_sources, target) is None:
                 errors.append(f"{target}: decomposed completion/agent:end contract missing")
         except (ValueError, SyntaxError) as exc:
             errors.append(f"{target}: unsafe anchors or ownership ({exc})")

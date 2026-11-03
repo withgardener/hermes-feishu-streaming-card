@@ -55,6 +55,17 @@ SOURCE_COHORTS: tuple[dict[str, str], ...] = (
         "gateway.session_ingress": "06b27f2312014adbfb98dccda06c3e69ccdb9182d8103d29d858631722acdd2e",
         "gateway.session_authority": "c8bd11dbdda29b04a8ebf54e6471be197602615c9549e9dd5cea7e01c6df4f59",
     },
+    {
+        # LOCAL PATCH (PATCH-039): v0.22.6. f0d94882e8 rewrote both admission
+        # modules upstream (session_ingress: managed-worker admission routing;
+        # session_authority: claim/epoch bookkeeping), so both whole-file
+        # digests move together. The verified admission functions and the Base
+        # extraction seam (admission_extraction.apply) are unchanged; the
+        # hashes below were measured on the v0.22.6 checkout itself, and the
+        # runtime row still compares compiled function shapes byte for byte.
+        "gateway.session_ingress": "12466f9c31f57877c6ae8ea6189d76123a278bdc99e5242c13c5c4ecff0f8ae9",
+        "gateway.session_authority": "207708e4aeb0bf2d8e577f145110a414d80c12da1c4e69570f0402f7d7f6d1a6",
+    },
 )
 Finish = Callable[[Any, bool], Awaitable[None]]
 

@@ -16,3 +16,12 @@ DECOMPOSED_SOURCE_TARGETS = (
     "gateway/run.py", *DECOMPOSED_GATEWAY_TARGETS,
     "cron/scheduler.py", "cron/scheduler_delivery.py", "gateway/platforms/base.py",
 )
+
+# LOCAL PATCH (PATCH-039): read-only references for the inherited completion
+# ownership proof. Hermes 0.22.6 (6cfdb53323) moved background-turn execution
+# out of gateway/run_turn.py into gateway/run_background.py and put
+# GatewayBackgroundMixin first in GatewayTurnMixin's bases, so proving the
+# earlier base cannot shadow the persistence mixin needs that module's source.
+# It is read, parsed and never rendered: not a patch target, not a manifest
+# entry, not a backup, never written.
+COMPLETION_REFERENCE_SOURCES = ("gateway/run_background.py",)

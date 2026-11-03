@@ -14,6 +14,7 @@ from . import git_evidence, patcher
 from .manifest import validate_decomposed_manifest as validate_manifest
 from .source_layout import (
     BACKUP_SUFFIX, MANIFEST_NAME,
+    COMPLETION_REFERENCE_SOURCES,
     DECOMPOSED_MANIFEST_VERSION as MANIFEST_VERSION,
     DECOMPOSED_SOURCE_TARGETS as SOURCE_TARGETS,
 )
@@ -28,6 +29,29 @@ def is_managed(root: Path) -> bool:
         return isinstance(value, dict) and value.get("manifest_version") == MANIFEST_VERSION
     except (OSError, ValueError):
         return False
+
+
+def read_reference_sources(root: Path) -> dict[str, bytes]:
+    """Read the completion reference sources that are never rendered or owned.
+
+    LOCAL PATCH (PATCH-039): ``gateway/run_background.py`` is consulted only to
+    prove that the extra base of ``GatewayTurnMixin`` cannot shadow the
+    inherited delivery seam. A missing file is simply absent (the ownership
+    proof then fails closed on the missing module); a symlink or non-regular
+    file is refused, exactly like every other decomposed source.
+    """
+    result: dict[str, bytes] = {}
+    for name in COMPLETION_REFERENCE_SOURCES:
+        path = root / name
+        if path.is_symlink():
+            raise ValueError(f"{name}: decomposed reference must not be a symlink")
+        if not path.exists():
+            continue
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{name}: decomposed reference must be a regular file")
+        result[name] = path.read_bytes()
+    return result
 
 
 def _snapshot(root: Path) -> dict[str, bytes | None]:
@@ -66,9 +90,20 @@ def _fingerprint(snapshot: Mapping[str, bytes | None]) -> str:
     return sha256(json.dumps(evidence).encode()).hexdigest()
 
 
-def render(sources: Mapping[str, bytes], strategy: str = "gateway_run_013_plus") -> dict[str, bytes]:
+def render(sources: Mapping[str, bytes], strategy: str = "gateway_run_013_plus",
+           reference_sources: Mapping[str, bytes] | None = None) -> dict[str, bytes]:
     rendered = {}
     completion_sources = {name: raw.decode("utf-8") for name, raw in sources.items()}
+    # LOCAL PATCH (PATCH-039): reference sources answer the inherited-ownership
+    # proof only. They are never rendered, so they are not in `rendered` and
+    # never reach the manifest, a backup, or the target set.
+    references = dict(reference_sources or {})
+    unexpected = set(references) - set(COMPLETION_REFERENCE_SOURCES)
+    if unexpected:
+        raise ValueError("unexpected completion reference sources: "
+                         + ", ".join(sorted(unexpected)))
+    completion_sources.update({name: raw.decode("utf-8")
+                               for name, raw in references.items()})
     for target, raw in sources.items():
         text = raw.decode("utf-8")
         if target == "gateway/platforms/base.py":
@@ -211,6 +246,10 @@ def _legacy_upgrade_sources(snapshot: Mapping[str, bytes | None], sources: Mappi
 
 def _inspect(root: Path, *, render_hooks: bool = True) -> tuple[dict[str, bytes | None], dict[str, bytes], dict[str, bytes] | None, str]:
     snapshot = _snapshot(root)
+    # LOCAL PATCH (PATCH-039): the completion reference module is read from the
+    # tree, never from the manifest, and handed to the renderer for the
+    # inherited-ownership proof only.
+    references = read_reference_sources(root)
     sources = {name: raw for name in SOURCE_TARGETS if (raw := snapshot[name]) is not None}
     raw_manifest = snapshot[MANIFEST_NAME]
     if raw_manifest is None:
@@ -224,7 +263,7 @@ def _inspect(root: Path, *, render_hooks: bool = True) -> tuple[dict[str, bytes 
         raise ValueError("invalid decomposed ownership manifest")
     if manifest.get("manifest_version") != MANIFEST_VERSION:
         originals = _legacy_upgrade_sources(snapshot, sources, manifest)
-        return snapshot, originals, render(originals) if render_hooks else None, "stale_unpatched"
+        return snapshot, originals, render(originals, reference_sources=references) if render_hooks else None, "stale_unpatched"
     validate_manifest(manifest)
     owned_targets = set(manifest["targets"])
     added = set(sources) - owned_targets
@@ -265,9 +304,9 @@ def _inspect(root: Path, *, render_hooks: bool = True) -> tuple[dict[str, bytes 
             reapplied = True
     if replacements:
         originals = {**originals, **replacements}
-        rendered = render(originals) if render_hooks else None
+        rendered = render(originals, reference_sources=references) if render_hooks else None
         return snapshot, originals, rendered, "stale_reapplied" if reapplied else "stale_unpatched"
-    rendered = render(originals) if render_hooks else None
+    rendered = render(originals, reference_sources=references) if render_hooks else None
     renderer_changed = rendered is not None and any(
         sha256(raw).hexdigest() != manifest["targets"][target]["patched_sha256"]
         for target, raw in rendered.items())

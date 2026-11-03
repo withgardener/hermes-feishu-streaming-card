@@ -2706,7 +2706,9 @@ def install_decomposed(detection, *, no_repair=False, expected_fingerprint=None,
         fresh = _plan_decomposed_recovery(detection, accept_hermes_upgrade=accept_hermes_upgrade)
         if fresh.fingerprint != decomposed_ownership._fingerprint(snapshot):
             raise ValueError("decomposed evidence changed before install")
-        rendered = rendered or decomposed_ownership.render(originals, detection.hook_strategy)
+        rendered = rendered or decomposed_ownership.render(
+            originals, detection.hook_strategy,
+            reference_sources=decomposed_ownership.read_reference_sources(detection.root))
         manifest = {
             "manifest_version": DECOMPOSED_MANIFEST_VERSION, "layout": "gateway-decomposed-v1",
             "integration_mode": "legacy-patch",

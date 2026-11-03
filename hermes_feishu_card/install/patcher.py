@@ -55,6 +55,24 @@ from .patch_descriptors import (
 )
 
 
+# LOCAL PATCH (PATCH-039): Hermes 0.22.6 (6cfdb53323) extracted background-turn
+# execution from gateway/run_turn.py into gateway/run_background.py and made
+# GatewayBackgroundMixin the first base of GatewayTurnMixin. The completion
+# methods still live in the persistence mixin, so the new tuple is accepted and
+# every base is still resolved through its own module by name.
+_COMPLETION_BASE_MODULES = {
+    "GatewayBackgroundMixin": "gateway.run_background",
+    "GatewayTurnPrepareMixin": "gateway.run_turn_prepare",
+    "GatewayTurnHygieneMixin": "gateway.run_turn_hygiene",
+    "GatewayTurnPersistenceMixin": "gateway.run_turn_persistence",
+}
+_COMPLETION_BASE_TUPLES = frozenset({
+    ("GatewayTurnPersistenceMixin",),
+    ("GatewayTurnPrepareMixin", "GatewayTurnHygieneMixin", "GatewayTurnPersistenceMixin"),
+    ("GatewayBackgroundMixin", "GatewayTurnPrepareMixin", "GatewayTurnHygieneMixin",
+     "GatewayTurnPersistenceMixin"),
+})
+
 TURN_TIMING_PATCH_BEGIN = "# HERMES_FEISHU_CARD_TURN_TIMING_PATCH_BEGIN"
 TURN_TIMING_PATCH_END = "# HERMES_FEISHU_CARD_TURN_TIMING_PATCH_END"
 STALE_INTERRUPTED_PATCH_BEGIN = "# HERMES_FEISHU_CARD_STALE_INTERRUPTED_PATCH_BEGIN"
@@ -4402,9 +4420,7 @@ def _split_completion_node(sources, target):
                        for alias in node.names)]
     methods = _COMPLETION_METHODS
     if (len(owners) != 1 or len(peers) != 1 or len(imports) != 1
-            or tuple(ast.unparse(base) for base in owners[0].bases) not in {
-                ("GatewayTurnPersistenceMixin",),
-                ("GatewayTurnPrepareMixin", "GatewayTurnHygieneMixin", "GatewayTurnPersistenceMixin")}
+            or tuple(ast.unparse(base) for base in owners[0].bases) not in _COMPLETION_BASE_TUPLES
             or any(getattr(node, "name", None) in methods for node in owners[0].body)):
         raise ValueError("inherited completion ownership contract changed")
     # Earlier bases must be proven not to shadow persistence. Bind their
@@ -4413,9 +4429,9 @@ def _split_completion_node(sources, target):
         if not isinstance(base, ast.Name):
             raise ValueError("inherited completion base is not a direct name")
         name = base.id
-        module = {"GatewayTurnPrepareMixin": "gateway.run_turn_prepare",
-                  "GatewayTurnHygieneMixin": "gateway.run_turn_hygiene",
-                  "GatewayTurnPersistenceMixin": "gateway.run_turn_persistence"}[name]
+        module = _COMPLETION_BASE_MODULES.get(name)
+        if module is None:
+            raise ValueError("inherited completion base binding changed")
         bindings = [node for node in handler_tree.body if isinstance(node, ast.ImportFrom)
                     and node.module == module and node.level == 0
                     and any(alias.name == name and alias.asname is None for alias in node.names)]
@@ -4426,7 +4442,14 @@ def _split_completion_node(sources, target):
                 or isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store) and n.attr in methods
                 for n in ast.walk(handler_tree)):
             raise ValueError("inherited completion base binding changed")
-        base_tree = _parse_content(remove_patch(sources.get(module.replace(".", "/") + ".py", "")))
+        source_name = module.replace(".", "/") + ".py"
+        # LOCAL PATCH (PATCH-039): the base module is a read-only reference, so
+        # a tree that names a base without shipping its source fails closed here
+        # instead of being parsed as an empty (shadow-free) module.
+        if source_name not in sources:
+            raise ValueError(
+                "inherited completion earlier base source missing: " + source_name)
+        base_tree = _parse_content(remove_patch(sources[source_name]))
         classes = [n for n in base_tree.body if isinstance(n, ast.ClassDef) and n.name == name]
         if (len(classes) != 1 or classes[0].bases or classes[0].keywords or classes[0].decorator_list
                 or any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
